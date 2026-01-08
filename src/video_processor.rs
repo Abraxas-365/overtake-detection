@@ -3,10 +3,10 @@
 use crate::types::{Config, Frame};
 use anyhow::Result;
 use opencv::{
-    core::{self},
+    core::{self, Mat},
     imgproc,
     prelude::*,
-    videoio::{self, VideoCapture, VideoWriter},
+    videoio::{self, VideoCapture, VideoCaptureTrait, VideoWriter, VideoWriterTrait},
 };
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -21,7 +21,6 @@ impl VideoProcessor {
         Self { config }
     }
 
-    /// Find all video files in the input directory
     pub fn find_video_files(&self) -> Result<Vec<PathBuf>> {
         let mut videos = Vec::new();
 
@@ -44,16 +43,16 @@ impl VideoProcessor {
         Ok(videos)
     }
 
-    /// Open video file and return frame iterator
     pub fn open_video(&self, path: &Path) -> Result<VideoReader> {
         info!("Opening video: {}", path.display());
 
-        let cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
+        let mut cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
 
-        if !VideoCaptureTrait::is_opened(&cap)? {
+        if !cap.is_opened()? {
             anyhow::bail!("Failed to open video file");
         }
 
+        // Get video properties using VideoCaptureTrait methods
         let fps = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FPS)?;
         let total_frames = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
         let width = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
@@ -74,7 +73,6 @@ impl VideoProcessor {
         })
     }
 
-    /// Create video writer for annotated output
     pub fn create_writer(
         &self,
         input_path: &Path,
@@ -86,10 +84,8 @@ impl VideoProcessor {
             return Ok(None);
         }
 
-        // Create output directory
         std::fs::create_dir_all(&self.config.video.output_dir)?;
 
-        // Generate output filename
         let input_name = input_path.file_stem().unwrap().to_str().unwrap();
         let output_path = PathBuf::from(&self.config.video.output_dir)
             .join(format!("{}_annotated.mp4", input_name));
@@ -110,7 +106,7 @@ impl VideoProcessor {
 }
 
 pub struct VideoReader {
-    cap: VideoCapture,
+    pub cap: VideoCapture, // Make it pub
     pub fps: f64,
     pub total_frames: i32,
     pub current_frame: i32,
@@ -119,10 +115,10 @@ pub struct VideoReader {
 }
 
 impl VideoReader {
-    /// Read next frame
     pub fn read_frame(&mut self) -> Result<Option<Frame>> {
         let mut mat = Mat::default();
 
+        // Use VideoCaptureTrait::read
         if !VideoCaptureTrait::read(&mut self.cap, &mut mat)? || mat.empty() {
             return Ok(None);
         }
@@ -145,7 +141,6 @@ impl VideoReader {
         }))
     }
 
-    /// Get progress percentage
     pub fn progress(&self) -> f32 {
         if self.total_frames == 0 {
             return 0.0;
@@ -154,10 +149,9 @@ impl VideoReader {
     }
 }
 
-/// Draw lanes on frame
 pub fn draw_lanes(
     frame: &[u8],
-    width: i32,
+    _width: i32,
     height: i32,
     lanes: &[crate::types::Lane],
 ) -> Result<Mat> {
@@ -171,9 +165,9 @@ pub fn draw_lanes(
 
     let mut output = bgr_mat.try_clone()?;
 
-    // Draw each lane
+    // Lane colors (BGR format for OpenCV)
     let colors = vec![
-        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red (BGR)
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
         core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
         core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
         core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow

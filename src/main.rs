@@ -1,5 +1,3 @@
-// src/main.rs
-
 mod config;
 mod inference;
 mod lane_detection;
@@ -9,10 +7,9 @@ mod types;
 mod video_processor;
 
 use anyhow::Result;
-use opencv::prelude::VideoWriterTrait;
+use opencv::prelude::VideoWriterTrait; // ← Add this import
 use std::path::Path;
 use tracing::{error, info};
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
