@@ -1,6 +1,6 @@
-// src/video_processor.rs
-
-use crate::types::{Config, Frame};
+use crate::lane_detection::{find_vehicle_lane, parse_lanes};
+use crate::overtake::{OvertakeDetector, StateMachine};
+use crate::types::{Config, Frame, OvertakeEvent};
 use anyhow::Result;
 use opencv::{
     core::{self, Mat},
@@ -102,6 +102,56 @@ impl VideoProcessor {
         )?;
 
         Ok(Some(writer))
+    }
+
+    // NEW: Process detection results with debug logging
+    pub fn process_detection_result(
+        result: crate::lane_detection::LaneDetectionResult,
+        frame_width: f32,
+        state_machine: &mut StateMachine,
+        overtake_detector: &mut OvertakeDetector,
+        frame_count: usize,
+    ) -> Option<OvertakeEvent> {
+        info!(
+            "📊 Frame {}: {} lanes detected",
+            frame_count,
+            result.lanes.len()
+        );
+
+        // Find vehicle lane position
+        if let Some((lane_idx, offset)) = find_vehicle_lane(&result.lanes, frame_width) {
+            info!(
+                "🚗 Frame {}: Vehicle in lane {}, offset: {:.2}",
+                frame_count, lane_idx, offset
+            );
+
+            // Check for lane change
+            if let Some(lane_change) = state_machine.update(lane_idx, offset, result.timestamp) {
+                info!(
+                    "🔄 LANE CHANGE DETECTED: {:?} from lane {} to lane {} (confidence: {:.2})",
+                    lane_change.direction,
+                    lane_change.from_lane,
+                    lane_change.to_lane,
+                    lane_change.confidence
+                );
+
+                // Check for overtake
+                if let Some(overtake) = overtake_detector.check_overtake(&lane_change) {
+                    info!(
+                        "🏁 OVERTAKE DETECTED! Complete: {}, Duration: {:.2}s",
+                        overtake.is_complete,
+                        overtake.end_timestamp - overtake.start_timestamp
+                    );
+                    return Some(overtake);
+                } else {
+                    info!("   ⏳ Lane change recorded, waiting for return...");
+                }
+            }
+        } else {
+            info!("❌ Frame {}: Vehicle lane position unknown", frame_count);
+        }
+
+        None
     }
 }
 

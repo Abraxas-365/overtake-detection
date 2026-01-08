@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod config;
 mod inference;
 mod lane_detection;
@@ -8,7 +10,7 @@ mod video_processor;
 
 use anyhow::Result;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -98,6 +100,10 @@ async fn process_video(
     let mut overtakes = Vec::new();
     let mut frame_count = 0;
 
+    // Track stats for summary
+    let mut frames_with_lanes = 0;
+    let mut frames_with_vehicle_position = 0;
+
     // Process frames
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
@@ -105,23 +111,45 @@ async fn process_video(
         // Show progress every 30 frames
         if frame_count % 30 == 0 {
             info!(
-                "Progress: {:.1}% ({}/{})",
+                "Progress: {:.1}% ({}/{}) - Lanes: {}/{}, Vehicle pos: {}/{}",
                 reader.progress(),
                 reader.current_frame,
-                reader.total_frames
+                reader.total_frames,
+                frames_with_lanes,
+                frame_count,
+                frames_with_vehicle_position,
+                frame_count
             );
         }
 
         // Process frame
-        match process_frame(&frame, inference_engine, &mut overtake_detector, config).await {
+        match process_frame(
+            &frame,
+            inference_engine,
+            &mut overtake_detector,
+            config,
+            frame_count,
+        )
+        .await
+        {
             Ok(result) => {
+                // Update stats
+                if !result.lanes.is_empty() {
+                    frames_with_lanes += 1;
+                }
+                if result.had_vehicle_position {
+                    frames_with_vehicle_position += 1;
+                }
+
                 // Save overtake event
                 if let Some(overtake) = result.overtake {
                     overtakes.push(overtake.clone());
                     info!(
-                        "🎯 Overtake #{} detected at {:.2}s",
+                        "🎯 Overtake #{} detected at {:.2}s - Complete: {}, Duration: {:.2}s",
                         overtakes.len(),
-                        overtake.end_timestamp
+                        overtake.end_timestamp,
+                        overtake.is_complete,
+                        overtake.end_timestamp - overtake.start_timestamp
                     );
                 }
 
@@ -147,6 +175,21 @@ async fn process_video(
     let duration = start_time.elapsed();
     let avg_fps = frame_count as f64 / duration.as_secs_f64();
 
+    // Print summary
+    info!("\n📊 Processing Summary:");
+    info!(
+        "  Frames with lanes: {}/{} ({:.1}%)",
+        frames_with_lanes,
+        frame_count,
+        (frames_with_lanes as f32 / frame_count as f32) * 100.0
+    );
+    info!(
+        "  Frames with vehicle position: {}/{} ({:.1}%)",
+        frames_with_vehicle_position,
+        frame_count,
+        (frames_with_vehicle_position as f32 / frame_count as f32) * 100.0
+    );
+
     // Save results to JSON
     save_results(video_path, &overtakes, config)?;
 
@@ -161,6 +204,7 @@ async fn process_video(
 struct FrameResult {
     lanes: Vec<types::Lane>,
     overtake: Option<types::OvertakeEvent>,
+    had_vehicle_position: bool,
 }
 
 async fn process_frame(
@@ -168,6 +212,7 @@ async fn process_frame(
     inference_engine: &mut inference::InferenceEngine,
     overtake_detector: &mut overtake_detector::OvertakeDetector,
     config: &types::Config,
+    frame_count: i32,
 ) -> Result<FrameResult> {
     // 1. Preprocess
     let preprocessed = preprocessing::preprocess(
@@ -190,18 +235,54 @@ async fn process_frame(
         frame.timestamp,
     )?;
 
+    // DEBUG: Log every 30 frames or when lanes detected
+    let should_log = frame_count % 30 == 0 || !lane_detection.lanes.is_empty();
+
+    if should_log {
+        info!(
+            "📊 Frame {}: {} lanes detected",
+            frame_count,
+            lane_detection.lanes.len()
+        );
+    }
+
     // 4. Find vehicle position and check for overtake
+    let mut had_vehicle_position = false;
     let overtake = if let Some((lane_idx, lateral_offset)) =
         lane_detection::find_vehicle_lane(&lane_detection.lanes, frame.width as f32)
     {
-        overtake_detector.update(lane_idx as i32, lateral_offset, frame.timestamp)
+        had_vehicle_position = true;
+
+        if should_log {
+            info!(
+                "🚗 Frame {}: Vehicle in lane {}, offset: {:.2}",
+                frame_count, lane_idx, lateral_offset
+            );
+        }
+
+        // Check for overtake
+        let result = overtake_detector.update(lane_idx as i32, lateral_offset, frame.timestamp);
+
+        if let Some(ref overtake_event) = result {
+            // This is logged in the main loop already
+            info!("🏁 OVERTAKE EVENT CREATED!");
+        }
+
+        result
     } else {
+        if should_log {
+            warn!(
+                "❌ Frame {}: Vehicle lane position unknown (need at least 2 lanes)",
+                frame_count
+            );
+        }
         None
     };
 
     Ok(FrameResult {
         lanes: lane_detection.lanes,
         overtake,
+        had_vehicle_position,
     })
 }
 
@@ -222,6 +303,8 @@ fn save_results(
     let mut file = File::create(&output_path)?;
     file.write_all(json.as_bytes())?;
 
-    info!("Results saved to: {}", output_path.display());
+    info!("💾 Results saved to: {}", output_path.display());
+    info!("   Total overtakes: {}", overtakes.len());
+
     Ok(())
 }
