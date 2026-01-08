@@ -1,10 +1,22 @@
-use crate::types::{Config, Lane, LanePoint};
+// src/lane_detection.rs
+
+use crate::types::{Config, Lane};
 use anyhow::Result;
 
 pub struct LaneDetectionResult {
     pub lanes: Vec<Lane>,
     pub timestamp: f64,
 }
+
+// CULane row anchors (normalized to 320 height)
+const ROW_ANCHORS: [f32; 72] = [
+    121.0, 131.0, 141.0, 150.0, 160.0, 170.0, 180.0, 189.0, 199.0, 209.0, 219.0, 228.0, 238.0,
+    248.0, 258.0, 267.0, 277.0, 287.0, 297.0, 306.0, 316.0, 326.0, 336.0, 345.0, 355.0, 365.0,
+    375.0, 384.0, 394.0, 404.0, 414.0, 423.0, 433.0, 443.0, 453.0, 462.0, 472.0, 482.0, 492.0,
+    501.0, 511.0, 521.0, 531.0, 540.0, 550.0, 560.0, 570.0, 579.0, 589.0, 599.0, 609.0, 618.0,
+    628.0, 638.0, 648.0, 657.0, 667.0, 677.0, 687.0, 696.0, 706.0, 716.0, 726.0, 735.0, 745.0,
+    755.0, 765.0, 774.0, 784.0, 794.0, 804.0, 813.0,
+];
 
 pub fn parse_lanes(
     output: &[f32],
@@ -25,6 +37,8 @@ pub fn parse_lanes(
     // Process each lane
     for lane_idx in 0..num_lanes {
         let mut points = Vec::new();
+        let mut total_confidence = 0.0;
+        let mut point_count = 0;
 
         // Process each anchor (row)
         for anchor_idx in 0..num_anchors {
@@ -59,18 +73,25 @@ pub fn parse_lanes(
                 let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
 
                 // Y coordinate from row anchor (scaled to frame height)
-                let y = (config.model.row_anchors[anchor_idx] / config.model.input_height as f32)
-                    * frame_height;
+                let y = (ROW_ANCHORS[anchor_idx] / config.model.input_height as f32) * frame_height;
 
-                points.push(LanePoint { x, y, confidence });
+                points.push((x, y));
+                total_confidence += confidence;
+                point_count += 1;
             }
         }
 
         // Only add lane if it has enough points
         if points.len() >= 5 {
+            let avg_confidence = if point_count > 0 {
+                total_confidence / point_count as f32
+            } else {
+                0.0
+            };
+
             lanes.push(Lane {
-                id: lane_idx,
                 points,
+                confidence: avg_confidence,
             });
         }
     }
@@ -85,18 +106,21 @@ pub fn find_vehicle_lane(lanes: &[Lane], frame_width: f32) -> Option<(usize, f32
 
     let vehicle_x = frame_width / 2.0;
 
-    // Sort lanes by x position at bottom of frame
+    // Get x positions of lanes at bottom of frame
     let mut lane_positions: Vec<(usize, f32)> = lanes
         .iter()
-        .filter_map(|lane| lane.points.last().map(|p| (lane.id, p.x)))
+        .enumerate()
+        .filter_map(|(idx, lane)| {
+            lane.points.last().map(|p| (idx, p.0)) // p.0 is x coordinate
+        })
         .collect();
 
     lane_positions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     // Find which lane pair the vehicle is between
     for i in 0..lane_positions.len() - 1 {
-        let (left_id, left_x) = lane_positions[i];
-        let (right_id, right_x) = lane_positions[i + 1];
+        let (_, left_x) = lane_positions[i];
+        let (_, right_x) = lane_positions[i + 1];
 
         if left_x <= vehicle_x && vehicle_x <= right_x {
             let lane_width = right_x - left_x;
