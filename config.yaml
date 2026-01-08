@@ -1,0 +1,40 @@
+# Model settings
+model:
+  path: "models/ufldv2.onnx"
+  input_width: 1600
+  input_height: 320
+  num_anchors: 72
+  num_lanes: 4
+  griding_num: 200
+
+# Inference settings
+inference:
+  use_tensorrt: true
+  use_fp16: true
+  enable_engine_cache: true
+  engine_cache_path: "./cache"
+  num_threads: 4
+
+# Detection settings
+detection:
+  confidence_threshold: 0.5
+  min_points_per_lane: 5
+  
+# Overtake detection
+overtake:
+  lane_change_offset_threshold: 0.6
+  debounce_frames: 5
+  confirm_frames: 8
+  max_window_seconds: 15.0
+  min_interval_seconds: 2.0
+
+# Video settings
+video:
+  source_width: 1280
+  source_height: 720
+  target_fps: 30
+
+# Logging
+logging:
+  level: "info"  # trace, debug, info, warn, error
+

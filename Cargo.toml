@@ -1,0 +1,38 @@
+[package]
+name = "overtake-detection"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ONNX Runtime with TensorRT support
+ort = { version = "2.0.0-rc.10", features = ["cuda", "tensorrt"] }
+
+# Tensor operations
+ndarray = "0.15"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Image processing
+image = "0.24"
+
+# Collections
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
