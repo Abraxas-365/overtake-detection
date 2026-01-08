@@ -1,7 +1,5 @@
-// src/inference.rs - CORRECT ort 2.0.0-rc.11 API
-
 use crate::types::Config;
-use andhow::{Context, Result};
+use anyhow::{Context, Result}; // ← FIXED TYPO
 use ort::{
     execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
@@ -68,19 +66,18 @@ impl InferenceEngine {
         ];
 
         // Create input value from tuple (shape, data)
-        // This is the KEY: use tuple format (dimensions, data)
         let input_value =
             ort::value::Value::from_array((shape.as_slice(), input.to_vec().into_boxed_slice()))?;
 
-        // Run inference - NO `?` after inputs! macro
+        // Run inference
         let outputs = self.session.run(ort::inputs!["input" => input_value])?;
 
-        // Extract output using try_extract_tensor (returns ndarray view)
+        // Extract output - returns (&Shape, &[f32])
         let output = &outputs["output"];
-        let tensor_view = output.try_extract_tensor::<f32>()?;
+        let (_shape, data_slice) = output.try_extract_tensor::<f32>()?;
 
-        // Convert ndarray view to Vec
-        let output_data: Vec<f32> = tensor_view.iter().copied().collect();
+        // Convert slice to Vec
+        let output_data: Vec<f32> = data_slice.to_vec();
 
         Ok(output_data)
     }
