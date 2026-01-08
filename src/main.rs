@@ -1,4 +1,3 @@
-// src/main.rs
 mod config;
 mod inference;
 mod lane_detection;
@@ -8,7 +7,6 @@ mod types;
 mod video_processor;
 
 use anyhow::Result;
-use opencv::videoio::VideoWriterTraitConst;
 use std::path::Path;
 use tracing::{error, info};
 
@@ -51,7 +49,7 @@ async fn main() -> Result<()> {
         );
         info!("========================================\n");
 
-        match process_video(video_path, &inference_engine, &video_processor, &config).await {
+        match process_video(video_path, &mut inference_engine, &video_processor, &config).await {
             Ok(stats) => {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
@@ -78,7 +76,7 @@ struct ProcessingStats {
 
 async fn process_video(
     video_path: &Path,
-    inference_engine: &inference::InferenceEngine,
+    inference_engine: &mut inference::InferenceEngine,
     video_processor: &video_processor::VideoProcessor,
     config: &types::Config,
 ) -> Result<ProcessingStats> {
@@ -115,7 +113,14 @@ async fn process_video(
         }
 
         // Process frame
-        match process_frame(&frame, inference_engine, &mut overtake_detector, config).await {
+        match process_frame(
+            &frame,
+            &mut inference_engine,
+            &mut overtake_detector,
+            config,
+        )
+        .await
+        {
             Ok(result) => {
                 // Save overtake event
                 if let Some(overtake) = result.overtake {
@@ -167,7 +172,7 @@ struct FrameResult {
 
 async fn process_frame(
     frame: &types::Frame,
-    inference_engine: &inference::InferenceEngine,
+    inference_engine: &mut inference::InferenceEngine,
     overtake_detector: &mut overtake_detector::OvertakeDetector,
     config: &types::Config,
 ) -> Result<FrameResult> {
