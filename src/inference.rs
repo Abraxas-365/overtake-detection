@@ -1,12 +1,8 @@
-// src/inference.rs - CORRECT ort 2.0.0-rc.11 API
-
 use crate::types::Config;
 use anyhow::{Context, Result};
-use ndarray::Array;
 use ort::{
     execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
-    value::Value,
 };
 use tracing::{debug, info};
 
@@ -61,27 +57,28 @@ impl InferenceEngine {
     pub fn infer(&self, input: &[f32]) -> Result<Vec<f32>> {
         debug!("Running inference");
 
-        // Create input array
-        let input_array = Array::from_shape_vec(
-            (
-                1,
-                3,
-                self.config.model.input_height,
-                self.config.model.input_width,
-            ),
-            input.to_vec(),
-        )?;
+        // Create shape tuple
+        let shape = [
+            1,
+            3,
+            self.config.model.input_height,
+            self.config.model.input_width,
+        ];
 
-        // Create Value from ndarray
-        let input_value = Value::from_array(input_array)?;
+        // Create input value from tuple (shape, data)
+        let input_value =
+            ort::value::Value::from_array((shape.as_slice(), input.to_vec().into_boxed_slice()))?;
 
-        // Run inference with inputs! macro
+        // Run inference
         let outputs = self.session.run(ort::inputs!["input" => input_value])?;
 
-        // Extract output tensor
+        // Extract output
         let output = &outputs["output"];
-        let (_, data) = output.try_extract_raw_tensor::<f32>()?;
+        let output_view = output.try_extract_tensor::<f32>()?;
 
-        Ok(data.to_vec())
+        // Convert to Vec
+        let output_data: Vec<f32> = output_view.view().iter().copied().collect();
+
+        Ok(output_data)
     }
 }
