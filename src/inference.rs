@@ -2,10 +2,11 @@
 
 use crate::types::Config;
 use anyhow::{Context, Result};
-use ndarray::{Array, IxDyn};
+use ndarray::{Array, ArrayView, IxDyn};
 use ort::{
     execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
+    value::Value,
 };
 use tracing::{debug, info};
 
@@ -71,20 +72,17 @@ impl InferenceEngine {
         let input_array = Array::from_shape_vec(IxDyn(&input_shape), input.to_vec())
             .context("Failed to create input array")?;
 
+        // Create ort Value from ndarray
+        let input_value = Value::from_array(input_array)?;
+
         // Run inference
-        let outputs = self
-            .session
-            .run(ort::inputs!["input" => input_array.view()]?)
-            .context("Inference failed")?;
+        let outputs = self.session.run(ort::inputs!["input" => input_value])?;
 
         // Extract output
-        let output = &outputs[0];
-        let output_view = output
-            .try_extract_tensor::<f32>()
-            .context("Failed to extract output tensor")?;
-        let output_slice = output_view
+        let output = outputs["output"].try_extract_tensor::<f32>()?;
+        let output_slice = output
             .view()
-            .as_slice()
+            .to_slice()
             .context("Failed to get output slice")?;
 
         Ok(output_slice.to_vec())

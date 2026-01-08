@@ -6,7 +6,7 @@ use opencv::{
     core::{self, Mat},
     imgproc,
     prelude::*,
-    videoio::{self, VideoCapture, VideoCaptureTrait, VideoWriter, VideoWriterTrait},
+    videoio::{self, VideoCapture, VideoCaptureTraitConst, VideoWriter},
 };
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -46,17 +46,17 @@ impl VideoProcessor {
     pub fn open_video(&self, path: &Path) -> Result<VideoReader> {
         info!("Opening video: {}", path.display());
 
-        let mut cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
+        let cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
 
         if !cap.is_opened()? {
             anyhow::bail!("Failed to open video file");
         }
 
-        // Get video properties using VideoCaptureTrait methods
-        let fps = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FPS)?;
-        let total_frames = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
-        let width = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
-        let height = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
+        // Use VideoCaptureTraitConst for const methods
+        let fps = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FPS)?;
+        let total_frames = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
+        let width = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
+        let height = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
 
         info!(
             "Video properties: {}x{} @ {:.1} FPS, {} frames",
@@ -106,7 +106,7 @@ impl VideoProcessor {
 }
 
 pub struct VideoReader {
-    pub cap: VideoCapture, // Make it pub
+    pub cap: VideoCapture,
     pub fps: f64,
     pub total_frames: i32,
     pub current_frame: i32,
@@ -116,9 +116,10 @@ pub struct VideoReader {
 
 impl VideoReader {
     pub fn read_frame(&mut self) -> Result<Option<Frame>> {
+        use opencv::videoio::VideoCaptureTrait;
+
         let mut mat = Mat::default();
 
-        // Use VideoCaptureTrait::read
         if !VideoCaptureTrait::read(&mut self.cap, &mut mat)? || mat.empty() {
             return Ok(None);
         }

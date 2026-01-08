@@ -1,3 +1,4 @@
+// src/main.rs
 mod config;
 mod inference;
 mod lane_detection;
@@ -7,9 +8,10 @@ mod types;
 mod video_processor;
 
 use anyhow::Result;
-use opencv::prelude::VideoWriterTrait; // ← Add this import
+use opencv::videoio::VideoWriterTraitConst;
 use std::path::Path;
 use tracing::{error, info};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -133,7 +135,8 @@ async fn process_video(
                         reader.height,
                         &result.lanes,
                     ) {
-                        VideoWriterTrait::write(w, &annotated)?;
+                        use opencv::videoio::VideoWriterTrait;
+                        w.write(&annotated)?;
                     }
                 }
             }
