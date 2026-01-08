@@ -1,4 +1,4 @@
-// src/inference.rs - Correct ort 2.0.0-rc.11 API
+// src/inference.rs - CORRECT ort 2.0.0-rc.11 API
 
 use crate::types::Config;
 use anyhow::{Context, Result};
@@ -6,6 +6,7 @@ use ndarray::Array;
 use ort::{
     execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
+    value::Value,
 };
 use tracing::{debug, info};
 
@@ -71,19 +72,16 @@ impl InferenceEngine {
             input.to_vec(),
         )?;
 
-        // Run inference with proper inputs! macro
-        let outputs = self
-            .session
-            .run(ort::inputs!["input" => input_array.view()]?)
-            .context("Inference failed")?;
+        // Create Value from ndarray
+        let input_value = Value::from_array(input_array)?;
+
+        // Run inference with inputs! macro
+        let outputs = self.session.run(ort::inputs!["input" => input_value])?;
 
         // Extract output tensor
-        let binding = outputs["output"].try_extract_tensor::<f32>()?;
-        let output_view = binding.view();
-        let output_slice = output_view
-            .as_slice()
-            .context("Failed to get output slice")?;
+        let output = &outputs["output"];
+        let (_, data) = output.try_extract_raw_tensor::<f32>()?;
 
-        Ok(output_slice.to_vec())
+        Ok(data.to_vec())
     }
 }
