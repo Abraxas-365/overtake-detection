@@ -1,12 +1,11 @@
-// src/inference.rs
+// src/inference.rs - Correct ort 2.0.0-rc.11 API
 
 use crate::types::Config;
 use anyhow::{Context, Result};
-use ndarray::{Array, ArrayView, IxDyn};
+use ndarray::Array;
 use ort::{
     execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
     session::{builder::GraphOptimizationLevel, Session},
-    value::Value,
 };
 use tracing::{debug, info};
 
@@ -61,28 +60,28 @@ impl InferenceEngine {
     pub fn infer(&self, input: &[f32]) -> Result<Vec<f32>> {
         debug!("Running inference");
 
-        // Create input tensor
-        let input_shape = vec![
-            1,
-            3,
-            self.config.model.input_height,
-            self.config.model.input_width,
-        ];
+        // Create input array
+        let input_array = Array::from_shape_vec(
+            (
+                1,
+                3,
+                self.config.model.input_height,
+                self.config.model.input_width,
+            ),
+            input.to_vec(),
+        )?;
 
-        let input_array = Array::from_shape_vec(IxDyn(&input_shape), input.to_vec())
-            .context("Failed to create input array")?;
+        // Run inference with proper inputs! macro
+        let outputs = self
+            .session
+            .run(ort::inputs!["input" => input_array.view()]?)
+            .context("Inference failed")?;
 
-        // Create ort Value from ndarray
-        let input_value = Value::from_array(input_array)?;
-
-        // Run inference
-        let outputs = self.session.run(ort::inputs!["input" => input_value])?;
-
-        // Extract output
-        let output = outputs["output"].try_extract_tensor::<f32>()?;
-        let output_slice = output
-            .view()
-            .to_slice()
+        // Extract output tensor
+        let binding = outputs["output"].try_extract_tensor::<f32>()?;
+        let output_view = binding.view();
+        let output_slice = output_view
+            .as_slice()
             .context("Failed to get output slice")?;
 
         Ok(output_slice.to_vec())
