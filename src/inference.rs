@@ -72,9 +72,13 @@ impl InferenceEngine {
         // Run inference
         let outputs = self.session.run(ort::inputs!["input" => input_value])?;
 
-        // Extract output - USE INDEX [0] instead of name
-        let output = &outputs[0]; // ← Changed from outputs["output"]
-        let (_shape, data_slice) = output.try_extract_tensor::<f32>()?;
+        // Extract output
+        let output = &outputs[0];
+        let (output_shape, data_slice) = output.try_extract_tensor::<f32>()?;
+
+        // DEBUG: Print actual output shape
+        info!("Model output shape: {:?}", output_shape);
+        info!("Model output size: {}", data_slice.len());
 
         // Convert slice to Vec
         let output_data: Vec<f32> = data_slice.to_vec();
