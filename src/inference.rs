@@ -54,7 +54,7 @@ impl InferenceEngine {
         Ok(Self { session, config })
     }
 
-    pub fn infer(&self, input: &[f32]) -> Result<Vec<f32>> {
+    pub fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>> {
         debug!("Running inference");
 
         // Create shape tuple

@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     info!("✓ Configuration loaded");
 
     // Initialize inference engine
-    let inference_engine = inference::InferenceEngine::new(config.clone())?;
+    let mut inference_engine = inference::InferenceEngine::new(config.clone())?;
     info!("✓ Inference engine ready");
 
     // Initialize video processor
