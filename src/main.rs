@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod config;
 mod inference;
 mod lane_detection;
@@ -7,6 +9,7 @@ mod types;
 mod video_processor;
 
 use anyhow::Result;
+use opencv::prelude::VideoWriterTrait;
 use std::path::Path;
 use tracing::{error, info};
 
@@ -32,7 +35,7 @@ async fn main() -> Result<()> {
 
     // Find all video files
     let video_files = video_processor.find_video_files()?;
-    
+
     if video_files.is_empty() {
         error!("No video files found in {}", config.video.input_dir);
         return Ok(());
@@ -41,19 +44,15 @@ async fn main() -> Result<()> {
     // Process each video
     for (idx, video_path) in video_files.iter().enumerate() {
         info!("\n========================================");
-        info!("Processing video {}/{}: {}", 
-            idx + 1, 
-            video_files.len(), 
+        info!(
+            "Processing video {}/{}: {}",
+            idx + 1,
+            video_files.len(),
             video_path.display()
         );
         info!("========================================\n");
 
-        match process_video(
-            video_path,
-            &inference_engine,
-            &video_processor,
-            &config,
-        ).await {
+        match process_video(video_path, &inference_engine, &video_processor, &config).await {
             Ok(stats) => {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
@@ -90,18 +89,14 @@ async fn process_video(
 
     // Open video
     let mut reader = video_processor.open_video(video_path)?;
-    
+
     // Create video writer for annotated output
-    let mut writer = video_processor.create_writer(
-        video_path,
-        reader.width,
-        reader.height,
-        reader.fps,
-    )?;
+    let mut writer =
+        video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
     // Initialize overtake detector
     let mut overtake_detector = overtake_detector::OvertakeDetector::new(config.clone());
-    
+
     // Results storage
     let mut overtakes = Vec::new();
     let mut frame_count = 0;
@@ -121,18 +116,14 @@ async fn process_video(
         }
 
         // Process frame
-        match process_frame(
-            &frame,
-            inference_engine,
-            &mut overtake_detector,
-            config,
-        ).await {
+        match process_frame(&frame, inference_engine, &mut overtake_detector, config).await {
             Ok(result) => {
                 // Save overtake event
                 if let Some(overtake) = result.overtake {
                     overtakes.push(overtake.clone());
-                    info!("🎯 Overtake #{} detected at {:.2}s", 
-                        overtakes.len(), 
+                    info!(
+                        "🎯 Overtake #{} detected at {:.2}s",
+                        overtakes.len(),
                         overtake.end_timestamp
                     );
                 }
@@ -145,7 +136,7 @@ async fn process_video(
                         reader.height,
                         &result.lanes,
                     ) {
-                        w.write(&annotated)?;
+                        VideoWriterTrait::write(w, &annotated)?;
                     }
                 }
             }
@@ -226,8 +217,8 @@ fn save_results(
     use std::io::Write;
 
     let video_name = video_path.file_stem().unwrap().to_str().unwrap();
-    let output_path = Path::new(&config.video.output_dir)
-        .join(format!("{}_results.json", video_name));
+    let output_path =
+        Path::new(&config.video.output_dir).join(format!("{}_results.json", video_name));
 
     let json = serde_json::to_string_pretty(overtakes)?;
     let mut file = File::create(&output_path)?;
@@ -236,4 +227,3 @@ fn save_results(
     info!("Results saved to: {}", output_path.display());
     Ok(())
 }
-

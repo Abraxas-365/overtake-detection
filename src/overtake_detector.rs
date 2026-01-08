@@ -24,7 +24,7 @@ impl OvertakeDetector {
     pub fn update(
         &mut self,
         current_lane: i32,
-        lateral_offset: f32,
+        _lateral_offset: f32,
         timestamp: f64,
     ) -> Option<OvertakeEvent> {
         // Add to history

@@ -1,13 +1,15 @@
+// src/video_processor.rs
+
 use crate::types::{Config, Frame};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use opencv::{
-    core::{self, Vector},
+    core::{self},
     imgproc,
     prelude::*,
     videoio::{self, VideoCapture, VideoWriter},
 };
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::info;
 use walkdir::WalkDir;
 
 pub struct VideoProcessor {
@@ -46,16 +48,16 @@ impl VideoProcessor {
     pub fn open_video(&self, path: &Path) -> Result<VideoReader> {
         info!("Opening video: {}", path.display());
 
-        let mut cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
+        let cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
 
-        if !cap.is_opened()? {
+        if !VideoCaptureTrait::is_opened(&cap)? {
             anyhow::bail!("Failed to open video file");
         }
 
-        let fps = cap.get(videoio::CAP_PROP_FPS)?;
-        let total_frames = cap.get(videoio::CAP_PROP_FRAME_COUNT)? as i32;
-        let width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32;
-        let height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
+        let fps = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FPS)?;
+        let total_frames = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
+        let width = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
+        let height = VideoCaptureTrait::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
 
         info!(
             "Video properties: {}x{} @ {:.1} FPS, {} frames",
@@ -121,7 +123,7 @@ impl VideoReader {
     pub fn read_frame(&mut self) -> Result<Option<Frame>> {
         let mut mat = Mat::default();
 
-        if !self.cap.read(&mut mat)? || mat.empty() {
+        if !VideoCaptureTrait::read(&mut self.cap, &mut mat)? || mat.empty() {
             return Ok(None);
         }
 
@@ -159,25 +161,22 @@ pub fn draw_lanes(
     height: i32,
     lanes: &[crate::types::Lane],
 ) -> Result<Mat> {
-    // Convert to OpenCV Mat
-    let mat = unsafe {
-        Mat::new_rows_cols_with_data(
-            height,
-            width,
-            core::CV_8UC3,
-            frame.as_ptr() as *mut std::ffi::c_void,
-            core::Mat_AUTO_STEP,
-        )?
-    };
+    // Create Mat from raw RGB data
+    let mat = Mat::from_slice(frame)?;
+    let mat = mat.reshape(3, height)?;
 
-    let mut output = mat.clone();
+    // Convert RGB to BGR for OpenCV
+    let mut bgr_mat = Mat::default();
+    imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
+
+    let mut output = bgr_mat.try_clone()?;
 
     // Draw each lane
     let colors = vec![
-        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Red
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red (BGR)
         core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
-        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Blue
-        core::Scalar::new(255.0, 255.0, 0.0, 0.0), // Yellow
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
     ];
 
     for (i, lane) in lanes.iter().enumerate() {
