@@ -1,7 +1,6 @@
-// src/lane_detection.rs
-
 use crate::types::{Config, Lane};
 use anyhow::Result;
+use tracing::info;
 
 pub struct LaneDetectionResult {
     pub lanes: Vec<Lane>,
@@ -25,12 +24,27 @@ pub fn parse_lanes(
     config: &Config,
     timestamp: f64,
 ) -> Result<LaneDetectionResult> {
+    // DEBUG: Check output values
+    let max_val = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min_val = output.iter().copied().fold(f32::INFINITY, f32::min);
+    let avg_val = output.iter().sum::<f32>() / output.len() as f32;
+
+    info!(
+        "Output stats - min: {:.4}, max: {:.4}, avg: {:.4}",
+        min_val, max_val, avg_val
+    );
+
     // Model output shape: [1, griding_num, num_anchors, num_lanes]
     // = [1, 200, 72, 4]
 
     let griding_num = config.model.griding_num;
     let num_anchors = config.model.num_anchors;
     let num_lanes = config.model.num_lanes;
+
+    info!(
+        "Config - griding: {}, anchors: {}, lanes: {}",
+        griding_num, num_anchors, num_lanes
+    );
 
     let mut lanes = Vec::new();
 
@@ -59,16 +73,11 @@ pub fn parse_lanes(
                 }
             }
 
-            // Apply softmax to get confidence
-            let mut sum_exp = 0.0_f32;
-            for grid_idx in 0..griding_num {
-                let idx = grid_idx * (num_anchors * num_lanes) + anchor_idx * num_lanes + lane_idx;
-                sum_exp += (output[idx] - max_prob).exp();
-            }
-            let confidence = 1.0 / sum_exp;
+            // Use sigmoid for confidence (simpler than softmax)
+            let confidence = 1.0 / (1.0 + (-max_prob).exp());
 
-            // Only add point if confidence is high enough
-            if confidence >= 0.5 && max_grid_idx < griding_num {
+            // LOWERED THRESHOLD for debugging
+            if confidence >= 0.1 && max_grid_idx < griding_num {
                 // Convert grid position to pixel coordinates
                 let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
 
@@ -81,13 +90,20 @@ pub fn parse_lanes(
             }
         }
 
-        // Only add lane if it has enough points
-        if points.len() >= 5 {
+        // LOWERED THRESHOLD: Only need 3+ points
+        if points.len() >= 3 {
             let avg_confidence = if point_count > 0 {
                 total_confidence / point_count as f32
             } else {
                 0.0
             };
+
+            info!(
+                "Lane {} detected with {} points, confidence: {:.4}",
+                lane_idx,
+                points.len(),
+                avg_confidence
+            );
 
             lanes.push(Lane {
                 points,
@@ -95,6 +111,8 @@ pub fn parse_lanes(
             });
         }
     }
+
+    info!("Total lanes detected: {}", lanes.len());
 
     Ok(LaneDetectionResult { lanes, timestamp })
 }
