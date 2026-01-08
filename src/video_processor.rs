@@ -1,6 +1,3 @@
-use crate::lane_detection::{find_vehicle_lane, parse_lanes};
-use crate::overtake::{OvertakeDetector, StateMachine};
-use crate::types::{Config, Frame, OvertakeEvent};
 use anyhow::Result;
 use opencv::{
     core::{self, Mat},
