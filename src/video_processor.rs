@@ -1,3 +1,6 @@
+// src/video_processor.rs
+
+use crate::types::Config;
 use anyhow::Result;
 use opencv::{
     core::{self, Mat},
@@ -49,7 +52,6 @@ impl VideoProcessor {
             anyhow::bail!("Failed to open video file");
         }
 
-        // Use VideoCaptureTraitConst for const methods
         let fps = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FPS)?;
         let total_frames = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
         let width = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
@@ -100,56 +102,6 @@ impl VideoProcessor {
 
         Ok(Some(writer))
     }
-
-    // NEW: Process detection results with debug logging
-    pub fn process_detection_result(
-        result: crate::lane_detection::LaneDetectionResult,
-        frame_width: f32,
-        state_machine: &mut StateMachine,
-        overtake_detector: &mut OvertakeDetector,
-        frame_count: usize,
-    ) -> Option<OvertakeEvent> {
-        info!(
-            "📊 Frame {}: {} lanes detected",
-            frame_count,
-            result.lanes.len()
-        );
-
-        // Find vehicle lane position
-        if let Some((lane_idx, offset)) = find_vehicle_lane(&result.lanes, frame_width) {
-            info!(
-                "🚗 Frame {}: Vehicle in lane {}, offset: {:.2}",
-                frame_count, lane_idx, offset
-            );
-
-            // Check for lane change
-            if let Some(lane_change) = state_machine.update(lane_idx, offset, result.timestamp) {
-                info!(
-                    "🔄 LANE CHANGE DETECTED: {:?} from lane {} to lane {} (confidence: {:.2})",
-                    lane_change.direction,
-                    lane_change.from_lane,
-                    lane_change.to_lane,
-                    lane_change.confidence
-                );
-
-                // Check for overtake
-                if let Some(overtake) = overtake_detector.check_overtake(&lane_change) {
-                    info!(
-                        "🏁 OVERTAKE DETECTED! Complete: {}, Duration: {:.2}s",
-                        overtake.is_complete,
-                        overtake.end_timestamp - overtake.start_timestamp
-                    );
-                    return Some(overtake);
-                } else {
-                    info!("   ⏳ Lane change recorded, waiting for return...");
-                }
-            }
-        } else {
-            info!("❌ Frame {}: Vehicle lane position unknown", frame_count);
-        }
-
-        None
-    }
 }
 
 pub struct VideoReader {
@@ -162,7 +114,7 @@ pub struct VideoReader {
 }
 
 impl VideoReader {
-    pub fn read_frame(&mut self) -> Result<Option<Frame>> {
+    pub fn read_frame(&mut self) -> Result<Option<crate::types::Frame>> {
         use opencv::videoio::VideoCaptureTrait;
 
         let mut mat = Mat::default();
@@ -174,14 +126,12 @@ impl VideoReader {
         self.current_frame += 1;
         let timestamp = (self.current_frame as f64) / self.fps;
 
-        // Convert BGR to RGB
         let mut rgb_mat = Mat::default();
         imgproc::cvt_color(&mat, &mut rgb_mat, imgproc::COLOR_BGR2RGB, 0)?;
 
-        // Convert Mat to Vec<u8>
         let data = rgb_mat.data_bytes()?.to_vec();
 
-        Ok(Some(Frame {
+        Ok(Some(crate::types::Frame {
             data,
             width: self.width as usize,
             height: self.height as usize,
@@ -203,17 +153,14 @@ pub fn draw_lanes(
     height: i32,
     lanes: &[crate::types::Lane],
 ) -> Result<Mat> {
-    // Create Mat from raw RGB data
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
 
-    // Convert RGB to BGR for OpenCV
     let mut bgr_mat = Mat::default();
     imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
 
     let mut output = bgr_mat.try_clone()?;
 
-    // Lane colors (BGR format for OpenCV)
     let colors = vec![
         core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
         core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
@@ -224,13 +171,11 @@ pub fn draw_lanes(
     for (i, lane) in lanes.iter().enumerate() {
         let color = colors[i % colors.len()];
 
-        // Draw points
         for point in &lane.points {
             let pt = core::Point::new(point.0 as i32, point.1 as i32);
             imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
         }
 
-        // Draw lines between points
         for window in lane.points.windows(2) {
             let pt1 = core::Point::new(window[0].0 as i32, window[0].1 as i32);
             let pt2 = core::Point::new(window[1].0 as i32, window[1].1 as i32);
