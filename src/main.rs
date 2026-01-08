@@ -113,14 +113,7 @@ async fn process_video(
         }
 
         // Process frame
-        match process_frame(
-            &frame,
-            &mut inference_engine,
-            &mut overtake_detector,
-            config,
-        )
-        .await
-        {
+        match process_frame(&frame, inference_engine, &mut overtake_detector, config).await {
             Ok(result) => {
                 // Save overtake event
                 if let Some(overtake) = result.overtake {
