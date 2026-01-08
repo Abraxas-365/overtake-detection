@@ -1,26 +1,23 @@
-# Model settings
+# config.yaml
 model:
-  path: "models/ufldv2.onnx"
+  path: "/home/edartru/InEdge/poc-minsur/models/ufldv2_culane_res34_320x1600.onnx"
   input_width: 1600
   input_height: 320
   num_anchors: 72
   num_lanes: 4
   griding_num: 200
 
-# Inference settings
 inference:
   use_tensorrt: true
   use_fp16: true
   enable_engine_cache: true
-  engine_cache_path: "./cache"
+  engine_cache_path: "/home/edartru/InEdge/poc-minsur/cache"
   num_threads: 4
 
-# Detection settings
 detection:
   confidence_threshold: 0.5
   min_points_per_lane: 5
   
-# Overtake detection
 overtake:
   lane_change_offset_threshold: 0.6
   debounce_frames: 5
@@ -28,13 +25,17 @@ overtake:
   max_window_seconds: 15.0
   min_interval_seconds: 2.0
 
-# Video settings
 video:
+  # Input video settings
+  input_dir: "/home/edartru/InEdge/poc-minsur/videos"
+  output_dir: "/home/edartru/InEdge/poc-minsur/output"
   source_width: 1280
   source_height: 720
   target_fps: 30
+  
+  # Video output settings
+  save_annotated: true
+  save_events_only: false
 
-# Logging
 logging:
-  level: "info"  # trace, debug, info, warn, error
-
+  level: "info"

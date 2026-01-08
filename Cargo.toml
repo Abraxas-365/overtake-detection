@@ -20,19 +20,21 @@ thiserror = "1.0"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1.0"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Image processing
+# Image and video processing
 image = "0.24"
+opencv = { version = "0.91", features = ["rgb"] }
 
-# Collections
-[dev-dependencies]
-criterion = "0.5"
+# File system
+walkdir = "2.4"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+

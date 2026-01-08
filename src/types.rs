@@ -46,9 +46,13 @@ pub struct OvertakeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoConfig {
+    pub input_dir: String,
+    pub output_dir: String,
     pub source_width: usize,
     pub source_height: usize,
     pub target_fps: u32,
+    pub save_annotated: bool,
+    pub save_events_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,13 +80,6 @@ pub struct LaneDetection {
     pub timestamp: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Direction {
-    None,
-    Left,
-    Right,
-}
-
 #[derive(Debug, Clone)]
 pub struct LaneChangeEvent {
     pub timestamp: f64,
@@ -92,7 +89,15 @@ pub struct LaneChangeEvent {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone)]
+// Make sure these have Serialize
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum Direction {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct OvertakeEvent {
     pub start_timestamp: f64,
     pub end_timestamp: f64,
