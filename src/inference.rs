@@ -1,7 +1,9 @@
+// src/inference.rs
+
 use crate::types::Config;
-use anyhow::{Context, Result}; // ← FIXED TYPO
+use anyhow::{Context, Result};
 use ort::{
-    execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider},
+    execution_providers::CUDAExecutionProvider,
     session::{builder::GraphOptimizationLevel, Session},
 };
 use tracing::{debug, info};
@@ -18,28 +20,12 @@ impl InferenceEngine {
 
         let mut session_builder = Session::builder()?;
 
-        if config.inference.use_tensorrt {
-            info!("Enabling TensorRT execution provider");
-
-            let mut trt_options = TensorRTExecutionProvider::default();
-            if config.inference.use_fp16 {
-                trt_options = trt_options.with_fp16(true);
-                info!("FP16 precision enabled");
-            }
-            if config.inference.enable_engine_cache {
-                trt_options = trt_options.with_engine_cache(true).with_timing_cache(true);
-                info!(
-                    "Engine cache enabled at: {}",
-                    config.inference.engine_cache_path
-                );
-            }
-
-            session_builder = session_builder.with_execution_providers([trt_options.build()])?;
-        }
-
-        // Add CUDA as fallback
+        // CUDA execution provider
+        info!("Enabling CUDA execution provider");
         session_builder =
-            session_builder.with_execution_providers([CUDAExecutionProvider::default().build()])?;
+            session_builder.with_execution_providers([CUDAExecutionProvider::default()
+                .with_device_id(0)
+                .build()])?;
 
         info!("Building ONNX Runtime session...");
         let session = session_builder

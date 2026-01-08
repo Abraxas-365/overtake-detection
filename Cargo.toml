@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # ONNX Runtime with TensorRT support
-ort = { version = "2.0.0-rc.10", features = ["cuda", "tensorrt"] }
+ort = { version = "2.0.0-rc.11", features = ["cuda", "download-binaries"] }
 
 # Tensor operations
 ndarray = "0.15"
