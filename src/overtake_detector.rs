@@ -164,22 +164,18 @@ impl OvertakeDetector {
     }
 
     fn check_overtake(&mut self, current_event: &LaneChangeEvent) -> Option<OvertakeEvent> {
-        // Add to recent changes
         self.recent_changes.push(current_event.clone());
 
-        // Keep only events within time window
         self.recent_changes.retain(|e| {
             current_event.timestamp - e.timestamp < self.config.overtake.max_window_seconds
         });
 
-        // Need at least 2 lane changes
         if self.recent_changes.len() < 2 {
             return None;
         }
 
         let prev = &self.recent_changes[self.recent_changes.len() - 2];
         let curr = current_event;
-
         let delta = curr.timestamp - prev.timestamp;
 
         // Check timing constraints
@@ -189,9 +185,14 @@ impl OvertakeDetector {
             return None;
         }
 
-        // Check for opposite directions (overtake pattern)
+        // ⭐ NEW: Only process opposite directions
         let is_complete = (prev.direction == Direction::Left && curr.direction == Direction::Right)
             || (prev.direction == Direction::Right && curr.direction == Direction::Left);
+
+        // ⭐ NEW: Don't return anything for same-direction pairs
+        if !is_complete {
+            return None; // Changed from creating incomplete event
+        }
 
         if is_complete {
             info!("🚗 OVERTAKE DETECTED!");
