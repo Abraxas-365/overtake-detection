@@ -1,6 +1,5 @@
 // src/main.rs
 
-mod config;
 mod inference;
 mod lane_detection;
 mod overtake_detector;
