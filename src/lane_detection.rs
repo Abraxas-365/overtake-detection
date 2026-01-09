@@ -117,35 +117,35 @@ pub fn parse_lanes(
     Ok(LaneDetectionResult { lanes, timestamp })
 }
 
-pub fn find_vehicle_lane(lanes: &[Lane], frame_width: f32) -> Option<(usize, f32)> {
+pub fn find_vehicle_lane_with_confidence(
+    lanes: &[Lane],
+    frame_width: f32,
+) -> Option<(usize, f32, f32)> {
     if lanes.len() < 2 {
         return None;
     }
 
     let vehicle_x = frame_width / 2.0;
 
-    // Get x positions of lanes at bottom of frame
-    let mut lane_positions: Vec<(usize, f32)> = lanes
+    let mut lane_positions: Vec<(usize, f32, f32)> = lanes
         .iter()
         .enumerate()
-        .filter_map(|(idx, lane)| {
-            lane.points.last().map(|p| (idx, p.0)) // p.0 is x coordinate
-        })
+        .filter_map(|(idx, lane)| lane.points.last().map(|p| (idx, p.0, lane.confidence)))
         .collect();
 
     lane_positions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-    // Find which lane pair the vehicle is between
     for i in 0..lane_positions.len() - 1 {
-        let (_, left_x) = lane_positions[i];
-        let (_, right_x) = lane_positions[i + 1];
+        let (_, left_x, left_conf) = lane_positions[i];
+        let (_, right_x, right_conf) = lane_positions[i + 1];
 
         if left_x <= vehicle_x && vehicle_x <= right_x {
             let lane_width = right_x - left_x;
             let offset_from_left = vehicle_x - left_x;
-            let normalized_offset = (offset_from_left / lane_width - 0.5) * 2.0; // [-1, 1]
+            let normalized_offset = (offset_from_left / lane_width - 0.5) * 2.0;
+            let confidence = left_conf.min(right_conf);
 
-            return Some((i, normalized_offset));
+            return Some((i, normalized_offset, confidence));
         }
     }
 

@@ -33,8 +33,13 @@ pub struct InferenceConfig {
 pub struct DetectionConfig {
     pub confidence_threshold: f32,
     pub min_points_per_lane: usize,
+    pub smoother_window_size: usize,
+    pub calibration_frames: usize,
+    pub debounce_frames: u32,
+    pub confirm_frames: u32,
+    pub min_lane_confidence: f32,
+    pub min_position_confidence: f32,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OvertakeConfig {
     pub lane_change_offset_threshold: f32,

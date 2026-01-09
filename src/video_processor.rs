@@ -185,3 +185,118 @@ pub fn draw_lanes(
 
     Ok(output)
 }
+
+pub fn draw_lanes_with_info(
+    frame: &[u8],
+    width: i32,
+    height: i32,
+    lanes: &[crate::types::Lane],
+    position: Option<&crate::types::VehiclePosition>,
+    calibrated: bool,
+) -> Result<Mat> {
+    let mat = Mat::from_slice(frame)?;
+    let mat = mat.reshape(3, height)?;
+
+    let mut bgr_mat = Mat::default();
+    imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
+    let mut output = bgr_mat.try_clone()?;
+
+    // Draw lanes
+    let colors = vec![
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+    ];
+
+    for (i, lane) in lanes.iter().enumerate() {
+        let color = colors[i % colors.len()]; // ✅ FIXED!
+
+        // Draw lane points
+        for point in &lane.points {
+            let pt = core::Point::new(point.0 as i32, point.1 as i32);
+            imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
+        }
+
+        // Draw lane lines
+        for window in lane.points.windows(2) {
+            let pt1 = core::Point::new(window[0].0 as i32, window[0].1 as i32);
+            let pt2 = core::Point::new(window[1].0 as i32, window[1].1 as i32);
+            imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
+        }
+    }
+
+    // Draw vehicle position marker (center bottom)
+    let vehicle_x = width / 2;
+    let vehicle_y = (height as f32 * 0.85) as i32;
+    imgproc::circle(
+        &mut output,
+        core::Point::new(vehicle_x, vehicle_y),
+        8,
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Cyan circle
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // Draw position info overlay
+    if let Some(pos) = position {
+        let info = format!(
+            "Lane: {} | Offset: {:.2} | Conf: {:.2} | Cal: {}",
+            pos.lane_index, pos.lateral_offset, pos.confidence, calibrated
+        );
+
+        // Draw text background
+        imgproc::rectangle(
+            &mut output,
+            core::Rect::new(5, 5, 600, 40),
+            core::Scalar::new(0.0, 0.0, 0.0, 128.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        // Draw text
+        imgproc::put_text(
+            &mut output,
+            &info,
+            core::Point::new(10, 30),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.7,
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0), // Green text
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+    } else {
+        // Show "No position detected" when position is None
+        let info = if calibrated {
+            "No position detected"
+        } else {
+            "CALIBRATING..."
+        };
+
+        imgproc::rectangle(
+            &mut output,
+            core::Rect::new(5, 5, 400, 40),
+            core::Scalar::new(0.0, 0.0, 0.0, 128.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        imgproc::put_text(
+            &mut output,
+            info,
+            core::Point::new(10, 30),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.7,
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0), // Red text
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+    }
+
+    Ok(output)
+}

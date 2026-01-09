@@ -17,6 +17,12 @@ inference:
 detection:
   confidence_threshold: 0.5
   min_points_per_lane: 5
+  smoother_window_size: 10
+  calibration_frames: 90
+  debounce_frames: 15
+  confirm_frames: 20
+  min_lane_confidence: 0.6
+  min_position_confidence: 0.5
   
 overtake:
   lane_change_offset_threshold: 0.6

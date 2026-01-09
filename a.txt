@@ -1,0 +1,1529 @@
+use crate::types::Config;
+use anyhow::Result;
+use std::fs;
+
+impl Config {
+    pub fn load(path: &str) -> Result<Self> {
+        let contents = fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&contents)?;
+        Ok(config)
+    }
+}
+use opencv::{core, imgproc, prelude::*};
+
+pub fn visualize_lanes(frame: &Mat, lanes: &[Lane], position: &VehiclePosition) -> Result<Mat> {
+    let mut debug_frame = frame.clone();
+
+    // Draw detected lanes with different colors
+    let colors = [
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue - Lane 0
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green - Lane 1
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red - Lane 2
+        core::Scalar::new(255.0, 255.0, 0.0, 0.0), // Cyan - Lane 3
+    ];
+
+    for (i, lane) in lanes.iter().enumerate() {
+        // Draw lane points
+        for window in lane.points.windows(2) {
+            let p1 = core::Point::new(window[0].x as i32, window[0].y as i32);
+            let p2 = core::Point::new(window[1].x as i32, window[1].y as i32);
+            imgproc::line(
+                &mut debug_frame,
+                p1,
+                p2,
+                colors[i % 4],
+                3,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+
+        // Draw lane ID
+        if let Some(first_point) = lane.points.first() {
+            imgproc::put_text(
+                &mut debug_frame,
+                &format!("L{} ({:.2})", i, lane.confidence),
+                core::Point::new(first_point.x as i32, first_point.y as i32 - 10),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.6,
+                colors[i % 4],
+                2,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+    }
+
+    // Draw vehicle position indicator
+    let vehicle_x = frame.cols() / 2;
+    let vehicle_y = (frame.rows() as f32 * 0.85) as i32;
+
+    imgproc::circle(
+        &mut debug_frame,
+        core::Point::new(vehicle_x, vehicle_y),
+        10,
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // Draw current lane info
+    let info = format!(
+        "Lane: {} | Offset: {:.2} | Conf: {:.2}",
+        position.lane_index, position.lateral_offset, position.confidence
+    );
+    imgproc::put_text(
+        &mut debug_frame,
+        &info,
+        core::Point::new(10, 30),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        0.8,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        2,
+        imgproc::LINE_8,
+        false,
+    )?;
+
+    Ok(debug_frame)
+}
+// src/inference.rs
+
+use crate::types::Config;
+use anyhow::{Context, Result};
+use ort::{
+    execution_providers::CUDAExecutionProvider,
+    session::{builder::GraphOptimizationLevel, Session},
+};
+use tracing::{debug, info};
+
+pub struct InferenceEngine {
+    session: Session,
+    config: Config,
+}
+
+impl InferenceEngine {
+    pub fn new(config: Config) -> Result<Self> {
+        info!("Initializing inference engine");
+        info!("Model path: {}", config.model.path);
+
+        let mut session_builder = Session::builder()?;
+
+        // CUDA execution provider
+        info!("Enabling CUDA execution provider");
+        session_builder =
+            session_builder.with_execution_providers([CUDAExecutionProvider::default()
+                .with_device_id(0)
+                .build()])?;
+
+        info!("Building ONNX Runtime session...");
+        let session = session_builder
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(config.inference.num_threads)?
+            .with_inter_threads(1)?
+            .commit_from_file(&config.model.path)
+            .context("Failed to load model")?;
+
+        info!("✓ Inference engine initialized successfully");
+
+        Ok(Self { session, config })
+    }
+
+    pub fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>> {
+        debug!("Running inference");
+
+        // Create shape tuple
+        let shape = [
+            1,
+            3,
+            self.config.model.input_height,
+            self.config.model.input_width,
+        ];
+
+        // Create input value from tuple (shape, data)
+        let input_value =
+            ort::value::Value::from_array((shape.as_slice(), input.to_vec().into_boxed_slice()))?;
+
+        // Run inference
+        let outputs = self.session.run(ort::inputs!["input" => input_value])?;
+
+        // Extract output
+        let output = &outputs[0];
+        let (output_shape, data_slice) = output.try_extract_tensor::<f32>()?;
+
+        // DEBUG: Print actual output shape
+        info!("Model output shape: {:?}", output_shape);
+        info!("Model output size: {}", data_slice.len());
+
+        // Convert slice to Vec
+        let output_data: Vec<f32> = data_slice.to_vec();
+
+        Ok(output_data)
+    }
+}
+use crate::types::{Config, Lane};
+use anyhow::Result;
+use tracing::info;
+
+pub struct LaneDetectionResult {
+    pub lanes: Vec<Lane>,
+    pub timestamp: f64,
+}
+
+// CULane row anchors (normalized to 320 height)
+const ROW_ANCHORS: [f32; 72] = [
+    121.0, 131.0, 141.0, 150.0, 160.0, 170.0, 180.0, 189.0, 199.0, 209.0, 219.0, 228.0, 238.0,
+    248.0, 258.0, 267.0, 277.0, 287.0, 297.0, 306.0, 316.0, 326.0, 336.0, 345.0, 355.0, 365.0,
+    375.0, 384.0, 394.0, 404.0, 414.0, 423.0, 433.0, 443.0, 453.0, 462.0, 472.0, 482.0, 492.0,
+    501.0, 511.0, 521.0, 531.0, 540.0, 550.0, 560.0, 570.0, 579.0, 589.0, 599.0, 609.0, 618.0,
+    628.0, 638.0, 648.0, 657.0, 667.0, 677.0, 687.0, 696.0, 706.0, 716.0, 726.0, 735.0, 745.0,
+    755.0, 765.0, 774.0, 784.0, 794.0, 804.0, 813.0,
+];
+
+pub fn parse_lanes(
+    output: &[f32],
+    frame_width: f32,
+    frame_height: f32,
+    config: &Config,
+    timestamp: f64,
+) -> Result<LaneDetectionResult> {
+    // DEBUG: Check output values
+    let max_val = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min_val = output.iter().copied().fold(f32::INFINITY, f32::min);
+    let avg_val = output.iter().sum::<f32>() / output.len() as f32;
+
+    info!(
+        "Output stats - min: {:.4}, max: {:.4}, avg: {:.4}",
+        min_val, max_val, avg_val
+    );
+
+    // Model output shape: [1, griding_num, num_anchors, num_lanes]
+    // = [1, 200, 72, 4]
+
+    let griding_num = config.model.griding_num;
+    let num_anchors = config.model.num_anchors;
+    let num_lanes = config.model.num_lanes;
+
+    info!(
+        "Config - griding: {}, anchors: {}, lanes: {}",
+        griding_num, num_anchors, num_lanes
+    );
+
+    let mut lanes = Vec::new();
+
+    // Process each lane
+    for lane_idx in 0..num_lanes {
+        let mut points = Vec::new();
+        let mut total_confidence = 0.0;
+        let mut point_count = 0;
+
+        // Process each anchor (row)
+        for anchor_idx in 0..num_anchors {
+            // Find the grid position with max probability
+            let mut max_prob = f32::NEG_INFINITY;
+            let mut max_grid_idx = 0;
+
+            // Check each grid position
+            for grid_idx in 0..griding_num {
+                // Index calculation for shape [1, 200, 72, 4]
+                // Skip batch dimension (0), so: [grid, anchor, lane]
+                let idx = grid_idx * (num_anchors * num_lanes) + anchor_idx * num_lanes + lane_idx;
+
+                let prob = output[idx];
+                if prob > max_prob {
+                    max_prob = prob;
+                    max_grid_idx = grid_idx;
+                }
+            }
+
+            // Use sigmoid for confidence (simpler than softmax)
+            let confidence = 1.0 / (1.0 + (-max_prob).exp());
+
+            // LOWERED THRESHOLD for debugging
+            if confidence >= 0.1 && max_grid_idx < griding_num {
+                // Convert grid position to pixel coordinates
+                let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
+
+                // Y coordinate from row anchor (scaled to frame height)
+                let y = (ROW_ANCHORS[anchor_idx] / config.model.input_height as f32) * frame_height;
+
+                points.push((x, y));
+                total_confidence += confidence;
+                point_count += 1;
+            }
+        }
+
+        // LOWERED THRESHOLD: Only need 3+ points
+        if points.len() >= 3 {
+            let avg_confidence = if point_count > 0 {
+                total_confidence / point_count as f32
+            } else {
+                0.0
+            };
+
+            info!(
+                "Lane {} detected with {} points, confidence: {:.4}",
+                lane_idx,
+                points.len(),
+                avg_confidence
+            );
+
+            lanes.push(Lane {
+                points,
+                confidence: avg_confidence,
+            });
+        }
+    }
+
+    info!("Total lanes detected: {}", lanes.len());
+
+    Ok(LaneDetectionResult { lanes, timestamp })
+}
+
+pub fn find_vehicle_lane(lanes: &[Lane], frame_width: f32) -> Option<(usize, f32)> {
+    if lanes.len() < 2 {
+        return None;
+    }
+
+    let vehicle_x = frame_width / 2.0;
+
+    // Get x positions of lanes at bottom of frame
+    let mut lane_positions: Vec<(usize, f32)> = lanes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, lane)| {
+            lane.points.last().map(|p| (idx, p.0)) // p.0 is x coordinate
+        })
+        .collect();
+
+    lane_positions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    // Find which lane pair the vehicle is between
+    for i in 0..lane_positions.len() - 1 {
+        let (_, left_x) = lane_positions[i];
+        let (_, right_x) = lane_positions[i + 1];
+
+        if left_x <= vehicle_x && vehicle_x <= right_x {
+            let lane_width = right_x - left_x;
+            let offset_from_left = vehicle_x - left_x;
+            let normalized_offset = (offset_from_left / lane_width - 0.5) * 2.0; // [-1, 1]
+
+            return Some((i, normalized_offset));
+        }
+    }
+
+    None
+}
+// src/main.rs
+
+mod config;
+mod inference;
+mod lane_detection;
+mod overtake_detector;
+mod preprocessing;
+mod smoother;
+mod types;
+mod video_processor; // ← NEW MODULE
+
+use anyhow::Result;
+use std::path::Path;
+use tracing::{debug, error, info, warn};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter("overtake_detection=info,ort=warn")
+        .init();
+
+    info!("🚗 Overtake Detection System Starting");
+
+    // Load configuration
+    let config = types::Config::load("config.yaml")?;
+    info!("✓ Configuration loaded");
+    info!(
+        "  Smoother window: {} frames",
+        config.detection.smoother_window_size
+    );
+    info!(
+        "  Calibration frames: {}",
+        config.detection.calibration_frames
+    );
+    info!("  Debounce frames: {}", config.detection.debounce_frames);
+    info!("  Confirm frames: {}", config.detection.confirm_frames);
+
+    // Initialize inference engine
+    let mut inference_engine = inference::InferenceEngine::new(config.clone())?;
+    info!("✓ Inference engine ready");
+
+    // Initialize video processor
+    let video_processor = video_processor::VideoProcessor::new(config.clone());
+
+    // Find all video files
+    let video_files = video_processor.find_video_files()?;
+
+    if video_files.is_empty() {
+        error!("No video files found in {}", config.video.input_dir);
+        return Ok(());
+    }
+
+    // Process each video
+    for (idx, video_path) in video_files.iter().enumerate() {
+        info!("\n========================================");
+        info!(
+            "Processing video {}/{}: {}",
+            idx + 1,
+            video_files.len(),
+            video_path.display()
+        );
+        info!("========================================\n");
+
+        match process_video(video_path, &mut inference_engine, &video_processor, &config).await {
+            Ok(stats) => {
+                info!("\n✓ Video processed successfully!");
+                info!("  Total frames: {}", stats.total_frames);
+                info!(
+                    "  Frames with valid position: {} ({:.1}%)",
+                    stats.frames_with_position,
+                    (stats.frames_with_position as f32 / stats.total_frames as f32) * 100.0
+                );
+                info!("  Lane changes detected: {}", stats.lane_changes_detected);
+                info!("  Overtakes detected: {}", stats.overtakes_detected);
+                info!("  Processing time: {:.2}s", stats.duration_secs);
+                info!("  Average FPS: {:.2}", stats.avg_fps);
+            }
+            Err(e) => {
+                error!("Failed to process video: {}", e);
+            }
+        }
+    }
+
+    info!("\n🎉 All videos processed!");
+    Ok(())
+}
+
+struct ProcessingStats {
+    total_frames: i32,
+    frames_with_position: i32,
+    lane_changes_detected: usize,
+    overtakes_detected: usize,
+    duration_secs: f64,
+    avg_fps: f64,
+}
+
+async fn process_video(
+    video_path: &Path,
+    inference_engine: &mut inference::InferenceEngine,
+    video_processor: &video_processor::VideoProcessor,
+    config: &types::Config,
+) -> Result<ProcessingStats> {
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+
+    // Open video
+    let mut reader = video_processor.open_video(video_path)?;
+
+    // Create video writer for annotated output
+    let mut writer =
+        video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
+
+    // Initialize components with smoother! ⭐
+    let mut smoother = smoother::LanePositionSmoother::new(config.detection.smoother_window_size);
+    let mut overtake_detector = overtake_detector::OvertakeDetector::new(config.clone());
+
+    // Results storage
+    let mut overtakes = Vec::new();
+    let mut lane_changes = Vec::new();
+    let mut frame_count = 0;
+
+    // Track stats for summary
+    let mut frames_with_lanes = 0;
+    let mut frames_with_valid_position = 0;
+    let mut calibration_complete = false;
+
+    info!(
+        "🔄 Starting calibration phase ({} frames)...",
+        config.detection.calibration_frames
+    );
+
+    // Process frames
+    while let Some(frame) = reader.read_frame()? {
+        frame_count += 1;
+
+        // Show progress
+        if frame_count % 30 == 0 {
+            let progress_msg = if calibration_complete {
+                format!(
+                    "Progress: {:.1}% ({}/{}) - Valid pos: {}/{} ({:.1}%) - Lane changes: {} - Overtakes: {}",
+                    reader.progress(),
+                    reader.current_frame,
+                    reader.total_frames,
+                    frames_with_valid_position,
+                    frame_count,
+                    (frames_with_valid_position as f32 / frame_count as f32) * 100.0,
+                    lane_changes.len(),
+                    overtakes.len()
+                )
+            } else {
+                format!(
+                    "🔄 Calibrating: {}/{} frames",
+                    frame_count, config.detection.calibration_frames
+                )
+            };
+            info!("{}", progress_msg);
+        }
+
+        // Process frame with smoother ⭐
+        match process_frame(
+            &frame,
+            inference_engine,
+            &mut smoother,
+            &mut overtake_detector,
+            config,
+            frame_count,
+            calibration_complete,
+        )
+        .await
+        {
+            Ok(result) => {
+                // Update stats
+                if !result.lanes.is_empty() {
+                    frames_with_lanes += 1;
+                }
+
+                if result.had_valid_position {
+                    frames_with_valid_position += 1;
+                }
+
+                // Check if calibration just completed
+                if !calibration_complete && result.calibration_complete {
+                    calibration_complete = true;
+                    info!(
+                        "✅ Calibration complete! Baseline lane: {}",
+                        result.baseline_lane.unwrap_or(-1)
+                    );
+                }
+
+                // Save lane change event
+                if let Some(lane_change) = result.lane_change {
+                    lane_changes.push(lane_change.clone());
+                    info!(
+                        "🔄 Lane change #{}: {:?} (lane {} → {}) at {:.2}s",
+                        lane_changes.len(),
+                        lane_change.direction,
+                        lane_change.from_lane,
+                        lane_change.to_lane,
+                        lane_change.timestamp
+                    );
+                }
+
+                // Save overtake event
+                if let Some(overtake) = result.overtake {
+                    overtakes.push(overtake.clone());
+                    info!(
+                        "🎯 OVERTAKE #{} detected at {:.2}s",
+                        overtakes.len(),
+                        overtake.end_timestamp
+                    );
+                    info!(
+                        "   Direction: {:?} → {:?}",
+                        overtake.first_direction, overtake.second_direction
+                    );
+                    info!(
+                        "   Lanes: {} → {} → {}",
+                        overtake.start_lane,
+                        if overtake.first_direction == types::Direction::Right {
+                            overtake.start_lane + 1
+                        } else {
+                            overtake.start_lane - 1
+                        },
+                        overtake.end_lane
+                    );
+                    info!(
+                        "   Duration: {:.2}s",
+                        overtake.end_timestamp - overtake.start_timestamp
+                    );
+                    info!(
+                        "   Complete: {} | Confidence: {:.2}",
+                        overtake.is_complete, overtake.confidence
+                    );
+                }
+
+                // Draw lanes on frame and write to output video
+                if let Some(ref mut w) = writer {
+                    if let Ok(annotated) = video_processor::draw_lanes_with_info(
+                        &frame.data,
+                        reader.width,
+                        reader.height,
+                        &result.lanes,
+                        result.smoothed_position.as_ref(),
+                        calibration_complete,
+                    ) {
+                        use opencv::videoio::VideoWriterTrait;
+                        w.write(&annotated)?;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Frame {} processing failed: {}", frame_count, e);
+            }
+        }
+    }
+
+    let duration = start_time.elapsed();
+    let avg_fps = frame_count as f64 / duration.as_secs_f64();
+
+    // Print detailed summary
+    info!("\n📊 Processing Summary:");
+    info!(
+        "  Frames with lanes: {}/{} ({:.1}%)",
+        frames_with_lanes,
+        frame_count,
+        (frames_with_lanes as f32 / frame_count as f32) * 100.0
+    );
+    info!(
+        "  Frames with valid position: {}/{} ({:.1}%)",
+        frames_with_valid_position,
+        frame_count,
+        (frames_with_valid_position as f32 / frame_count as f32) * 100.0
+    );
+    info!("  Lane changes detected: {}", lane_changes.len());
+    info!("  Overtakes detected: {}", overtakes.len());
+
+    if !overtakes.is_empty() {
+        let complete_overtakes = overtakes.iter().filter(|o| o.is_complete).count();
+        info!("    └─ Complete overtakes: {}", complete_overtakes);
+        info!(
+            "    └─ Incomplete: {}",
+            overtakes.len() - complete_overtakes
+        );
+    }
+
+    // Save results to JSON
+    save_results(video_path, &overtakes, &lane_changes, config)?;
+
+    Ok(ProcessingStats {
+        total_frames: frame_count,
+        frames_with_position: frames_with_valid_position,
+        lane_changes_detected: lane_changes.len(),
+        overtakes_detected: overtakes.len(),
+        duration_secs: duration.as_secs_f64(),
+        avg_fps,
+    })
+}
+
+struct FrameResult {
+    lanes: Vec<types::Lane>,
+    raw_position: Option<types::VehiclePosition>,
+    smoothed_position: Option<types::VehiclePosition>,
+    lane_change: Option<types::LaneChangeEvent>,
+    overtake: Option<types::OvertakeEvent>,
+    had_valid_position: bool,
+    calibration_complete: bool,
+    baseline_lane: Option<i32>,
+}
+
+async fn process_frame(
+    frame: &types::Frame,
+    inference_engine: &mut inference::InferenceEngine,
+    smoother: &mut smoother::LanePositionSmoother,
+    overtake_detector: &mut overtake_detector::OvertakeDetector,
+    config: &types::Config,
+    frame_count: i32,
+    calibration_complete: bool,
+) -> Result<FrameResult> {
+    // 1. Preprocess
+    let preprocessed = preprocessing::preprocess(
+        &frame.data,
+        frame.width,
+        frame.height,
+        config.model.input_width,
+        config.model.input_height,
+    )?;
+
+    // 2. Run inference
+    let output = inference_engine.infer(&preprocessed)?;
+
+    // 3. Parse lanes
+    let lane_detection = lane_detection::parse_lanes(
+        &output,
+        frame.width as f32,
+        frame.height as f32,
+        config,
+        frame.timestamp,
+    )?;
+
+    // Filter lanes by confidence ⭐
+    let high_confidence_lanes: Vec<types::Lane> = lane_detection
+        .lanes
+        .into_iter()
+        .filter(|lane| lane.confidence > config.detection.min_lane_confidence)
+        .collect();
+
+    // Log lane detection every 30 frames
+    if frame_count % 30 == 0 {
+        debug!(
+            "Frame {}: {}/{} lanes above confidence threshold",
+            frame_count,
+            high_confidence_lanes.len(),
+            lane_detection.lanes.len()
+        );
+    }
+
+    // 4. Calculate raw vehicle position
+    let raw_position = if let Some((lane_idx, lateral_offset, confidence)) =
+        lane_detection::find_vehicle_lane_with_confidence(
+            &high_confidence_lanes,
+            frame.width as f32,
+        ) {
+        Some(types::VehiclePosition {
+            lane_index: lane_idx as i32,
+            lateral_offset,
+            confidence,
+            timestamp: frame.timestamp,
+        })
+    } else {
+        None
+    };
+
+    // 5. Smooth position ⭐ (CRITICAL STEP!)
+    let smoothed_position = if let Some(raw_pos) = raw_position {
+        // Only process if confidence is high enough
+        if raw_pos.confidence >= config.detection.min_position_confidence {
+            Some(smoother.smooth(raw_pos))
+        } else {
+            if frame_count % 30 == 0 {
+                debug!(
+                    "Frame {}: Skipping low confidence position ({:.2})",
+                    frame_count, raw_pos.confidence
+                );
+            }
+            None
+        }
+    } else {
+        None
+    };
+
+    // 6. Update overtake detector with smoothed position ⭐
+    let mut lane_change = None;
+    let mut overtake = None;
+    let mut new_calibration_complete = calibration_complete;
+    let mut baseline_lane = None;
+
+    if let Some(smooth_pos) = smoothed_position {
+        // Update detector
+        let result = overtake_detector.update_with_position(smooth_pos);
+
+        // Check calibration status
+        if !calibration_complete && overtake_detector.is_calibrated() {
+            new_calibration_complete = true;
+            baseline_lane = overtake_detector.get_baseline_lane();
+        }
+
+        // Extract events
+        lane_change = result.lane_change;
+        overtake = result.overtake;
+
+        // Debug logging
+        if frame_count % 30 == 0 {
+            debug!(
+                "Frame {}: Lane={}, Offset={:.2}, Conf={:.2}",
+                frame_count,
+                smooth_pos.lane_index,
+                smooth_pos.lateral_offset,
+                smooth_pos.confidence
+            );
+        }
+    }
+
+    Ok(FrameResult {
+        lanes: high_confidence_lanes,
+        raw_position,
+        smoothed_position,
+        lane_change,
+        overtake,
+        had_valid_position: smoothed_position.is_some(),
+        calibration_complete: new_calibration_complete,
+        baseline_lane,
+    })
+}
+
+fn save_results(
+    video_path: &Path,
+    overtakes: &[types::OvertakeEvent],
+    lane_changes: &[types::LaneChangeEvent],
+    config: &types::Config,
+) -> Result<()> {
+    use serde_json;
+    use std::fs::File;
+    use std::io::Write;
+
+    let video_name = video_path.file_stem().unwrap().to_str().unwrap();
+
+    // Save overtakes
+    let overtakes_path =
+        Path::new(&config.video.output_dir).join(format!("{}_overtakes.json", video_name));
+    let json = serde_json::to_string_pretty(overtakes)?;
+    let mut file = File::create(&overtakes_path)?;
+    file.write_all(json.as_bytes())?;
+    info!("💾 Overtakes saved to: {}", overtakes_path.display());
+
+    // Save lane changes
+    let lane_changes_path =
+        Path::new(&config.video.output_dir).join(format!("{}_lane_changes.json", video_name));
+    let json = serde_json::to_string_pretty(lane_changes)?;
+    let mut file = File::create(&lane_changes_path)?;
+    file.write_all(json.as_bytes())?;
+    info!("💾 Lane changes saved to: {}", lane_changes_path.display());
+
+    // Save summary
+    let summary = serde_json::json!({
+        "video": video_name,
+        "total_lane_changes": lane_changes.len(),
+        "total_overtakes": overtakes.len(),
+        "complete_overtakes": overtakes.iter().filter(|o| o.is_complete).count(),
+        "overtakes": overtakes,
+        "lane_changes": lane_changes,
+    });
+
+    let summary_path =
+        Path::new(&config.video.output_dir).join(format!("{}_summary.json", video_name));
+    let json = serde_json::to_string_pretty(&summary)?;
+    let mut file = File::create(&summary_path)?;
+    file.write_all(json.as_bytes())?;
+    info!("💾 Summary saved to: {}", summary_path.display());
+
+    Ok(())
+}
+use crate::types::{Config, Direction, LaneChangeEvent, OvertakeEvent};
+use std::collections::VecDeque;
+use tracing::info;
+
+pub struct OvertakeDetector {
+    config: Config,
+    lane_history: VecDeque<(i32, f64)>,
+    last_stable_lane: Option<i32>,
+    last_change_time: Option<f64>,
+    recent_changes: Vec<LaneChangeEvent>,
+}
+
+impl OvertakeDetector {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            lane_history: VecDeque::with_capacity(30),
+            last_stable_lane: None,
+            last_change_time: None,
+            recent_changes: Vec::new(),
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        current_lane: i32,
+        _lateral_offset: f32,
+        timestamp: f64,
+    ) -> Option<OvertakeEvent> {
+        // Add to history
+        self.lane_history.push_back((current_lane, timestamp));
+        if self.lane_history.len() > 30 {
+            self.lane_history.pop_front();
+        }
+
+        // Get stable lane (mode of last 10 frames)
+        let stable_lane = self.get_stable_lane();
+
+        // Detect lane change
+        if let Some(prev_stable) = self.last_stable_lane {
+            if stable_lane != prev_stable {
+                let event = LaneChangeEvent {
+                    timestamp,
+                    direction: if stable_lane > prev_stable {
+                        Direction::Right
+                    } else {
+                        Direction::Left
+                    },
+                    from_lane: prev_stable,
+                    to_lane: stable_lane,
+                    confidence: 0.8, // You can calculate actual confidence
+                };
+
+                info!(
+                    "Lane change detected: {:?} from {} to {}",
+                    event.direction, event.from_lane, event.to_lane
+                );
+
+                // Check for overtake
+                let overtake = self.check_overtake(&event);
+
+                self.last_stable_lane = Some(stable_lane);
+                self.last_change_time = Some(timestamp);
+
+                return overtake;
+            }
+        } else {
+            self.last_stable_lane = Some(stable_lane);
+        }
+
+        None
+    }
+
+    fn get_stable_lane(&self) -> i32 {
+        if self.lane_history.is_empty() {
+            return -1;
+        }
+
+        // Get mode of last 10 frames
+        let recent: Vec<i32> = self
+            .lane_history
+            .iter()
+            .rev()
+            .take(10)
+            .map(|(lane, _)| *lane)
+            .collect();
+
+        let mut counts = std::collections::HashMap::new();
+        for &lane in &recent {
+            *counts.entry(lane).or_insert(0) += 1;
+        }
+
+        counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(lane, _)| lane)
+            .unwrap_or(-1)
+    }
+
+    fn check_overtake(&mut self, current_event: &LaneChangeEvent) -> Option<OvertakeEvent> {
+        // Add to recent changes
+        self.recent_changes.push(current_event.clone());
+
+        // Keep only events within time window
+        self.recent_changes.retain(|e| {
+            current_event.timestamp - e.timestamp < self.config.overtake.max_window_seconds
+        });
+
+        // Need at least 2 lane changes
+        if self.recent_changes.len() < 2 {
+            return None;
+        }
+
+        let prev = &self.recent_changes[self.recent_changes.len() - 2];
+        let curr = current_event;
+
+        let delta = curr.timestamp - prev.timestamp;
+
+        // Check timing constraints
+        if delta < self.config.overtake.min_interval_seconds
+            || delta > self.config.overtake.max_window_seconds
+        {
+            return None;
+        }
+
+        // Check for opposite directions (overtake pattern)
+        let is_complete = (prev.direction == Direction::Left && curr.direction == Direction::Right)
+            || (prev.direction == Direction::Right && curr.direction == Direction::Left);
+
+        if is_complete {
+            info!("🚗 OVERTAKE DETECTED!");
+        }
+
+        Some(OvertakeEvent {
+            start_timestamp: prev.timestamp,
+            end_timestamp: curr.timestamp,
+            first_direction: prev.direction,
+            second_direction: curr.direction,
+            start_lane: prev.from_lane,
+            end_lane: curr.to_lane,
+            is_complete,
+            confidence: (prev.confidence + curr.confidence) / 2.0,
+        })
+    }
+}
+// src/preprocessing.rs
+
+use anyhow::Result;
+
+/// Preprocess raw RGB image for model input
+pub fn preprocess(
+    src: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst_width: usize,
+    dst_height: usize,
+) -> Result<Vec<f32>> {
+    // Resize
+    let resized = resize_bilinear(src, src_width, src_height, dst_width, dst_height);
+
+    // Normalize and convert HWC -> CHW
+    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+    const STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+    let mut output = vec![0.0f32; 3 * dst_height * dst_width];
+
+    for c in 0..3 {
+        for h in 0..dst_height {
+            for w in 0..dst_width {
+                let hwc_idx = (h * dst_width + w) * 3 + c;
+                let chw_idx = c * dst_height * dst_width + h * dst_width + w;
+
+                let pixel = resized[hwc_idx] as f32 / 255.0;
+                output[chw_idx] = (pixel - MEAN[c]) / STD[c];
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Bilinear image resize
+fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+    let mut dst = vec![0u8; dst_h * dst_w * 3];
+
+    let x_ratio = src_w as f32 / dst_w as f32;
+    let y_ratio = src_h as f32 / dst_h as f32;
+
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let sx = dx as f32 * x_ratio;
+            let sy = dy as f32 * y_ratio;
+
+            let sx0 = sx.floor() as usize;
+            let sy0 = sy.floor() as usize;
+            let sx1 = (sx0 + 1).min(src_w - 1);
+            let sy1 = (sy0 + 1).min(src_h - 1);
+
+            let fx = sx - sx0 as f32;
+            let fy = sy - sy0 as f32;
+
+            for c in 0..3 {
+                let p00 = src[(sy0 * src_w + sx0) * 3 + c] as f32;
+                let p10 = src[(sy0 * src_w + sx1) * 3 + c] as f32;
+                let p01 = src[(sy1 * src_w + sx0) * 3 + c] as f32;
+                let p11 = src[(sy1 * src_w + sx1) * 3 + c] as f32;
+
+                let val = p00 * (1.0 - fx) * (1.0 - fy)
+                    + p10 * fx * (1.0 - fy)
+                    + p01 * (1.0 - fx) * fy
+                    + p11 * fx * fy;
+
+                dst[(dy * dst_w + dx) * 3 + c] = val.round() as u8;
+            }
+        }
+    }
+
+    dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preprocess() {
+        let src = vec![128u8; 640 * 480 * 3];
+        let result = preprocess(&src, 640, 480, 1600, 320);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3 * 320 * 1600);
+    }
+
+    #[test]
+    fn test_resize() {
+        let src = vec![255u8; 100 * 100 * 3];
+        let dst = resize_bilinear(&src, 100, 100, 50, 50);
+        assert_eq!(dst.len(), 50 * 50 * 3);
+    }
+}
+// src/smoother.rs
+
+use crate::types::VehiclePosition;
+use std::collections::{HashMap, VecDeque};
+
+/// Temporal smoother for vehicle position using a sliding window
+pub struct LanePositionSmoother {
+    history: VecDeque<VehiclePosition>,
+    window_size: usize,
+}
+
+impl LanePositionSmoother {
+    /// Create a new smoother with specified window size
+    ///
+    /// # Arguments
+    /// * `window_size` - Number of frames to use for smoothing (e.g., 10 frames)
+    pub fn new(window_size: usize) -> Self {
+        Self {
+            history: VecDeque::with_capacity(window_size),
+            window_size,
+        }
+    }
+
+    /// Smooth the current position using temporal window
+    ///
+    /// Uses different strategies for different components:
+    /// - Lane index: Mode (most common value)
+    /// - Lateral offset: Median (resistant to outliers)
+    /// - Confidence: Average
+    pub fn smooth(&mut self, position: VehiclePosition) -> VehiclePosition {
+        self.history.push_back(position);
+
+        // Maintain window size
+        if self.history.len() > self.window_size {
+            self.history.pop_front();
+        }
+
+        // Need at least 3 frames for meaningful smoothing
+        if self.history.len() < 3 {
+            return position;
+        }
+
+        VehiclePosition {
+            lane_index: self.smooth_lane_index(),
+            lateral_offset: self.smooth_lateral_offset(),
+            confidence: self.smooth_confidence(),
+            timestamp: position.timestamp, // Keep current timestamp
+        }
+    }
+
+    /// Get the most common lane index (mode)
+    fn smooth_lane_index(&self) -> i32 {
+        let mut counts: HashMap<i32, usize> = HashMap::new();
+
+        for pos in &self.history {
+            *counts.entry(pos.lane_index).or_insert(0) += 1;
+        }
+
+        counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(lane, _)| lane)
+            .unwrap_or(-1)
+    }
+
+    /// Get median lateral offset (resistant to outliers)
+    fn smooth_lateral_offset(&self) -> f32 {
+        let mut offsets: Vec<f32> = self.history.iter().map(|p| p.lateral_offset).collect();
+        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        offsets[offsets.len() / 2]
+    }
+
+    /// Get average confidence
+    fn smooth_confidence(&self) -> f32 {
+        let sum: f32 = self.history.iter().map(|p| p.confidence).sum();
+        sum / self.history.len() as f32
+    }
+
+    /// Reset the smoother (e.g., when video changes)
+    pub fn reset(&mut self) {
+        self.history.clear();
+    }
+
+    /// Get the number of frames currently in the history
+    pub fn history_size(&self) -> usize {
+        self.history.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smoother_mode_for_lane_index() {
+        let mut smoother = LanePositionSmoother::new(5);
+
+        // Feed noisy lane detections: [1, 1, 2, 1, 1]
+        let positions = vec![
+            VehiclePosition {
+                lane_index: 1,
+                lateral_offset: 0.0,
+                confidence: 0.8,
+                timestamp: 0.0,
+            },
+            VehiclePosition {
+                lane_index: 1,
+                lateral_offset: 0.0,
+                confidence: 0.8,
+                timestamp: 0.033,
+            },
+            VehiclePosition {
+                lane_index: 2, // noise
+                lateral_offset: 0.0,
+                confidence: 0.8,
+                timestamp: 0.066,
+            },
+            VehiclePosition {
+                lane_index: 1,
+                lateral_offset: 0.0,
+                confidence: 0.8,
+                timestamp: 0.099,
+            },
+            VehiclePosition {
+                lane_index: 1,
+                lateral_offset: 0.0,
+                confidence: 0.8,
+                timestamp: 0.132,
+            },
+        ];
+
+        for pos in positions {
+            smoother.smooth(pos);
+        }
+
+        // Last smoothed position should have lane_index = 1 (mode)
+        let last_pos = positions.last().unwrap();
+        let smoothed = smoother.smooth(*last_pos);
+        assert_eq!(smoothed.lane_index, 1);
+    }
+
+    #[test]
+    fn test_smoother_median_for_offset() {
+        let mut smoother = LanePositionSmoother::new(5);
+
+        // Feed offsets with outlier: [-0.1, -0.05, 0.0, 0.05, 2.0 (outlier)]
+        let offsets = vec![-0.1, -0.05, 0.0, 0.05, 2.0];
+
+        for (i, offset) in offsets.iter().enumerate() {
+            let pos = VehiclePosition {
+                lane_index: 1,
+                lateral_offset: *offset,
+                confidence: 0.8,
+                timestamp: i as f64 * 0.033,
+            };
+            smoother.smooth(pos);
+        }
+
+        let last_pos = VehiclePosition {
+            lane_index: 1,
+            lateral_offset: 2.0,
+            confidence: 0.8,
+            timestamp: 0.165,
+        };
+        let smoothed = smoother.smooth(last_pos);
+
+        // Median should be 0.0 (middle value), not affected by 2.0 outlier
+        assert_eq!(smoothed.lateral_offset, 0.0);
+    }
+}
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub model: ModelConfig,
+    pub inference: InferenceConfig,
+    pub detection: DetectionConfig,
+    pub overtake: OvertakeConfig,
+    pub video: VideoConfig,
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub path: String,
+    pub input_width: usize,
+    pub input_height: usize,
+    pub num_anchors: usize,
+    pub num_lanes: usize,
+    pub griding_num: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    pub use_tensorrt: bool,
+    pub use_fp16: bool,
+    pub enable_engine_cache: bool,
+    pub engine_cache_path: String,
+    pub num_threads: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionConfig {
+    pub confidence_threshold: f32,
+    pub min_points_per_lane: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OvertakeConfig {
+    pub lane_change_offset_threshold: f32,
+    pub debounce_frames: u32,
+    pub confirm_frames: u32,
+    pub max_window_seconds: f64,
+    pub min_interval_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    pub input_dir: String,
+    pub output_dir: String,
+    pub source_width: usize,
+    pub source_height: usize,
+    pub target_fps: u32,
+    pub save_annotated: bool,
+    pub save_events_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Lane {
+    pub points: Vec<(f32, f32)>,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneDetection {
+    pub lanes: Vec<Lane>,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneChangeEvent {
+    pub timestamp: f64,
+    pub direction: Direction,
+    pub from_lane: i32,
+    pub to_lane: i32,
+    pub confidence: f32,
+}
+
+// Make sure these have Serialize
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum Direction {
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OvertakeEvent {
+    pub start_timestamp: f64,
+    pub end_timestamp: f64,
+    pub first_direction: Direction,
+    pub second_direction: Direction,
+    pub start_lane: i32,
+    pub end_lane: i32,
+    pub is_complete: bool,
+    pub confidence: f32,
+}
+
+// Add to src/types.rs
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct VehiclePosition {
+    pub lane_index: i32,
+    pub lateral_offset: f32,
+    pub confidence: f32,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Direction {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LaneChangeEvent {
+    pub timestamp: f64,
+    pub direction: Direction,
+    pub from_lane: i32,
+    pub to_lane: i32,
+    pub confidence: f32,
+}
+// src/video_processor.rs
+
+use crate::types::Config;
+use anyhow::Result;
+use opencv::{
+    core::{self, Mat},
+    imgproc,
+    prelude::*,
+    videoio::{self, VideoCapture, VideoCaptureTraitConst, VideoWriter},
+};
+use std::path::{Path, PathBuf};
+use tracing::info;
+use walkdir::WalkDir;
+
+pub struct VideoProcessor {
+    config: Config,
+}
+
+impl VideoProcessor {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    pub fn find_video_files(&self) -> Result<Vec<PathBuf>> {
+        let mut videos = Vec::new();
+
+        let video_extensions = vec!["mp4", "avi", "mov", "mkv", "MP4", "AVI", "MOV", "MKV"];
+
+        for entry in WalkDir::new(&self.config.video.input_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if video_extensions.contains(&ext.to_str().unwrap_or("")) {
+                    videos.push(path.to_path_buf());
+                }
+            }
+        }
+
+        info!("Found {} video files", videos.len());
+        Ok(videos)
+    }
+
+    pub fn open_video(&self, path: &Path) -> Result<VideoReader> {
+        info!("Opening video: {}", path.display());
+
+        let cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
+
+        if !cap.is_opened()? {
+            anyhow::bail!("Failed to open video file");
+        }
+
+        let fps = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FPS)?;
+        let total_frames = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
+        let width = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
+        let height = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
+
+        info!(
+            "Video properties: {}x{} @ {:.1} FPS, {} frames",
+            width, height, fps, total_frames
+        );
+
+        Ok(VideoReader {
+            cap,
+            fps,
+            total_frames,
+            current_frame: 0,
+            width,
+            height,
+        })
+    }
+
+    pub fn create_writer(
+        &self,
+        input_path: &Path,
+        width: i32,
+        height: i32,
+        fps: f64,
+    ) -> Result<Option<VideoWriter>> {
+        if !self.config.video.save_annotated {
+            return Ok(None);
+        }
+
+        std::fs::create_dir_all(&self.config.video.output_dir)?;
+
+        let input_name = input_path.file_stem().unwrap().to_str().unwrap();
+        let output_path = PathBuf::from(&self.config.video.output_dir)
+            .join(format!("{}_annotated.mp4", input_name));
+
+        info!("Output video: {}", output_path.display());
+
+        let fourcc = VideoWriter::fourcc('m', 'p', '4', 'v')?;
+        let writer = VideoWriter::new(
+            output_path.to_str().unwrap(),
+            fourcc,
+            fps,
+            core::Size::new(width, height),
+            true,
+        )?;
+
+        Ok(Some(writer))
+    }
+}
+
+pub struct VideoReader {
+    pub cap: VideoCapture,
+    pub fps: f64,
+    pub total_frames: i32,
+    pub current_frame: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl VideoReader {
+    pub fn read_frame(&mut self) -> Result<Option<crate::types::Frame>> {
+        use opencv::videoio::VideoCaptureTrait;
+
+        let mut mat = Mat::default();
+
+        if !VideoCaptureTrait::read(&mut self.cap, &mut mat)? || mat.empty() {
+            return Ok(None);
+        }
+
+        self.current_frame += 1;
+        let timestamp = (self.current_frame as f64) / self.fps;
+
+        let mut rgb_mat = Mat::default();
+        imgproc::cvt_color(&mat, &mut rgb_mat, imgproc::COLOR_BGR2RGB, 0)?;
+
+        let data = rgb_mat.data_bytes()?.to_vec();
+
+        Ok(Some(crate::types::Frame {
+            data,
+            width: self.width as usize,
+            height: self.height as usize,
+            timestamp,
+        }))
+    }
+
+    pub fn progress(&self) -> f32 {
+        if self.total_frames == 0 {
+            return 0.0;
+        }
+        (self.current_frame as f32 / self.total_frames as f32) * 100.0
+    }
+}
+
+pub fn draw_lanes(
+    frame: &[u8],
+    _width: i32,
+    height: i32,
+    lanes: &[crate::types::Lane],
+) -> Result<Mat> {
+    let mat = Mat::from_slice(frame)?;
+    let mat = mat.reshape(3, height)?;
+
+    let mut bgr_mat = Mat::default();
+    imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
+
+    let mut output = bgr_mat.try_clone()?;
+
+    let colors = vec![
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+    ];
+
+    for (i, lane) in lanes.iter().enumerate() {
+        let color = colors[i % colors.len()];
+
+        for point in &lane.points {
+            let pt = core::Point::new(point.0 as i32, point.1 as i32);
+            imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
+        }
+
+        for window in lane.points.windows(2) {
+            let pt1 = core::Point::new(window[0].0 as i32, window[0].1 as i32);
+            let pt2 = core::Point::new(window[1].0 as i32, window[1].1 as i32);
+            imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
+        }
+    }
+
+    Ok(output)
+}
