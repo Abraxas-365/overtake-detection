@@ -1,4 +1,10 @@
+// src/types.rs
+
 use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Configuration Structs
+// ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -40,6 +46,7 @@ pub struct DetectionConfig {
     pub min_lane_confidence: f32,
     pub min_position_confidence: f32,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OvertakeConfig {
     pub lane_change_offset_threshold: f32,
@@ -65,6 +72,10 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+// ============================================================================
+// Video Processing Types
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub data: Vec<u8>,
@@ -85,7 +96,29 @@ pub struct LaneDetection {
     pub timestamp: f64,
 }
 
-#[derive(Debug, Clone)]
+// ============================================================================
+// Vehicle Position and Direction
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VehiclePosition {
+    pub lane_index: i32,
+    pub lateral_offset: f32,
+    pub confidence: f32,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Direction {
+    Left,
+    Right,
+}
+
+// ============================================================================
+// Event Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneChangeEvent {
     pub timestamp: f64,
     pub direction: Direction,
@@ -94,15 +127,7 @@ pub struct LaneChangeEvent {
     pub confidence: f32,
 }
 
-// Make sure these have Serialize
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub enum Direction {
-    None,
-    Left,
-    Right,
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OvertakeEvent {
     pub start_timestamp: f64,
     pub end_timestamp: f64,
@@ -114,27 +139,63 @@ pub struct OvertakeEvent {
     pub confidence: f32,
 }
 
-// Add to src/types.rs
+// ============================================================================
+// Implementation: Config Loading
+// ============================================================================
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct VehiclePosition {
-    pub lane_index: i32,
-    pub lateral_offset: f32,
-    pub confidence: f32,
-    pub timestamp: f64,
+impl Config {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&contents)?;
+        Ok(config)
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Direction {
-    Left,
-    Right,
+// ============================================================================
+// Implementation: VehiclePosition Helpers
+// ============================================================================
+
+impl VehiclePosition {
+    /// Create an invalid position (used as default/placeholder)
+    pub fn invalid() -> Self {
+        Self {
+            lane_index: -1,
+            lateral_offset: 0.0,
+            confidence: 0.0,
+            timestamp: 0.0,
+        }
+    }
+
+    /// Check if this position is valid
+    pub fn is_valid(&self) -> bool {
+        self.lane_index >= 0 && self.confidence > 0.0
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LaneChangeEvent {
-    pub timestamp: f64,
-    pub direction: Direction,
-    pub from_lane: i32,
-    pub to_lane: i32,
-    pub confidence: f32,
+// ============================================================================
+// Implementation: Direction Helpers
+// ============================================================================
+
+impl Direction {
+    /// Convert to string for display
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Direction::Left => "Left",
+            Direction::Right => "Right",
+        }
+    }
+
+    /// Get opposite direction
+    pub fn opposite(&self) -> Self {
+        match self {
+            Direction::Left => Direction::Right,
+            Direction::Right => Direction::Left,
+        }
+    }
+}
+
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }

@@ -7,11 +7,11 @@ mod overtake_detector;
 mod preprocessing;
 mod smoother;
 mod types;
-mod video_processor; // ← NEW MODULE
+mod video_processor;
 
 use anyhow::Result;
 use std::path::Path;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,6 +35,14 @@ async fn main() -> Result<()> {
     );
     info!("  Debounce frames: {}", config.detection.debounce_frames);
     info!("  Confirm frames: {}", config.detection.confirm_frames);
+    info!(
+        "  Min lane confidence: {:.2}",
+        config.detection.min_lane_confidence
+    );
+    info!(
+        "  Min position confidence: {:.2}",
+        config.detection.min_position_confidence
+    );
 
     // Initialize inference engine
     let mut inference_engine = inference::InferenceEngine::new(config.clone())?;
@@ -50,6 +58,8 @@ async fn main() -> Result<()> {
         error!("No video files found in {}", config.video.input_dir);
         return Ok(());
     }
+
+    info!("Found {} video file(s) to process", video_files.len());
 
     // Process each video
     for (idx, video_path) in video_files.iter().enumerate() {
@@ -193,7 +203,7 @@ async fn process_video(
                 if let Some(lane_change) = result.lane_change {
                     lane_changes.push(lane_change.clone());
                     info!(
-                        "🔄 Lane change #{}: {:?} (lane {} → {}) at {:.2}s",
+                        "🔄 Lane change #{}: {} (lane {} → {}) at {:.2}s",
                         lane_changes.len(),
                         lane_change.direction,
                         lane_change.from_lane,
@@ -211,18 +221,19 @@ async fn process_video(
                         overtake.end_timestamp
                     );
                     info!(
-                        "   Direction: {:?} → {:?}",
+                        "   Direction: {} → {}",
                         overtake.first_direction, overtake.second_direction
                     );
+
+                    let middle_lane = if overtake.first_direction == types::Direction::Right {
+                        overtake.start_lane + 1
+                    } else {
+                        overtake.start_lane - 1
+                    };
+
                     info!(
                         "   Lanes: {} → {} → {}",
-                        overtake.start_lane,
-                        if overtake.first_direction == types::Direction::Right {
-                            overtake.start_lane + 1
-                        } else {
-                            overtake.start_lane - 1
-                        },
-                        overtake.end_lane
+                        overtake.start_lane, middle_lane, overtake.end_lane
                     );
                     info!(
                         "   Duration: {:.2}s",
@@ -338,6 +349,9 @@ async fn process_frame(
         frame.timestamp,
     )?;
 
+    // Save total lanes count BEFORE filtering (to avoid borrow after move)
+    let total_lanes_detected = lane_detection.lanes.len();
+
     // Filter lanes by confidence ⭐
     let high_confidence_lanes: Vec<types::Lane> = lane_detection
         .lanes
@@ -351,7 +365,7 @@ async fn process_frame(
             "Frame {}: {}/{} lanes above confidence threshold",
             frame_count,
             high_confidence_lanes.len(),
-            lane_detection.lanes.len()
+            total_lanes_detected
         );
     }
 
@@ -443,6 +457,9 @@ fn save_results(
     use std::fs::File;
     use std::io::Write;
 
+    // Ensure output directory exists
+    std::fs::create_dir_all(&config.video.output_dir)?;
+
     let video_name = video_path.file_stem().unwrap().to_str().unwrap();
 
     // Save overtakes
@@ -467,6 +484,7 @@ fn save_results(
         "total_lane_changes": lane_changes.len(),
         "total_overtakes": overtakes.len(),
         "complete_overtakes": overtakes.iter().filter(|o| o.is_complete).count(),
+        "incomplete_overtakes": overtakes.iter().filter(|o| !o.is_complete).count(),
         "overtakes": overtakes,
         "lane_changes": lane_changes,
     });
