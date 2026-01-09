@@ -108,3 +108,28 @@ pub struct OvertakeEvent {
     pub is_complete: bool,
     pub confidence: f32,
 }
+
+// Add to src/types.rs
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct VehiclePosition {
+    pub lane_index: i32,
+    pub lateral_offset: f32,
+    pub confidence: f32,
+    pub timestamp: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Direction {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LaneChangeEvent {
+    pub timestamp: f64,
+    pub direction: Direction,
+    pub from_lane: i32,
+    pub to_lane: i32,
+    pub confidence: f32,
+}
