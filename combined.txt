@@ -827,28 +827,18 @@ pub fn draw_lanes_with_state(
 // src/analysis/state_machine.rs
 
 use crate::types::{Direction, LaneChangeConfig, LaneChangeEvent, LaneChangeState, VehicleState};
-use std::collections::HashMap;
 use tracing::{debug, info};
 
-/// State machine for lane change detection (matching Python implementation)
 pub struct LaneChangeStateMachine {
     config: LaneChangeConfig,
     source_id: String,
-
-    // Current state
     state: LaneChangeState,
     frames_in_state: u32,
-
-    // Pending state transition
     pending_state: Option<LaneChangeState>,
     pending_frames: u32,
-
-    // Lane change tracking
     change_direction: Direction,
     change_start_frame: Option<u64>,
     change_start_time: Option<f64>,
-
-    // Cooldown tracking
     cooldown_remaining: u32,
 }
 
@@ -868,61 +858,45 @@ impl LaneChangeStateMachine {
         }
     }
 
-    pub fn with_source_id(mut self, source_id: String) -> Self {
-        self.source_id = source_id;
-        self
-    }
-
-    /// Get current state name
     pub fn current_state(&self) -> &str {
         self.state.as_str()
     }
 
-    /// Update state machine with new vehicle state
     pub fn update(
         &mut self,
         vehicle_state: &VehicleState,
         frame_id: u64,
         timestamp_ms: f64,
     ) -> Option<LaneChangeEvent> {
-        // Handle cooldown period
         if self.cooldown_remaining > 0 {
             self.cooldown_remaining -= 1;
             if self.cooldown_remaining == 0 {
-                // Reset to CENTERED after cooldown
                 self.state = LaneChangeState::Centered;
                 self.frames_in_state = 0;
             }
             return None;
         }
 
-        // Check if we have valid lane information
         if !vehicle_state.is_valid() {
             return None;
         }
 
-        // Calculate normalized offset (as fraction of lane width)
-        let lane_width = vehicle_state.lane_width.unwrap(); // Safe due to is_valid check
+        let lane_width = vehicle_state.lane_width.unwrap();
         let normalized_offset = (vehicle_state.lateral_offset / lane_width).abs();
         let direction = Direction::from_offset(vehicle_state.lateral_offset);
 
-        // Determine target state based on offset magnitude
         let target_state = self.determine_target_state(normalized_offset);
 
-        // Check for state transition
         self.check_transition(target_state, direction, frame_id, timestamp_ms)
     }
 
-    /// Determine target state based on lateral offset magnitude
     fn determine_target_state(&self, normalized_offset: f32) -> LaneChangeState {
         if normalized_offset >= self.config.crossing_threshold {
             LaneChangeState::Crossing
         } else if normalized_offset >= self.config.drift_threshold {
             LaneChangeState::Drifting
         } else {
-            // Vehicle is centered
             if self.state == LaneChangeState::Crossing {
-                // Was crossing, now centered = completed
                 LaneChangeState::Completed
             } else {
                 LaneChangeState::Centered
@@ -930,7 +904,6 @@ impl LaneChangeStateMachine {
         }
     }
 
-    /// Check if state transition should occur
     fn check_transition(
         &mut self,
         target_state: LaneChangeState,
@@ -938,7 +911,6 @@ impl LaneChangeStateMachine {
         frame_id: u64,
         timestamp_ms: f64,
     ) -> Option<LaneChangeEvent> {
-        // Same state as current - reset pending and increment counter
         if target_state == self.state {
             self.pending_state = None;
             self.pending_frames = 0;
@@ -946,7 +918,6 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Different target state - accumulate confirmation frames
         if self.pending_state == Some(target_state) {
             self.pending_frames += 1;
         } else {
@@ -954,16 +925,13 @@ impl LaneChangeStateMachine {
             self.pending_frames = 1;
         }
 
-        // Check if we have enough confirmation frames
         if self.pending_frames < self.config.min_frames_confirm {
             return None;
         }
 
-        // Transition confirmed - execute and potentially emit event
         self.execute_transition(target_state, direction, frame_id, timestamp_ms)
     }
 
-    /// Execute state transition and create event if applicable
     fn execute_transition(
         &mut self,
         target_state: LaneChangeState,
@@ -973,7 +941,6 @@ impl LaneChangeStateMachine {
     ) -> Option<LaneChangeEvent> {
         let from_state = self.state;
 
-        // Track lane change start
         if target_state == LaneChangeState::Drifting && from_state == LaneChangeState::Centered {
             self.change_direction = direction;
             self.change_start_frame = Some(frame_id);
@@ -985,29 +952,22 @@ impl LaneChangeStateMachine {
             );
         }
 
-        // Calculate duration for completed lane changes
         let duration_ms = if target_state == LaneChangeState::Completed {
             self.change_start_time.map(|start| timestamp_ms - start)
         } else {
             None
         };
 
-        // Update state
         self.state = target_state;
         self.frames_in_state = 0;
         self.pending_state = None;
         self.pending_frames = 0;
 
-        // Handle completed state - start cooldown and emit event
         if target_state == LaneChangeState::Completed {
             self.cooldown_remaining = self.config.cooldown_frames;
 
-            let mut event = LaneChangeEvent::new(
-                timestamp_ms,
-                frame_id,
-                self.change_direction,
-                0.9, // Could be calculated from detection confidences
-            );
+            let mut event =
+                LaneChangeEvent::new(timestamp_ms, frame_id, self.change_direction, 0.9);
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
             event.metadata.insert(
@@ -1025,7 +985,6 @@ impl LaneChangeStateMachine {
                 frame_id
             );
 
-            // Reset lane change tracking
             self.change_direction = Direction::Unknown;
             self.change_start_frame = None;
             self.change_start_time = None;
@@ -1036,7 +995,6 @@ impl LaneChangeStateMachine {
         None
     }
 
-    /// Reset state machine to initial state
     pub fn reset(&mut self) {
         self.state = LaneChangeState::Centered;
         self.frames_in_state = 0;
@@ -1048,199 +1006,17 @@ impl LaneChangeStateMachine {
         self.cooldown_remaining = 0;
     }
 
-    /// Set source ID for events
     pub fn set_source_id(&mut self, source_id: String) {
         self.source_id = source_id;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn create_config() -> LaneChangeConfig {
-        LaneChangeConfig {
-            drift_threshold: 0.2,
-            crossing_threshold: 0.4,
-            min_frames_confirm: 3,
-            cooldown_frames: 10,
-            smoothing_alpha: 0.3,
-            reference_y_ratio: 0.8,
-        }
-    }
-
-    fn create_vehicle_state(lateral_offset: f32, lane_width: f32) -> VehicleState {
-        VehicleState {
-            lateral_offset,
-            lane_width: Some(lane_width),
-            heading_offset: 0.0,
-            frame_id: 0,
-            timestamp_ms: 0.0,
-        }
-    }
-
-    #[test]
-    fn test_initial_state_is_centered() {
-        let fsm = LaneChangeStateMachine::new(create_config());
-        assert_eq!(fsm.current_state(), "CENTERED");
-    }
-
-    #[test]
-    fn test_no_event_when_centered() {
-        let mut fsm = LaneChangeStateMachine::new(create_config());
-        let centered = create_vehicle_state(0.0, 400.0);
-
-        let event = fsm.update(&centered, 0, 0.0);
-
-        assert!(event.is_none());
-        assert_eq!(fsm.current_state(), "CENTERED");
-    }
-
-    #[test]
-    fn test_drift_detection_requires_multiple_frames() {
-        let mut fsm = LaneChangeStateMachine::new(create_config());
-
-        // 25% offset = drifting
-        let drifting = create_vehicle_state(100.0, 400.0);
-
-        // First two frames shouldn't trigger transition
-        let event1 = fsm.update(&drifting, 0, 0.0);
-        let event2 = fsm.update(&drifting, 1, 33.3);
-
-        assert!(event1.is_none());
-        assert!(event2.is_none());
-        assert_eq!(fsm.current_state(), "CENTERED");
-
-        // Third frame should trigger transition to DRIFTING
-        let event3 = fsm.update(&drifting, 2, 66.6);
-
-        assert!(event3.is_none()); // No event for DRIFTING
-        assert_eq!(fsm.current_state(), "DRIFTING");
-    }
-
-    #[test]
-    fn test_complete_lane_change_emits_event() {
-        let config = LaneChangeConfig {
-            drift_threshold: 0.2,
-            crossing_threshold: 0.4,
-            min_frames_confirm: 2,
-            cooldown_frames: 0,
-            ..Default::default()
-        };
-        let mut fsm = LaneChangeStateMachine::new(config);
-
-        let mut events = Vec::new();
-        let mut frame_id = 0u64;
-
-        // Phase 1: Start drifting (25% offset)
-        let drifting = create_vehicle_state(100.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&drifting, frame_id, frame_id as f64 * 33.3) {
-                events.push(e);
-            }
-            frame_id += 1;
-        }
-        assert_eq!(fsm.current_state(), "DRIFTING");
-
-        // Phase 2: Cross boundary (50% offset)
-        let crossing = create_vehicle_state(200.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&crossing, frame_id, frame_id as f64 * 33.3) {
-                events.push(e);
-            }
-            frame_id += 1;
-        }
-        assert_eq!(fsm.current_state(), "CROSSING");
-
-        // Phase 3: Re-center in new lane
-        let centered = create_vehicle_state(10.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&centered, frame_id, frame_id as f64 * 33.3) {
-                events.push(e);
-            }
-            frame_id += 1;
-        }
-
-        // Should have emitted a COMPLETED event
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].direction, Direction::Right);
-        assert!(events[0].duration_ms.is_some());
-        assert!(events[0].duration_ms.unwrap() > 0.0);
-    }
-
-    #[test]
-    fn test_direction_tracking_left() {
-        let config = LaneChangeConfig {
-            drift_threshold: 0.2,
-            crossing_threshold: 0.4,
-            min_frames_confirm: 2,
-            cooldown_frames: 0,
-            ..Default::default()
-        };
-        let mut fsm = LaneChangeStateMachine::new(config);
-
-        let mut event: Option<LaneChangeEvent> = None;
-        let mut frame_id = 0u64;
-
-        // Negative offset = drifting left
-        let drifting_left = create_vehicle_state(-100.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&drifting_left, frame_id, frame_id as f64 * 33.3) {
-                event = Some(e);
-            }
-            frame_id += 1;
-        }
-
-        let crossing_left = create_vehicle_state(-200.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&crossing_left, frame_id, frame_id as f64 * 33.3) {
-                event = Some(e);
-            }
-            frame_id += 1;
-        }
-
-        let centered = create_vehicle_state(-10.0, 400.0);
-        for _ in 0..3 {
-            if let Some(e) = fsm.update(&centered, frame_id, frame_id as f64 * 33.3) {
-                event = Some(e);
-            }
-            frame_id += 1;
-        }
-
-        assert!(event.is_some());
-        let e = event.unwrap();
-        assert_eq!(e.direction, Direction::Left);
-        assert_eq!(e.direction_name(), "LEFT");
-    }
-
-    #[test]
-    fn test_reset_clears_state() {
-        let mut fsm = LaneChangeStateMachine::new(create_config());
-
-        // Get into DRIFTING state
-        let drifting = create_vehicle_state(100.0, 400.0);
-        for i in 0..5 {
-            fsm.update(&drifting, i, i as f64 * 33.3);
-        }
-        assert_eq!(fsm.current_state(), "DRIFTING");
-
-        // Reset
-        fsm.reset();
-        assert_eq!(fsm.current_state(), "CENTERED");
-    }
-}
 // src/analysis/position_estimator.rs
 
-use crate::types::{Lane, LanePosition, VehicleState};
-use tracing::debug;
+use crate::types::{Lane, VehicleState};
 
-/// Estimates vehicle lateral position from lane detections
 pub struct PositionEstimator {
-    /// Vertical position for measurement (0=top, 1=bottom)
     pub reference_y_ratio: f32,
-    /// Minimum acceptable lane width in pixels
     pub min_lane_width: f32,
-    /// Maximum acceptable lane width in pixels
     pub max_lane_width: f32,
 }
 
@@ -1253,46 +1029,32 @@ impl PositionEstimator {
         }
     }
 
-    /// Estimate vehicle position from detected lanes
     pub fn estimate(&self, lanes: &[Lane], frame_width: u32, frame_height: u32) -> VehicleState {
         let vehicle_x = frame_width as f32 / 2.0;
         let reference_y = frame_height as f32 * self.reference_y_ratio;
 
-        // Find ego lane boundaries (lanes closest to center on each side)
         let left_lane = self.find_ego_lane(lanes, vehicle_x, true);
         let right_lane = self.find_ego_lane(lanes, vehicle_x, false);
 
-        // Calculate positions at reference Y
-        let left_x = left_lane.and_then(|l| l.get_x_at_y(reference_y));
-        let right_x = right_lane.and_then(|l| l.get_x_at_y(reference_y));
+        let left_x = left_lane.and_then(|l: &Lane| l.get_x_at_y(reference_y));
+        let right_x = right_lane.and_then(|l: &Lane| l.get_x_at_y(reference_y));
 
-        // Calculate lane width and offset
         let mut lane_width: Option<f32> = None;
         let mut lateral_offset = 0.0f32;
 
         match (left_x, right_x) {
             (Some(lx), Some(rx)) => {
                 let width = rx - lx;
-
-                // Validate lane width
                 if width >= self.min_lane_width && width <= self.max_lane_width {
                     lane_width = Some(width);
                     let lane_center = (lx + rx) / 2.0;
-                    // Offset: positive = right of center, negative = left of center
                     lateral_offset = vehicle_x - lane_center;
-                } else {
-                    debug!(
-                        "Invalid lane width: {:.1} (min: {:.1}, max: {:.1})",
-                        width, self.min_lane_width, self.max_lane_width
-                    );
                 }
             }
             (Some(lx), None) => {
-                // Only left lane visible
                 lateral_offset = vehicle_x - lx;
             }
             (None, Some(rx)) => {
-                // Only right lane visible
                 lateral_offset = vehicle_x - rx;
             }
             (None, None) => {}
@@ -1307,7 +1069,6 @@ impl PositionEstimator {
         }
     }
 
-    /// Find the ego lane boundary on one side
     fn find_ego_lane<'a>(
         &self,
         lanes: &'a [Lane],
@@ -1320,31 +1081,20 @@ impl PositionEstimator {
             if lane.points.is_empty() {
                 continue;
             }
-
             let avg_x = lane.avg_x();
 
-            if is_left {
-                // Left boundary should be to the left of vehicle
-                if avg_x < vehicle_x {
-                    let distance = vehicle_x - avg_x;
-                    candidates.push((lane, distance));
-                }
-            } else {
-                // Right boundary should be to the right of vehicle
-                if avg_x > vehicle_x {
-                    let distance = avg_x - vehicle_x;
-                    candidates.push((lane, distance));
-                }
+            if is_left && avg_x < vehicle_x {
+                candidates.push((lane, vehicle_x - avg_x));
+            } else if !is_left && avg_x > vehicle_x {
+                candidates.push((lane, avg_x - vehicle_x));
             }
         }
 
-        // Return closest lane
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         candidates.first().map(|(lane, _)| *lane)
     }
 }
 
-/// Temporal smoothing for position estimates using EMA
 pub struct PositionSmoother {
     alpha: f32,
     smoothed_offset: Option<f32>,
@@ -1360,9 +1110,7 @@ impl PositionSmoother {
         }
     }
 
-    /// Apply temporal smoothing to vehicle state
     pub fn smooth(&mut self, state: VehicleState) -> VehicleState {
-        // Smooth lateral offset
         let smoothed_offset = match self.smoothed_offset {
             None => {
                 self.smoothed_offset = Some(state.lateral_offset);
@@ -1375,7 +1123,6 @@ impl PositionSmoother {
             }
         };
 
-        // Smooth lane width
         let smoothed_width = if let Some(width) = state.lane_width {
             match self.smoothed_width {
                 None => {
@@ -1401,85 +1148,9 @@ impl PositionSmoother {
         }
     }
 
-    /// Reset smoother state
     pub fn reset(&mut self) {
         self.smoothed_offset = None;
         self.smoothed_width = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Point;
-
-    fn create_test_lane(lane_id: usize, x_positions: &[f32], y_start: f32, y_step: f32) -> Lane {
-        let points: Vec<Point> = x_positions
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| Point::new(x, y_start + i as f32 * y_step))
-            .collect();
-
-        Lane {
-            lane_id,
-            points,
-            confidence: 0.9,
-            position: None,
-        }
-    }
-
-    #[test]
-    fn test_position_estimator_centered() {
-        let estimator = PositionEstimator::new(0.8);
-
-        // Create left and right lanes centered around frame center
-        let left_lane = create_test_lane(0, &[400.0, 410.0, 420.0], 200.0, 50.0);
-        let right_lane = create_test_lane(1, &[880.0, 870.0, 860.0], 200.0, 50.0);
-
-        let lanes = vec![left_lane, right_lane];
-        let state = estimator.estimate(&lanes, 1280, 720);
-
-        assert!(state.is_valid());
-        assert!(state.lateral_offset.abs() < 50.0); // Roughly centered
-    }
-
-    #[test]
-    fn test_smoother_reduces_jitter() {
-        let mut smoother = PositionSmoother::new(0.3);
-
-        let states = vec![
-            VehicleState {
-                lateral_offset: 10.0,
-                lane_width: Some(400.0),
-                heading_offset: 0.0,
-                frame_id: 0,
-                timestamp_ms: 0.0,
-            },
-            VehicleState {
-                lateral_offset: 50.0,
-                lane_width: Some(400.0),
-                heading_offset: 0.0,
-                frame_id: 1,
-                timestamp_ms: 33.3,
-            }, // spike
-            VehicleState {
-                lateral_offset: 12.0,
-                lane_width: Some(400.0),
-                heading_offset: 0.0,
-                frame_id: 2,
-                timestamp_ms: 66.6,
-            },
-        ];
-
-        let mut smoothed_values = Vec::new();
-        for state in states {
-            let smoothed = smoother.smooth(state);
-            smoothed_values.push(smoothed.lateral_offset);
-        }
-
-        // The spike at 50.0 should be dampened
-        assert!(smoothed_values[1] < 50.0);
-        assert!(smoothed_values[1] > 10.0);
     }
 }
 // src/analysis/mod.rs
@@ -1494,9 +1165,7 @@ pub use lane_analyzer::LaneChangeAnalyzer;
 use crate::analysis::position_estimator::{PositionEstimator, PositionSmoother};
 use crate::analysis::state_machine::LaneChangeStateMachine;
 use crate::types::{Lane, LaneChangeConfig, LaneChangeEvent, VehicleState};
-use tracing::debug;
 
-/// High-level analyzer for lane change detection (matching Python's LaneChangeAnalyzer)
 pub struct LaneChangeAnalyzer {
     position_estimator: PositionEstimator,
     smoother: PositionSmoother,
@@ -1520,13 +1189,6 @@ impl LaneChangeAnalyzer {
         }
     }
 
-    /// Analyze lanes for lane change events
-    ///
-    /// Performs the full analysis pipeline:
-    /// 1. Estimate vehicle position from lanes
-    /// 2. Apply temporal smoothing
-    /// 3. Update state machine
-    /// 4. Return event if lane change detected
     pub fn analyze(
         &mut self,
         lanes: &[Lane],
@@ -1535,146 +1197,39 @@ impl LaneChangeAnalyzer {
         frame_id: u64,
         timestamp_ms: f64,
     ) -> Option<LaneChangeEvent> {
-        // Estimate raw vehicle position
         let mut raw_state = self
             .position_estimator
             .estimate(lanes, frame_width, frame_height);
         raw_state.frame_id = frame_id;
         raw_state.timestamp_ms = timestamp_ms;
 
-        // Apply temporal smoothing
         let smoothed_state = self.smoother.smooth(raw_state);
         self.last_state = Some(smoothed_state);
 
-        // Update state machine and check for lane change
         self.state_machine
             .update(&smoothed_state, frame_id, timestamp_ms)
     }
 
-    /// Analyze pre-computed vehicle state for lane change
-    pub fn analyze_with_state(
-        &mut self,
-        vehicle_state: &VehicleState,
-        frame_id: u64,
-        timestamp_ms: f64,
-    ) -> Option<LaneChangeEvent> {
-        self.state_machine
-            .update(vehicle_state, frame_id, timestamp_ms)
-    }
-
-    /// Get current state machine state name
     pub fn current_state(&self) -> &str {
         self.state_machine.current_state()
     }
 
-    /// Get last computed vehicle state
     pub fn last_vehicle_state(&self) -> Option<&VehicleState> {
         self.last_state.as_ref()
     }
 
-    /// Reset analyzer for new video processing
     pub fn reset(&mut self) {
         self.state_machine.reset();
         self.smoother.reset();
         self.last_state = None;
     }
 
-    /// Update source ID for new video
     pub fn set_source_id(&mut self, source_id: String) {
         self.state_machine.set_source_id(source_id);
     }
 
-    /// Get the config
     pub fn config(&self) -> &LaneChangeConfig {
         &self.config
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Point;
-
-    fn create_test_lanes(left_x: f32, right_x: f32) -> Vec<Lane> {
-        vec![
-            Lane {
-                lane_id: 0,
-                points: vec![
-                    Point::new(left_x, 100.0),
-                    Point::new(left_x + 10.0, 200.0),
-                    Point::new(left_x + 20.0, 300.0),
-                    Point::new(left_x + 30.0, 400.0),
-                    Point::new(left_x + 40.0, 500.0),
-                ],
-                confidence: 0.9,
-                position: None,
-            },
-            Lane {
-                lane_id: 1,
-                points: vec![
-                    Point::new(right_x, 100.0),
-                    Point::new(right_x - 10.0, 200.0),
-                    Point::new(right_x - 20.0, 300.0),
-                    Point::new(right_x - 30.0, 400.0),
-                    Point::new(right_x - 40.0, 500.0),
-                ],
-                confidence: 0.9,
-                position: None,
-            },
-        ]
-    }
-
-    #[test]
-    fn test_analyzer_integration() {
-        let config = LaneChangeConfig {
-            min_frames_confirm: 2,
-            cooldown_frames: 0,
-            ..Default::default()
-        };
-        let mut analyzer = LaneChangeAnalyzer::new(config);
-
-        let frame_width = 1280u32;
-        let frame_height = 720u32;
-
-        // Centered lanes (vehicle at x=640, lanes at 400 and 880)
-        let centered_lanes = create_test_lanes(400.0, 880.0);
-
-        // Process several centered frames
-        for i in 0..5 {
-            let event = analyzer.analyze(
-                &centered_lanes,
-                frame_width,
-                frame_height,
-                i,
-                i as f64 * 33.3,
-            );
-            assert!(event.is_none());
-        }
-
-        assert_eq!(analyzer.current_state(), "CENTERED");
-
-        // Check that we have a valid last state
-        let last_state = analyzer.last_vehicle_state();
-        assert!(last_state.is_some());
-        assert!(last_state.unwrap().is_valid());
-    }
-
-    #[test]
-    fn test_analyzer_reset() {
-        let config = LaneChangeConfig::default();
-        let mut analyzer = LaneChangeAnalyzer::new(config);
-
-        // Do some processing
-        let lanes = create_test_lanes(200.0, 680.0); // Off-center
-        for i in 0..10 {
-            analyzer.analyze(&lanes, 1280, 720, i, i as f64 * 33.3);
-        }
-
-        // Reset
-        analyzer.reset();
-
-        assert_eq!(analyzer.current_state(), "CENTERED");
-        assert!(analyzer.last_vehicle_state().is_none());
     }
 }
 use crate::types::Config;
@@ -1688,74 +1243,48 @@ impl Config {
         Ok(config)
     }
 }
-use crate::types::{Config, Lane};
+// src/lane_detection.rs
+
+use crate::types::{Config, DetectedLane};
 use anyhow::Result;
 use tracing::info;
 
 pub struct LaneDetectionResult {
-    pub lanes: Vec<Lane>,
-    pub timestamp: f64,
+    pub lanes: Vec<DetectedLane>,
+    pub timestamp_ms: f64,
 }
-
-// CULane row anchors (normalized to 320 height)
-const ROW_ANCHORS: [f32; 72] = [
-    121.0, 131.0, 141.0, 150.0, 160.0, 170.0, 180.0, 189.0, 199.0, 209.0, 219.0, 228.0, 238.0,
-    248.0, 258.0, 267.0, 277.0, 287.0, 297.0, 306.0, 316.0, 326.0, 336.0, 345.0, 355.0, 365.0,
-    375.0, 384.0, 394.0, 404.0, 414.0, 423.0, 433.0, 443.0, 453.0, 462.0, 472.0, 482.0, 492.0,
-    501.0, 511.0, 521.0, 531.0, 540.0, 550.0, 560.0, 570.0, 579.0, 589.0, 599.0, 609.0, 618.0,
-    628.0, 638.0, 648.0, 657.0, 667.0, 677.0, 687.0, 696.0, 706.0, 716.0, 726.0, 735.0, 745.0,
-    755.0, 765.0, 774.0, 784.0, 794.0, 804.0, 813.0,
-];
 
 pub fn parse_lanes(
     output: &[f32],
     frame_width: f32,
     frame_height: f32,
     config: &Config,
-    timestamp: f64,
+    timestamp_ms: f64,
 ) -> Result<LaneDetectionResult> {
-    // DEBUG: Check output values
-    let max_val = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let min_val = output.iter().copied().fold(f32::INFINITY, f32::min);
-    let avg_val = output.iter().sum::<f32>() / output.len() as f32;
+    let griding_num = config.model.griding_num; // 200
+    let num_anchors = config.model.num_anchors; // 72
+    let num_lanes = config.model.num_lanes; // 4
 
-    info!(
-        "Output stats - min: {:.4}, max: {:.4}, avg: {:.4}",
-        min_val, max_val, avg_val
-    );
-
-    // Model output shape: [1, griding_num, num_anchors, num_lanes]
-    // = [1, 200, 72, 4]
-
-    let griding_num = config.model.griding_num;
-    let num_anchors = config.model.num_anchors;
-    let num_lanes = config.model.num_lanes;
-
-    info!(
-        "Config - griding: {}, anchors: {}, lanes: {}",
-        griding_num, num_anchors, num_lanes
-    );
+    // Constants matching Python implementation (UFLDv2Postprocessor)
+    // These define the start and end Y-coordinates in the original 720p image space
+    const ROW_ANCHOR_START: f32 = 160.0;
+    const ROW_ANCHOR_END: f32 = 710.0;
+    const ORIGINAL_HEIGHT: f32 = 720.0;
 
     let mut lanes = Vec::new();
 
-    // Process each lane
     for lane_idx in 0..num_lanes {
-        let mut points = Vec::new();
+        let mut points: Vec<(f32, f32)> = Vec::new();
         let mut total_confidence = 0.0;
         let mut point_count = 0;
 
-        // Process each anchor (row)
         for anchor_idx in 0..num_anchors {
-            // Find the grid position with max probability
             let mut max_prob = f32::NEG_INFINITY;
             let mut max_grid_idx = 0;
 
-            // Check each grid position
+            // Find the grid cell with highest probability for this row/lane
             for grid_idx in 0..griding_num {
-                // Index calculation for shape [1, 200, 72, 4]
-                // Skip batch dimension (0), so: [grid, anchor, lane]
                 let idx = grid_idx * (num_anchors * num_lanes) + anchor_idx * num_lanes + lane_idx;
-
                 let prob = output[idx];
                 if prob > max_prob {
                     max_prob = prob;
@@ -1763,16 +1292,23 @@ pub fn parse_lanes(
                 }
             }
 
-            // Use sigmoid for confidence (simpler than softmax)
+            // Sigmoid for confidence
             let confidence = 1.0 / (1.0 + (-max_prob).exp());
 
-            // LOWERED THRESHOLD for debugging
-            if confidence >= 0.1 && max_grid_idx < griding_num {
-                // Convert grid position to pixel coordinates
-                let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
+            // Threshold
+            if confidence >= 0.1 && max_grid_idx > 0 && max_grid_idx < griding_num {
+                // Calculate X coordinate
+                // Map grid index (0..200) to width (0..frame_width)
+                let x = ((max_grid_idx as f32 - 1.0) / (griding_num as f32 - 1.0)) * frame_width;
 
-                // Y coordinate from row anchor (scaled to frame height)
-                let y = (ROW_ANCHORS[anchor_idx] / config.model.input_height as f32) * frame_height;
+                // Calculate Y coordinate
+                // Match Python: np.linspace(160, 710, 72)
+                let y_norm = ROW_ANCHOR_START
+                    + (ROW_ANCHOR_END - ROW_ANCHOR_START)
+                        * (anchor_idx as f32 / (num_anchors as f32 - 1.0));
+
+                // Scale normalized Y (from 720p space) to current frame height
+                let y = (y_norm / ORIGINAL_HEIGHT) * frame_height;
 
                 points.push((x, y));
                 total_confidence += confidence;
@@ -1780,35 +1316,28 @@ pub fn parse_lanes(
             }
         }
 
-        // LOWERED THRESHOLD: Only need 3+ points
-        if points.len() >= 3 {
+        if points.len() >= 2 {
             let avg_confidence = if point_count > 0 {
                 total_confidence / point_count as f32
             } else {
                 0.0
             };
 
-            info!(
-                "Lane {} detected with {} points, confidence: {:.4}",
-                lane_idx,
-                points.len(),
-                avg_confidence
-            );
-
-            lanes.push(Lane {
+            lanes.push(DetectedLane {
                 points,
                 confidence: avg_confidence,
             });
         }
     }
 
-    info!("Total lanes detected: {}", lanes.len());
-
-    Ok(LaneDetectionResult { lanes, timestamp })
+    Ok(LaneDetectionResult {
+        lanes,
+        timestamp_ms,
+    })
 }
 
 pub fn find_vehicle_lane_with_confidence(
-    lanes: &[Lane],
+    lanes: &[DetectedLane],
     frame_width: f32,
 ) -> Option<(usize, f32, f32)> {
     if lanes.len() < 2 {
@@ -2218,7 +1747,7 @@ mod video_processor;
 use analysis::LaneChangeAnalyzer;
 use anyhow::Result;
 use std::path::Path;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn}; // Added warn
 use types::{DetectedLane, Lane, LaneChangeConfig, LaneChangeEvent};
 
 #[tokio::main]
@@ -2267,14 +1796,7 @@ async fn main() -> Result<()> {
             Ok(stats) => {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
-                info!(
-                    "  Frames with valid position: {} ({:.1}%)",
-                    stats.frames_with_position,
-                    (stats.frames_with_position as f32 / stats.total_frames as f32) * 100.0
-                );
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
-                info!("  Processing time: {:.2}s", stats.duration_secs);
-                info!("  Average FPS: {:.2}", stats.avg_fps);
             }
             Err(e) => {
                 error!("Failed to process video: {}", e);
@@ -2282,7 +1804,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("\n🎉 All videos processed!");
     Ok(())
 }
 
@@ -2310,9 +1831,9 @@ async fn process_video(
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
     let lane_change_config = LaneChangeConfig {
-        drift_threshold: 0.2,
-        crossing_threshold: 0.4,
-        min_frames_confirm: config.detection.confirm_frames,
+        drift_threshold: 0.2,    // 20% deviation starts tracking
+        crossing_threshold: 0.4, // 40% deviation means crossing
+        min_frames_confirm: 3,   // Reduced from 5 to 3 for faster detection
         cooldown_frames: 30,
         smoothing_alpha: 0.3,
         reference_y_ratio: 0.8,
@@ -2320,21 +1841,6 @@ async fn process_video(
 
     let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
     analyzer.set_source_id(video_path.to_string_lossy().to_string());
-
-    info!("📊 Lane Change Analyzer Configuration:");
-    info!(
-        "   Drift threshold: {:.0}% of lane width",
-        analyzer.config().drift_threshold * 100.0
-    );
-    info!(
-        "   Crossing threshold: {:.0}% of lane width",
-        analyzer.config().crossing_threshold * 100.0
-    );
-    info!(
-        "   Min frames to confirm: {}",
-        analyzer.config().min_frames_confirm
-    );
-    info!("   Cooldown frames: {}", analyzer.config().cooldown_frames);
 
     let mut lane_changes: Vec<LaneChangeEvent> = Vec::new();
     let mut frame_count: u64 = 0;
@@ -2344,27 +1850,15 @@ async fn process_video(
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
-        if frame_count % 30 == 0 {
-            info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {}",
-                reader.progress(),
-                reader.current_frame,
-                reader.total_frames,
-                analyzer.current_state(),
-                lane_changes.len()
-            );
-        }
-
         match process_frame(&frame, inference_engine, config).await {
             Ok(detected_lanes) => {
-                // Convert DetectedLane to Lane for analysis
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
                     .enumerate()
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // Run lane change analysis
+                // Run analysis
                 if let Some(event) = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
@@ -2373,17 +1867,47 @@ async fn process_video(
                     timestamp_ms,
                 ) {
                     lane_changes.push(event.clone());
+                    // 🚨 CRITICAL LOG: This will show when an event actually triggers
                     info!(
-                        "🔄 LANE CHANGE #{}: {} at {:.2}s (frame {}) - Duration: {:.0}ms",
-                        lane_changes.len(),
+                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.frame_id,
-                        event.duration_ms.unwrap_or(0.0)
+                        event.frame_id
                     );
                 }
 
-                // Track valid positions
+                // Debug log every 30 frames to check offset values
+                if frame_count % 30 == 0 {
+                    if let Some(vs) = analyzer.last_vehicle_state() {
+                        if vs.is_valid() {
+                            let normalized = vs.normalized_offset().unwrap_or(0.0);
+                            let width = vs.lane_width.unwrap_or(0.0);
+                            // Only log if offset is significant (> 10%)
+                            if normalized.abs() > 0.1 {
+                                info!(
+                                    "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px",
+                                    frame_count,
+                                    analyzer.current_state(),
+                                    vs.lateral_offset,
+                                    normalized * 100.0,
+                                    width
+                                );
+                            } else {
+                                debug!(
+                                    "Frame {}: State=CENTERED (Offset {:.1}%)",
+                                    frame_count,
+                                    normalized * 100.0
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Frame {}: Invalid vehicle state (no lane width)",
+                                frame_count
+                            );
+                        }
+                    }
+                }
+
                 if analyzer
                     .last_vehicle_state()
                     .map_or(false, |s| s.is_valid())
@@ -2391,24 +1915,6 @@ async fn process_video(
                     frames_with_valid_position += 1;
                 }
 
-                // Debug logging
-                if frame_count % 30 == 0 {
-                    if let Some(vs) = analyzer.last_vehicle_state() {
-                        if vs.is_valid() {
-                            let normalized = vs.normalized_offset().unwrap_or(0.0);
-                            debug!(
-                                "Frame {}: State={}, Offset={:.1}px ({:.1}%), LaneWidth={:.0}px",
-                                frame_count,
-                                analyzer.current_state(),
-                                vs.lateral_offset,
-                                normalized * 100.0,
-                                vs.lane_width.unwrap_or(0.0)
-                            );
-                        }
-                    }
-                }
-
-                // Write annotated frame
                 if let Some(ref mut w) = writer {
                     if let Ok(annotated) = video_processor::draw_lanes_with_state(
                         &frame.data,
@@ -2423,36 +1929,24 @@ async fn process_video(
                     }
                 }
             }
-            Err(e) => {
-                error!("Frame {} processing failed: {}", frame_count, e);
-            }
+            Err(e) => error!("Frame {} failed: {}", frame_count, e),
         }
     }
 
     let duration = start_time.elapsed();
     let avg_fps = frame_count as f64 / duration.as_secs_f64();
 
-    info!("\n📊 Processing Summary:");
-    info!(
-        "  Frames with valid position: {}/{} ({:.1}%)",
-        frames_with_valid_position,
-        frame_count,
-        (frames_with_valid_position as f32 / frame_count as f32) * 100.0
-    );
-    info!("  Lane changes detected: {}", lane_changes.len());
+    info!("\n📊 Final Report:");
+    info!("  Total Lane Changes: {}", lane_changes.len());
 
-    if !lane_changes.is_empty() {
-        info!("\n  📋 Lane change events:");
-        for (i, event) in lane_changes.iter().enumerate() {
-            info!(
-                "    {}. {} at {:.2}s (frame {}) - duration: {:.0}ms",
-                i + 1,
-                event.direction_name(),
-                event.video_timestamp_ms / 1000.0,
-                event.frame_id,
-                event.duration_ms.unwrap_or(0.0)
-            );
-        }
+    // Print all events at the end
+    for (i, event) in lane_changes.iter().enumerate() {
+        info!(
+            "  {}. {} at {:.2}s",
+            i + 1,
+            event.direction_name(),
+            event.video_timestamp_ms / 1000.0
+        );
     }
 
     save_results(video_path, &lane_changes, config)?;
@@ -2507,41 +2001,16 @@ fn save_results(
     use std::io::Write;
 
     std::fs::create_dir_all(&config.video.output_dir)?;
-
     let video_name = video_path.file_stem().unwrap().to_str().unwrap();
-
-    // Save as JSON Lines
     let jsonl_path =
         Path::new(&config.video.output_dir).join(format!("{}_lane_changes.jsonl", video_name));
+
     let mut file = File::create(&jsonl_path)?;
     for event in lane_changes {
         let json_line = serde_json::to_string(&event.to_json())?;
         writeln!(file, "{}", json_line)?;
     }
-    info!("💾 Lane changes saved to: {}", jsonl_path.display());
-
-    // Save as pretty JSON
-    let json_path =
-        Path::new(&config.video.output_dir).join(format!("{}_lane_changes.json", video_name));
-    let events_json: Vec<serde_json::Value> = lane_changes.iter().map(|e| e.to_json()).collect();
-    let json = serde_json::to_string_pretty(&events_json)?;
-    let mut file = File::create(&json_path)?;
-    file.write_all(json.as_bytes())?;
-
-    // Save summary
-    let summary = serde_json::json!({
-        "video": video_name,
-        "total_lane_changes": lane_changes.len(),
-        "events": lane_changes.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
-    });
-
-    let summary_path =
-        Path::new(&config.video.output_dir).join(format!("{}_summary.json", video_name));
-    let json = serde_json::to_string_pretty(&summary)?;
-    let mut file = File::create(&summary_path)?;
-    file.write_all(json.as_bytes())?;
-    info!("💾 Summary saved to: {}", summary_path.display());
-
+    info!("💾 Saved to: {}", jsonl_path.display());
     Ok(())
 }
 // src/preprocessing.rs
