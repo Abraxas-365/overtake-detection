@@ -411,8 +411,8 @@ async fn process_frame(
         .lanes
         .into_iter()
         .filter(|lane| {
-            let dominated = lane.confidence > config.detection.min_lane_confidence;
-            if !dominated && lane.points.len() >= config.detection.min_points_per_lane {
+            let passed = lane.confidence > config.detection.min_lane_confidence;
+            if !passed && lane.points.len() >= config.detection.min_points_per_lane {
                 debug!(
                     "Lane filtered: {} points, conf={:.3} < threshold {:.3}",
                     lane.points.len(),
@@ -420,7 +420,7 @@ async fn process_frame(
                     config.detection.min_lane_confidence
                 );
             }
-            passed
+            passed // Return the boolean
         })
         .collect();
 
