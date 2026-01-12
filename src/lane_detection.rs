@@ -9,16 +9,6 @@ pub struct LaneDetectionResult {
     pub timestamp_ms: f64,
 }
 
-// CULane row anchors (normalized to 320 height)
-const ROW_ANCHORS: [f32; 72] = [
-    121.0, 131.0, 141.0, 150.0, 160.0, 170.0, 180.0, 189.0, 199.0, 209.0, 219.0, 228.0, 238.0,
-    248.0, 258.0, 267.0, 277.0, 287.0, 297.0, 306.0, 316.0, 326.0, 336.0, 345.0, 355.0, 365.0,
-    375.0, 384.0, 394.0, 404.0, 414.0, 423.0, 433.0, 443.0, 453.0, 462.0, 472.0, 482.0, 492.0,
-    501.0, 511.0, 521.0, 531.0, 540.0, 550.0, 560.0, 570.0, 579.0, 589.0, 599.0, 609.0, 618.0,
-    628.0, 638.0, 648.0, 657.0, 667.0, 677.0, 687.0, 696.0, 706.0, 716.0, 726.0, 735.0, 745.0,
-    755.0, 765.0, 774.0, 784.0, 794.0, 804.0, 813.0,
-];
-
 pub fn parse_lanes(
     output: &[f32],
     frame_width: f32,
@@ -26,9 +16,15 @@ pub fn parse_lanes(
     config: &Config,
     timestamp_ms: f64,
 ) -> Result<LaneDetectionResult> {
-    let griding_num = config.model.griding_num;
-    let num_anchors = config.model.num_anchors;
-    let num_lanes = config.model.num_lanes;
+    let griding_num = config.model.griding_num; // 200
+    let num_anchors = config.model.num_anchors; // 72
+    let num_lanes = config.model.num_lanes; // 4
+
+    // Constants matching Python implementation (UFLDv2Postprocessor)
+    // These define the start and end Y-coordinates in the original 720p image space
+    const ROW_ANCHOR_START: f32 = 160.0;
+    const ROW_ANCHOR_END: f32 = 710.0;
+    const ORIGINAL_HEIGHT: f32 = 720.0;
 
     let mut lanes = Vec::new();
 
@@ -41,6 +37,7 @@ pub fn parse_lanes(
             let mut max_prob = f32::NEG_INFINITY;
             let mut max_grid_idx = 0;
 
+            // Find the grid cell with highest probability for this row/lane
             for grid_idx in 0..griding_num {
                 let idx = grid_idx * (num_anchors * num_lanes) + anchor_idx * num_lanes + lane_idx;
                 let prob = output[idx];
@@ -50,11 +47,23 @@ pub fn parse_lanes(
                 }
             }
 
+            // Sigmoid for confidence
             let confidence = 1.0 / (1.0 + (-max_prob).exp());
 
-            if confidence >= 0.1 && max_grid_idx < griding_num {
-                let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
-                let y = (ROW_ANCHORS[anchor_idx] / config.model.input_height as f32) * frame_height;
+            // Threshold
+            if confidence >= 0.1 && max_grid_idx > 0 && max_grid_idx < griding_num {
+                // Calculate X coordinate
+                // Map grid index (0..200) to width (0..frame_width)
+                let x = ((max_grid_idx as f32 - 1.0) / (griding_num as f32 - 1.0)) * frame_width;
+
+                // Calculate Y coordinate
+                // Match Python: np.linspace(160, 710, 72)
+                let y_norm = ROW_ANCHOR_START
+                    + (ROW_ANCHOR_END - ROW_ANCHOR_START)
+                        * (anchor_idx as f32 / (num_anchors as f32 - 1.0));
+
+                // Scale normalized Y (from 720p space) to current frame height
+                let y = (y_norm / ORIGINAL_HEIGHT) * frame_height;
 
                 points.push((x, y));
                 total_confidence += confidence;
@@ -62,7 +71,7 @@ pub fn parse_lanes(
             }
         }
 
-        if points.len() >= 3 {
+        if points.len() >= 2 {
             let avg_confidence = if point_count > 0 {
                 total_confidence / point_count as f32
             } else {
