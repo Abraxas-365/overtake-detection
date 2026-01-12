@@ -317,6 +317,18 @@ pub struct LaneChangeEvent {
     pub source_id: String,
     pub evidence_images: Option<EvidencePaths>,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Legality analysis result (populated after API call)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legality: Option<LegalityInfo>,
+}
+
+/// Information about lane change legality
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegalityInfo {
+    pub is_legal: bool,
+    pub lane_line_type: String,
+    pub confidence: f32,
+    pub analysis_details: Option<String>,
 }
 
 impl LaneChangeEvent {
@@ -339,6 +351,7 @@ impl LaneChangeEvent {
             source_id: String::new(),
             evidence_images: None,
             metadata: HashMap::new(),
+            legality: None,
         }
     }
 
@@ -360,6 +373,7 @@ impl LaneChangeEvent {
             "duration_ms": self.duration_ms,
             "source_id": self.source_id,
             "metadata": self.metadata,
+            "legality": self.legality,
         })
     }
 }

@@ -2783,8 +2783,8 @@ pub use overtake_detector::OvertakeDetector;
 pub use position_calculator::calculate_vehicle_position;
 pub use smoother::LanePositionSmoother;
 pub use state_machine::StateMachine;
-pub use types::*;
 use std::collections::VecDeque;
+pub use types::*;
 
 pub struct LanePositionSmoother {
     history: VecDeque<VehiclePosition>,

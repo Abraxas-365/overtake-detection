@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod analysis;
+mod frame_buffer;
 mod inference;
 mod lane_detection;
 mod preprocessing;
@@ -9,9 +10,36 @@ mod video_processor;
 
 use analysis::LaneChangeAnalyzer;
 use anyhow::Result;
+use frame_buffer::{
+    build_legality_request, print_legality_request, save_legality_request_to_file,
+    LaneChangeFrameBuffer,
+};
 use std::path::Path;
 use tracing::{debug, error, info, warn};
-use types::{DetectedLane, Lane, LaneChangeConfig, LaneChangeEvent};
+use types::{DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
+
+/// Configuration for legality analysis
+struct LegalityAnalysisConfig {
+    /// Number of frames to extract and send for analysis
+    num_frames_to_analyze: usize,
+    /// Maximum frames to buffer during lane change (e.g., 90 = 3 seconds at 30fps)
+    max_buffer_frames: usize,
+    /// Whether to save the request payload to a file
+    save_to_file: bool,
+    /// Whether to print the base64 payload to console
+    print_to_console: bool,
+}
+
+impl Default for LegalityAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            num_frames_to_analyze: 5,
+            max_buffer_frames: 90,
+            save_to_file: true,
+            print_to_console: true,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +66,9 @@ async fn main() -> Result<()> {
 
     info!("Found {} video file(s) to process", video_files.len());
 
+    // Legality analysis configuration
+    let legality_config = LegalityAnalysisConfig::default();
+
     for (idx, video_path) in video_files.iter().enumerate() {
         info!("\n========================================");
         info!(
@@ -53,6 +84,7 @@ async fn main() -> Result<()> {
             &mut inference_engine,
             &video_processor,
             &config,
+            &legality_config,
         )
         .await
         {
@@ -83,6 +115,7 @@ async fn process_video(
     inference_engine: &mut inference::InferenceEngine,
     video_processor: &video_processor::VideoProcessor,
     config: &types::Config,
+    legality_config: &LegalityAnalysisConfig,
 ) -> Result<ProcessingStats> {
     use std::time::Instant;
 
@@ -109,8 +142,11 @@ async fn process_video(
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
 
-    let mut cached_start_frame: Option<types::Frame> = None;
+    let mut cached_start_frame: Option<Frame> = None;
     let mut previous_state = "CENTERED".to_string();
+
+    // Frame buffer for capturing lane change frames
+    let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
@@ -118,12 +154,13 @@ async fn process_video(
 
         if frame_count % 30 == 0 {
             info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {}",
+                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Buffered frames: {}",
                 reader.progress(),
                 reader.current_frame,
                 reader.total_frames,
                 analyzer.current_state(),
-                lane_changes.len()
+                lane_changes.len(),
+                frame_buffer.frame_count()
             );
         }
 
@@ -136,18 +173,32 @@ async fn process_video(
                     .collect();
 
                 let current_state = analyzer.current_state().to_string();
+
+                // State transition: CENTERED -> DRIFTING (start of potential lane change)
                 if previous_state == "CENTERED" && current_state == "DRIFTING" {
                     cached_start_frame = Some(frame.clone());
+                    frame_buffer.start_capture(frame_count);
                     debug!(
-                        "📸 Captured potential lane change start frame: {}",
+                        "📸 Started capturing lane change frames at frame {}",
                         frame_count
                     );
                 }
-                if current_state == "CENTERED" {
-                    cached_start_frame = None;
+
+                // Continue capturing frames during lane change (DRIFTING or CROSSING)
+                if frame_buffer.is_capturing() {
+                    frame_buffer.add_frame(frame.clone());
                 }
+
+                // State transition back to CENTERED without completing (false alarm)
+                if current_state == "CENTERED" && frame_buffer.is_capturing() {
+                    frame_buffer.cancel_capture();
+                    cached_start_frame = None;
+                    debug!("❌ Lane change cancelled - returned to CENTERED");
+                }
+
                 previous_state = current_state;
 
+                // Check if lane change completed
                 if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
@@ -159,9 +210,63 @@ async fn process_video(
                         "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.end_frame_id // FIXED: Changed from frame_id to end_frame_id
+                        event.end_frame_id
                     );
 
+                    // Stop capturing and get all frames
+                    let captured_frames = frame_buffer.stop_capture();
+
+                    // Build and process legality request
+                    if !captured_frames.is_empty() {
+                        match build_legality_request(
+                            &event,
+                            &captured_frames,
+                            legality_config.num_frames_to_analyze,
+                        ) {
+                            Ok(request) => {
+                                // Print to console
+                                if legality_config.print_to_console {
+                                    print_legality_request(&request);
+                                }
+
+                                // Save to file
+                                if legality_config.save_to_file {
+                                    if let Err(e) = save_legality_request_to_file(
+                                        &request,
+                                        &config.video.output_dir,
+                                    ) {
+                                        warn!("Failed to save legality request: {}", e);
+                                    }
+                                }
+
+                                // TODO: When API is ready, uncomment this:
+                                // match send_to_legality_api(&request, "https://your-api.com/analyze").await {
+                                //     Ok(response) => {
+                                //         event.legality = Some(types::LegalityInfo {
+                                //             is_legal: response.is_legal,
+                                //             lane_line_type: response.lane_line_type,
+                                //             confidence: response.confidence,
+                                //             analysis_details: response.analysis_details,
+                                //         });
+                                //         info!("✓ Legality analysis: {} ({})",
+                                //             if response.is_legal { "LEGAL" } else { "ILLEGAL" },
+                                //             response.lane_line_type
+                                //         );
+                                //     }
+                                //     Err(e) => {
+                                //         warn!("Failed to get legality analysis: {}", e);
+                                //     }
+                                // }
+                            }
+                            Err(e) => {
+                                warn!("Failed to build legality request: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("No frames captured for lane change event");
+                    }
+
+                    // Save evidence images
                     let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
                     let start_filename =
                         format!("{}_event_{}_start.jpg", video_stem, event.event_id);
@@ -251,11 +356,20 @@ async fn process_video(
     info!("  Total Lane Changes: {}", lane_changes.len());
 
     for (i, event) in lane_changes.iter().enumerate() {
+        let legality_str = match &event.legality {
+            Some(l) => format!(
+                " | {} ({})",
+                if l.is_legal { "LEGAL" } else { "ILLEGAL" },
+                l.lane_line_type
+            ),
+            None => " | Legality: PENDING".to_string(),
+        };
         info!(
-            "  {}. {} at {:.2}s",
+            "  {}. {} at {:.2}s{}",
             i + 1,
             event.direction_name(),
-            event.video_timestamp_ms / 1000.0
+            event.video_timestamp_ms / 1000.0,
+            legality_str
         );
     }
 
@@ -271,7 +385,7 @@ async fn process_video(
 }
 
 async fn process_frame(
-    frame: &types::Frame,
+    frame: &Frame,
     inference_engine: &mut inference::InferenceEngine,
     config: &types::Config,
 ) -> Result<Vec<DetectedLane>> {
