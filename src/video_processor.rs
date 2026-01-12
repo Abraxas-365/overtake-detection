@@ -3,8 +3,8 @@
 use crate::types::{Config, DetectedLane, VehicleState};
 use anyhow::Result;
 use opencv::{
-    core::{self, Mat},
-    imgproc,
+    core::{self, Mat, Vector},
+    imgcodecs, imgproc,
     prelude::*,
     videoio::{self, VideoCapture, VideoCaptureTraitConst, VideoWriter},
 };
@@ -23,7 +23,6 @@ impl VideoProcessor {
 
     pub fn find_video_files(&self) -> Result<Vec<PathBuf>> {
         let mut videos = Vec::new();
-
         let video_extensions = vec!["mp4", "avi", "mov", "mkv", "MP4", "AVI", "MOV", "MKV"];
 
         for entry in WalkDir::new(&self.config.video.input_dir)
@@ -38,14 +37,12 @@ impl VideoProcessor {
                 }
             }
         }
-
         info!("Found {} video files", videos.len());
         Ok(videos)
     }
 
     pub fn open_video(&self, path: &Path) -> Result<VideoReader> {
         info!("Opening video: {}", path.display());
-
         let cap = VideoCapture::from_file(path.to_str().unwrap(), videoio::CAP_ANY)?;
 
         if !cap.is_opened()? {
@@ -56,11 +53,6 @@ impl VideoProcessor {
         let total_frames = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
         let width = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
         let height = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
-
-        info!(
-            "Video properties: {}x{} @ {:.1} FPS, {} frames",
-            width, height, fps, total_frames
-        );
 
         Ok(VideoReader {
             cap,
@@ -82,14 +74,10 @@ impl VideoProcessor {
         if !self.config.video.save_annotated {
             return Ok(None);
         }
-
         std::fs::create_dir_all(&self.config.video.output_dir)?;
-
         let input_name = input_path.file_stem().unwrap().to_str().unwrap();
         let output_path = PathBuf::from(&self.config.video.output_dir)
             .join(format!("{}_annotated.mp4", input_name));
-
-        info!("Output video: {}", output_path.display());
 
         let fourcc = VideoWriter::fourcc('m', 'p', '4', 'v')?;
         let writer = VideoWriter::new(
@@ -99,8 +87,32 @@ impl VideoProcessor {
             core::Size::new(width, height),
             true,
         )?;
-
         Ok(Some(writer))
+    }
+
+    /// Save a specific frame as an image file
+    pub fn save_frame_to_disk(
+        &self,
+        frame: &crate::types::Frame,
+        filename: &str,
+    ) -> Result<PathBuf> {
+        let output_dir = Path::new(&self.config.video.output_dir).join("evidence");
+        std::fs::create_dir_all(&output_dir)?;
+
+        let file_path = output_dir.join(filename);
+
+        // Frame data is RGB, OpenCV needs BGR
+        let mat = Mat::from_slice(&frame.data)?;
+        let mat = mat.reshape(3, frame.height as i32)?;
+
+        let mut bgr_mat = Mat::default();
+        imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
+
+        // Use imgcodecs::imwrite
+        let params = Vector::new();
+        imgcodecs::imwrite(file_path.to_str().unwrap(), &bgr_mat, &params)?;
+
+        Ok(file_path)
     }
 }
 
@@ -116,19 +128,15 @@ pub struct VideoReader {
 impl VideoReader {
     pub fn read_frame(&mut self) -> Result<Option<crate::types::Frame>> {
         use opencv::videoio::VideoCaptureTrait;
-
         let mut mat = Mat::default();
-
         if !VideoCaptureTrait::read(&mut self.cap, &mut mat)? || mat.empty() {
             return Ok(None);
         }
-
         self.current_frame += 1;
         let timestamp_ms = (self.current_frame as f64 / self.fps) * 1000.0;
 
         let mut rgb_mat = Mat::default();
         imgproc::cvt_color(&mat, &mut rgb_mat, imgproc::COLOR_BGR2RGB, 0)?;
-
         let data = rgb_mat.data_bytes()?.to_vec();
 
         Ok(Some(crate::types::Frame {
@@ -147,7 +155,6 @@ impl VideoReader {
     }
 }
 
-/// Draw lanes with Python-style state machine info overlay
 pub fn draw_lanes_with_state(
     frame: &[u8],
     width: i32,
@@ -158,41 +165,27 @@ pub fn draw_lanes_with_state(
 ) -> Result<Mat> {
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
-
     let mut bgr_mat = Mat::default();
     imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
     let mut output = bgr_mat.try_clone()?;
 
-    // Lane colors
     let colors = vec![
-        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
-        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
-        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
-        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0),
     ];
 
-    // Draw lanes
     for (i, lane) in lanes.iter().enumerate() {
         let color = colors[i % colors.len()];
-
-        // Draw lane points
         for point in &lane.points {
             let pt = core::Point::new(point.0 as i32, point.1 as i32);
             imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
         }
-
-        // Draw lane lines
-        for window in lane.points.windows(2) {
-            let pt1 = core::Point::new(window[0].0 as i32, window[0].1 as i32);
-            let pt2 = core::Point::new(window[1].0 as i32, window[1].1 as i32);
-            imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
-        }
     }
 
-    // Draw vehicle position marker
     let vehicle_x = width / 2;
     let vehicle_y = (height as f32 * 0.85) as i32;
-
     imgproc::circle(
         &mut output,
         core::Point::new(vehicle_x, vehicle_y),
@@ -203,47 +196,25 @@ pub fn draw_lanes_with_state(
         0,
     )?;
 
-    // State color based on state machine state
-    let state_color = match state {
-        "CENTERED" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-        "DRIFTING" => core::Scalar::new(0.0, 255.0, 255.0, 0.0),
-        "CROSSING" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
-        "COMPLETED" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-        _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
-    };
-
-    // Draw info overlay background
-    imgproc::rectangle(
-        &mut output,
-        core::Rect::new(5, 5, 550, 70),
-        core::Scalar::new(40.0, 40.0, 40.0, 0.0),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-
-    // Draw state text
     imgproc::put_text(
         &mut output,
         &format!("State: {}", state),
         core::Point::new(15, 32),
         imgproc::FONT_HERSHEY_SIMPLEX,
         0.8,
-        state_color,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         2,
         imgproc::LINE_8,
         false,
     )?;
 
-    // Draw vehicle state info if available
     if let Some(vs) = vehicle_state {
         if vs.is_valid() {
             let normalized = vs.normalized_offset().unwrap_or(0.0);
             let info = format!(
-                "Offset: {:.1}px ({:+.1}%) | Width: {:.0}px",
+                "Offset: {:.1}px ({:+.1}%)",
                 vs.lateral_offset,
-                normalized * 100.0,
-                vs.lane_width.unwrap_or(0.0)
+                normalized * 100.0
             );
             imgproc::put_text(
                 &mut output,
@@ -258,20 +229,6 @@ pub fn draw_lanes_with_state(
             )?;
         }
     }
-
-    // Draw lanes count
-    let lanes_info = format!("Lanes: {}", lanes.len());
-    imgproc::put_text(
-        &mut output,
-        &lanes_info,
-        core::Point::new(15, 60),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        0.5,
-        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-        1,
-        imgproc::LINE_8,
-        false,
-    )?;
 
     Ok(output)
 }

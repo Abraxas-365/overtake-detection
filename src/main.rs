@@ -109,7 +109,6 @@ async fn process_video(
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
 
-    // Cache for frame extraction
     let mut cached_start_frame: Option<types::Frame> = None;
     let mut previous_state = "CENTERED".to_string();
 
@@ -136,7 +135,6 @@ async fn process_video(
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // 1. Capture Start Frame
                 let current_state = analyzer.current_state().to_string();
                 if previous_state == "CENTERED" && current_state == "DRIFTING" {
                     cached_start_frame = Some(frame.clone());
@@ -150,7 +148,6 @@ async fn process_video(
                 }
                 previous_state = current_state;
 
-                // 2. Run Analysis
                 if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
@@ -162,10 +159,9 @@ async fn process_video(
                         "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.frame_id
+                        event.end_frame_id // FIXED: Changed from frame_id to end_frame_id
                     );
 
-                    // 3. Extract and Save Evidence Frames
                     let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
                     let start_filename =
                         format!("{}_event_{}_start.jpg", video_stem, event.event_id);
@@ -174,7 +170,6 @@ async fn process_video(
                     let mut start_path_str = String::new();
                     let mut end_path_str = String::new();
 
-                    // Save Start Frame
                     if let Some(ref start_frame) = cached_start_frame {
                         if let Ok(path) =
                             video_processor.save_frame_to_disk(start_frame, &start_filename)
@@ -187,7 +182,6 @@ async fn process_video(
                         start_path_str = path.to_string_lossy().to_string();
                     }
 
-                    // Save End Frame
                     if let Ok(path) = video_processor.save_frame_to_disk(&frame, &end_filename) {
                         end_path_str = path.to_string_lossy().to_string();
                     }
@@ -201,7 +195,6 @@ async fn process_video(
                     cached_start_frame = None;
                 }
 
-                // Debug log
                 if frame_count % 30 == 0 {
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         if vs.is_valid() {
@@ -300,7 +293,7 @@ async fn process_frame(
         frame.timestamp_ms,
     )?;
 
-    // CHANGED: Lower threshold to 0.20 to catch the right lane in your example
+    // Low confidence threshold to catch single lanes
     let threshold = 0.20;
 
     let high_confidence_lanes: Vec<DetectedLane> = lane_detection

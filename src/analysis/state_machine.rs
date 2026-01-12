@@ -140,17 +140,20 @@ impl LaneChangeStateMachine {
         if target_state == LaneChangeState::Completed {
             self.cooldown_remaining = self.config.cooldown_frames;
 
-            let mut event =
-                LaneChangeEvent::new(timestamp_ms, frame_id, self.change_direction, 0.9);
+            // FIXED: Pass start_frame_id and end_frame_id
+            let start_frame = self.change_start_frame.unwrap_or(frame_id);
+
+            let mut event = LaneChangeEvent::new(
+                timestamp_ms,
+                start_frame, // start
+                frame_id,    // end
+                self.change_direction,
+                0.9,
+            );
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
-            event.metadata.insert(
-                "start_frame".to_string(),
-                serde_json::json!(self.change_start_frame),
-            );
-            event
-                .metadata
-                .insert("end_frame".to_string(), serde_json::json!(frame_id));
+
+            // Note: We don't need metadata for frames anymore since they are fields now
 
             info!(
                 "Lane change completed: {} (duration: {:.0}ms) at frame {}",
