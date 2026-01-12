@@ -5,7 +5,7 @@ model:
   input_height: 320
   num_anchors: 72
   num_lanes: 4
-  griding_num: 200
+  griding_num: 201
 
 inference:
   use_tensorrt: true
