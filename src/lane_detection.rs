@@ -1,10 +1,12 @@
-use crate::types::{Config, Lane};
+// src/lane_detection.rs
+
+use crate::types::{Config, DetectedLane};
 use anyhow::Result;
 use tracing::info;
 
 pub struct LaneDetectionResult {
-    pub lanes: Vec<Lane>,
-    pub timestamp: f64,
+    pub lanes: Vec<DetectedLane>,
+    pub timestamp_ms: f64,
 }
 
 // CULane row anchors (normalized to 320 height)
@@ -22,50 +24,25 @@ pub fn parse_lanes(
     frame_width: f32,
     frame_height: f32,
     config: &Config,
-    timestamp: f64,
+    timestamp_ms: f64,
 ) -> Result<LaneDetectionResult> {
-    // DEBUG: Check output values
-    let max_val = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let min_val = output.iter().copied().fold(f32::INFINITY, f32::min);
-    let avg_val = output.iter().sum::<f32>() / output.len() as f32;
-
-    info!(
-        "Output stats - min: {:.4}, max: {:.4}, avg: {:.4}",
-        min_val, max_val, avg_val
-    );
-
-    // Model output shape: [1, griding_num, num_anchors, num_lanes]
-    // = [1, 200, 72, 4]
-
     let griding_num = config.model.griding_num;
     let num_anchors = config.model.num_anchors;
     let num_lanes = config.model.num_lanes;
 
-    info!(
-        "Config - griding: {}, anchors: {}, lanes: {}",
-        griding_num, num_anchors, num_lanes
-    );
-
     let mut lanes = Vec::new();
 
-    // Process each lane
     for lane_idx in 0..num_lanes {
-        let mut points = Vec::new();
+        let mut points: Vec<(f32, f32)> = Vec::new();
         let mut total_confidence = 0.0;
         let mut point_count = 0;
 
-        // Process each anchor (row)
         for anchor_idx in 0..num_anchors {
-            // Find the grid position with max probability
             let mut max_prob = f32::NEG_INFINITY;
             let mut max_grid_idx = 0;
 
-            // Check each grid position
             for grid_idx in 0..griding_num {
-                // Index calculation for shape [1, 200, 72, 4]
-                // Skip batch dimension (0), so: [grid, anchor, lane]
                 let idx = grid_idx * (num_anchors * num_lanes) + anchor_idx * num_lanes + lane_idx;
-
                 let prob = output[idx];
                 if prob > max_prob {
                     max_prob = prob;
@@ -73,15 +50,10 @@ pub fn parse_lanes(
                 }
             }
 
-            // Use sigmoid for confidence (simpler than softmax)
             let confidence = 1.0 / (1.0 + (-max_prob).exp());
 
-            // LOWERED THRESHOLD for debugging
             if confidence >= 0.1 && max_grid_idx < griding_num {
-                // Convert grid position to pixel coordinates
                 let x = (max_grid_idx as f32 / griding_num as f32) * frame_width;
-
-                // Y coordinate from row anchor (scaled to frame height)
                 let y = (ROW_ANCHORS[anchor_idx] / config.model.input_height as f32) * frame_height;
 
                 points.push((x, y));
@@ -90,7 +62,6 @@ pub fn parse_lanes(
             }
         }
 
-        // LOWERED THRESHOLD: Only need 3+ points
         if points.len() >= 3 {
             let avg_confidence = if point_count > 0 {
                 total_confidence / point_count as f32
@@ -98,27 +69,21 @@ pub fn parse_lanes(
                 0.0
             };
 
-            info!(
-                "Lane {} detected with {} points, confidence: {:.4}",
-                lane_idx,
-                points.len(),
-                avg_confidence
-            );
-
-            lanes.push(Lane {
+            lanes.push(DetectedLane {
                 points,
                 confidence: avg_confidence,
             });
         }
     }
 
-    info!("Total lanes detected: {}", lanes.len());
-
-    Ok(LaneDetectionResult { lanes, timestamp })
+    Ok(LaneDetectionResult {
+        lanes,
+        timestamp_ms,
+    })
 }
 
 pub fn find_vehicle_lane_with_confidence(
-    lanes: &[Lane],
+    lanes: &[DetectedLane],
     frame_width: f32,
 ) -> Option<(usize, f32, f32)> {
     if lanes.len() < 2 {
