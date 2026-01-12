@@ -16,27 +16,13 @@ use types::{DetectedLane, Lane, LaneChangeConfig, LaneChangeEvent};
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("overtake_detection=debug,ort=warn") // Changed to debug level
+        .with_env_filter("overtake_detection=info,ort=warn")
         .init();
 
     info!("🚗 Lane Change Detection System Starting");
 
     let config = types::Config::load("config.yaml")?;
     info!("✓ Configuration loaded");
-
-    // Log important config values
-    info!("  Model: {}", config.model.path);
-    info!("  griding_num: {}", config.model.griding_num);
-    info!("  num_anchors: {}", config.model.num_anchors);
-    info!("  num_lanes: {}", config.model.num_lanes);
-    info!(
-        "  min_lane_confidence: {}",
-        config.detection.min_lane_confidence
-    );
-    info!(
-        "  confidence_threshold: {}",
-        config.detection.confidence_threshold
-    );
 
     let mut inference_engine = inference::InferenceEngine::new(config.clone())?;
     info!("✓ Inference engine ready");
@@ -73,13 +59,7 @@ async fn main() -> Result<()> {
             Ok(stats) => {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
-                info!(
-                    "  Frames with valid position: {}",
-                    stats.frames_with_position
-                );
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
-                info!("  Duration: {:.1}s", stats.duration_secs);
-                info!("  Average FPS: {:.1}", stats.avg_fps);
             }
             Err(e) => {
                 error!("Failed to process video: {}", e);
@@ -129,163 +109,121 @@ async fn process_video(
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
 
-    // Statistics for debugging
-    let mut total_lanes_detected: u64 = 0;
-    let mut frames_with_lanes: u64 = 0;
-    let mut frames_with_left_lane: u64 = 0;
-    let mut frames_with_right_lane: u64 = 0;
-    let mut frames_with_both_lanes: u64 = 0;
+    // Cache for frame extraction
+    let mut cached_start_frame: Option<types::Frame> = None;
+    let mut previous_state = "CENTERED".to_string();
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
-        let vehicle_x = frame.width as f32 / 2.0;
+
+        if frame_count % 30 == 0 {
+            info!(
+                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {}",
+                reader.progress(),
+                reader.current_frame,
+                reader.total_frames,
+                analyzer.current_state(),
+                lane_changes.len()
+            );
+        }
 
         match process_frame(&frame, inference_engine, config).await {
             Ok(detected_lanes) => {
-                // 🔍 DEBUG: Log lane detection details every 30 frames
-                if frame_count % 30 == 0 || frame_count <= 5 {
-                    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    info!(
-                        "Frame {}: Detected {} raw lanes",
-                        frame_count,
-                        detected_lanes.len()
-                    );
-
-                    let mut has_left = false;
-                    let mut has_right = false;
-
-                    for (i, lane) in detected_lanes.iter().enumerate() {
-                        if !lane.points.is_empty() {
-                            let avg_x: f32 = lane.points.iter().map(|p| p.0).sum::<f32>()
-                                / lane.points.len() as f32;
-                            let min_x: f32 = lane
-                                .points
-                                .iter()
-                                .map(|p| p.0)
-                                .fold(f32::INFINITY, f32::min);
-                            let max_x: f32 = lane
-                                .points
-                                .iter()
-                                .map(|p| p.0)
-                                .fold(f32::NEG_INFINITY, f32::max);
-                            let side = if avg_x < vehicle_x { "LEFT" } else { "RIGHT" };
-
-                            if avg_x < vehicle_x {
-                                has_left = true;
-                            } else {
-                                has_right = true;
-                            }
-
-                            info!(
-                                "  Lane {}: {} pts | conf={:.3} | x=[{:.0}..{:.0}] avg={:.0} | {}",
-                                i,
-                                lane.points.len(),
-                                lane.confidence,
-                                min_x,
-                                max_x,
-                                avg_x,
-                                side
-                            );
-                        } else {
-                            info!("  Lane {}: EMPTY (0 points)", i);
-                        }
-                    }
-
-                    info!("  Vehicle center X: {:.0}", vehicle_x);
-                    info!(
-                        "  Has LEFT lane: {} | Has RIGHT lane: {}",
-                        has_left, has_right
-                    );
-
-                    if has_left && has_right {
-                        info!("  ✓ Can calculate lane width");
-                    } else {
-                        warn!("  ✗ Cannot calculate lane width - need lanes on BOTH sides");
-                    }
-                }
-
-                // Update statistics
-                if !detected_lanes.is_empty() {
-                    frames_with_lanes += 1;
-                    total_lanes_detected += detected_lanes.len() as u64;
-
-                    let has_left = detected_lanes.iter().any(|l| {
-                        if l.points.is_empty() {
-                            return false;
-                        }
-                        let avg_x: f32 =
-                            l.points.iter().map(|p| p.0).sum::<f32>() / l.points.len() as f32;
-                        avg_x < vehicle_x
-                    });
-                    let has_right = detected_lanes.iter().any(|l| {
-                        if l.points.is_empty() {
-                            return false;
-                        }
-                        let avg_x: f32 =
-                            l.points.iter().map(|p| p.0).sum::<f32>() / l.points.len() as f32;
-                        avg_x >= vehicle_x
-                    });
-
-                    if has_left {
-                        frames_with_left_lane += 1;
-                    }
-                    if has_right {
-                        frames_with_right_lane += 1;
-                    }
-                    if has_left && has_right {
-                        frames_with_both_lanes += 1;
-                    }
-                }
-
-                // Convert to analysis lanes
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
                     .enumerate()
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // Run analysis
-                if let Some(event) = analyzer.analyze(
+                // 1. Capture Start Frame
+                let current_state = analyzer.current_state().to_string();
+                if previous_state == "CENTERED" && current_state == "DRIFTING" {
+                    cached_start_frame = Some(frame.clone());
+                    debug!(
+                        "📸 Captured potential lane change start frame: {}",
+                        frame_count
+                    );
+                }
+                if current_state == "CENTERED" {
+                    cached_start_frame = None;
+                }
+                previous_state = current_state;
+
+                // 2. Run Analysis
+                if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
                     frame.height as u32,
                     frame_count,
                     timestamp_ms,
                 ) {
-                    lane_changes.push(event.clone());
                     info!(
                         "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
                         event.frame_id
                     );
+
+                    // 3. Extract and Save Evidence Frames
+                    let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
+                    let start_filename =
+                        format!("{}_event_{}_start.jpg", video_stem, event.event_id);
+                    let end_filename = format!("{}_event_{}_end.jpg", video_stem, event.event_id);
+
+                    let mut start_path_str = String::new();
+                    let mut end_path_str = String::new();
+
+                    // Save Start Frame
+                    if let Some(ref start_frame) = cached_start_frame {
+                        if let Ok(path) =
+                            video_processor.save_frame_to_disk(start_frame, &start_filename)
+                        {
+                            start_path_str = path.to_string_lossy().to_string();
+                        }
+                    } else if let Ok(path) =
+                        video_processor.save_frame_to_disk(&frame, &start_filename)
+                    {
+                        start_path_str = path.to_string_lossy().to_string();
+                    }
+
+                    // Save End Frame
+                    if let Ok(path) = video_processor.save_frame_to_disk(&frame, &end_filename) {
+                        end_path_str = path.to_string_lossy().to_string();
+                    }
+
+                    event.evidence_images = Some(types::EvidencePaths {
+                        start_image_path: start_path_str,
+                        end_image_path: end_path_str,
+                    });
+
+                    lane_changes.push(event.clone());
+                    cached_start_frame = None;
                 }
 
-                // Debug log vehicle state every 30 frames
+                // Debug log
                 if frame_count % 30 == 0 {
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         if vs.is_valid() {
                             let normalized = vs.normalized_offset().unwrap_or(0.0);
                             let width = vs.lane_width.unwrap_or(0.0);
-                            info!(
-                                "  VehicleState: offset={:.1}px ({:.1}%) | width={:.0}px | state={}",
-                                vs.lateral_offset,
-                                normalized * 100.0,
-                                width,
-                                analyzer.current_state()
-                            );
-                            frames_with_valid_position += 1;
+                            if normalized.abs() > 0.1 {
+                                info!(
+                                    "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px",
+                                    frame_count,
+                                    analyzer.current_state(),
+                                    vs.lateral_offset,
+                                    normalized * 100.0,
+                                    width
+                                );
+                            }
                         } else {
                             warn!(
-                                "  VehicleState: INVALID (no lane width) | state={}",
-                                analyzer.current_state()
+                                "Frame {}: Invalid vehicle state (no lane width)",
+                                frame_count
                             );
                         }
-                    } else {
-                        warn!("  VehicleState: None");
                     }
-                    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 }
 
                 if analyzer
@@ -295,7 +233,6 @@ async fn process_video(
                     frames_with_valid_position += 1;
                 }
 
-                // Write annotated video
                 if let Some(ref mut w) = writer {
                     if let Ok(annotated) = video_processor::draw_lanes_with_state(
                         &frame.data,
@@ -312,63 +249,20 @@ async fn process_video(
             }
             Err(e) => error!("Frame {} failed: {}", frame_count, e),
         }
-
-        // Progress indicator every 100 frames
-        if frame_count % 100 == 0 {
-            let progress = (frame_count as f32 / reader.total_frames as f32) * 100.0;
-            info!(
-                "Progress: {:.1}% ({}/{})",
-                progress, frame_count, reader.total_frames
-            );
-        }
     }
 
     let duration = start_time.elapsed();
     let avg_fps = frame_count as f64 / duration.as_secs_f64();
 
-    // Print detailed statistics
-    info!("\n📊 Detection Statistics:");
-    info!("  Total frames processed: {}", frame_count);
-    info!(
-        "  Frames with any lanes: {} ({:.1}%)",
-        frames_with_lanes,
-        (frames_with_lanes as f64 / frame_count as f64) * 100.0
-    );
-    info!(
-        "  Frames with LEFT lane: {} ({:.1}%)",
-        frames_with_left_lane,
-        (frames_with_left_lane as f64 / frame_count as f64) * 100.0
-    );
-    info!(
-        "  Frames with RIGHT lane: {} ({:.1}%)",
-        frames_with_right_lane,
-        (frames_with_right_lane as f64 / frame_count as f64) * 100.0
-    );
-    info!(
-        "  Frames with BOTH lanes: {} ({:.1}%)",
-        frames_with_both_lanes,
-        (frames_with_both_lanes as f64 / frame_count as f64) * 100.0
-    );
-    info!(
-        "  Average lanes per frame: {:.2}",
-        total_lanes_detected as f64 / frame_count as f64
-    );
-    info!(
-        "  Frames with valid position: {} ({:.1}%)",
-        frames_with_valid_position,
-        (frames_with_valid_position as f64 / frame_count as f64) * 100.0
-    );
-
-    info!("\n📊 Lane Change Report:");
+    info!("\n📊 Final Report:");
     info!("  Total Lane Changes: {}", lane_changes.len());
 
     for (i, event) in lane_changes.iter().enumerate() {
         info!(
-            "  {}. {} at {:.2}s (frame {})",
+            "  {}. {} at {:.2}s",
             i + 1,
             event.direction_name(),
-            event.video_timestamp_ms / 1000.0,
-            event.frame_id
+            event.video_timestamp_ms / 1000.0
         );
     }
 
@@ -406,22 +300,13 @@ async fn process_frame(
         frame.timestamp_ms,
     )?;
 
-    // Filter by confidence
+    // CHANGED: Lower threshold to 0.20 to catch the right lane in your example
+    let threshold = 0.20;
+
     let high_confidence_lanes: Vec<DetectedLane> = lane_detection
         .lanes
         .into_iter()
-        .filter(|lane| {
-            let passed = lane.confidence > config.detection.min_lane_confidence;
-            if !passed && lane.points.len() >= config.detection.min_points_per_lane {
-                debug!(
-                    "Lane filtered: {} points, conf={:.3} < threshold {:.3}",
-                    lane.points.len(),
-                    lane.confidence,
-                    config.detection.min_lane_confidence
-                );
-            }
-            passed // Return the boolean
-        })
+        .filter(|lane| lane.confidence > threshold)
         .collect();
 
     Ok(high_confidence_lanes)

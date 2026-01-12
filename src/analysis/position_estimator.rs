@@ -1,11 +1,13 @@
 // src/analysis/position_estimator.rs
 
 use crate::types::{Lane, VehicleState};
+use tracing::warn;
 
 pub struct PositionEstimator {
     pub reference_y_ratio: f32,
     pub min_lane_width: f32,
     pub max_lane_width: f32,
+    pub default_lane_width: f32,
 }
 
 impl PositionEstimator {
@@ -14,6 +16,8 @@ impl PositionEstimator {
             reference_y_ratio,
             min_lane_width: 100.0,
             max_lane_width: 1000.0,
+            // Default width when only one lane is seen (approx 550px based on logs)
+            default_lane_width: 550.0,
         }
     }
 
@@ -24,8 +28,8 @@ impl PositionEstimator {
         let left_lane = self.find_ego_lane(lanes, vehicle_x, true);
         let right_lane = self.find_ego_lane(lanes, vehicle_x, false);
 
-        let left_x = left_lane.and_then(|l: &Lane| l.get_x_at_y(reference_y));
-        let right_x = right_lane.and_then(|l: &Lane| l.get_x_at_y(reference_y));
+        let left_x = left_lane.and_then(|l| l.get_x_at_y(reference_y));
+        let right_x = right_lane.and_then(|l| l.get_x_at_y(reference_y));
 
         let mut lane_width: Option<f32> = None;
         let mut lateral_offset = 0.0f32;
@@ -37,15 +41,31 @@ impl PositionEstimator {
                     lane_width = Some(width);
                     let lane_center = (lx + rx) / 2.0;
                     lateral_offset = vehicle_x - lane_center;
+                } else {
+                    // Width is invalid, use default width with the closer lane
+                    if (vehicle_x - lx).abs() < (rx - vehicle_x).abs() {
+                        lateral_offset = vehicle_x - (lx + self.default_lane_width / 2.0);
+                    } else {
+                        lateral_offset = vehicle_x - (rx - self.default_lane_width / 2.0);
+                    }
+                    lane_width = Some(self.default_lane_width);
                 }
             }
             (Some(lx), None) => {
-                lateral_offset = vehicle_x - lx;
+                // Only left lane visible, use default width
+                let estimated_center = lx + (self.default_lane_width / 2.0);
+                lateral_offset = vehicle_x - estimated_center;
+                lane_width = Some(self.default_lane_width);
             }
             (None, Some(rx)) => {
-                lateral_offset = vehicle_x - rx;
+                // Only right lane visible, use default width
+                let estimated_center = rx - (self.default_lane_width / 2.0);
+                lateral_offset = vehicle_x - estimated_center;
+                lane_width = Some(self.default_lane_width);
             }
-            (None, None) => {}
+            (None, None) => {
+                // No lanes found
+            }
         }
 
         VehicleState {
@@ -66,15 +86,21 @@ impl PositionEstimator {
         let mut candidates: Vec<(&Lane, f32)> = Vec::new();
 
         for lane in lanes {
-            if lane.points.is_empty() {
+            if lane.points.len() < 2 {
                 continue;
             }
-            let avg_x = lane.avg_x();
 
-            if is_left && avg_x < vehicle_x {
-                candidates.push((lane, vehicle_x - avg_x));
-            } else if !is_left && avg_x > vehicle_x {
-                candidates.push((lane, avg_x - vehicle_x));
+            // Use bottom_point (closest to car) instead of avg_x for better accuracy
+            if let Some(p) = lane.bottom_point() {
+                if is_left {
+                    if p.x < vehicle_x {
+                        candidates.push((lane, vehicle_x - p.x));
+                    }
+                } else {
+                    if p.x > vehicle_x {
+                        candidates.push((lane, p.x - vehicle_x));
+                    }
+                }
             }
         }
 

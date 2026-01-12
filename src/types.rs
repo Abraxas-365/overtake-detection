@@ -200,6 +200,13 @@ impl Lane {
         }
         self.points.iter().map(|p| p.x).sum::<f32>() / self.points.len() as f32
     }
+
+    /// Get the bottom-most point (highest Y value, closest to vehicle)
+    pub fn bottom_point(&self) -> Option<&Point> {
+        self.points
+            .iter()
+            .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+    }
 }
 
 // ============================================================================
@@ -284,6 +291,16 @@ impl std::fmt::Display for Direction {
 }
 
 // ============================================================================
+// Evidence Paths
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidencePaths {
+    pub start_image_path: String,
+    pub end_image_path: String,
+}
+
+// ============================================================================
 // Lane Change Event
 // ============================================================================
 
@@ -292,18 +309,21 @@ pub struct LaneChangeEvent {
     pub event_id: String,
     pub timestamp: String,
     pub video_timestamp_ms: f64,
-    pub frame_id: u64,
+    pub start_frame_id: u64,
+    pub end_frame_id: u64,
     pub direction: Direction,
     pub confidence: f32,
     pub duration_ms: Option<f64>,
     pub source_id: String,
+    pub evidence_images: Option<EvidencePaths>,
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl LaneChangeEvent {
     pub fn new(
         video_timestamp_ms: f64,
-        frame_id: u64,
+        start_frame_id: u64,
+        end_frame_id: u64,
         direction: Direction,
         confidence: f32,
     ) -> Self {
@@ -311,11 +331,13 @@ impl LaneChangeEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             video_timestamp_ms,
-            frame_id,
+            start_frame_id,
+            end_frame_id,
             direction,
             confidence,
             duration_ms: None,
             source_id: String::new(),
+            evidence_images: None,
             metadata: HashMap::new(),
         }
     }
@@ -327,12 +349,14 @@ impl LaneChangeEvent {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "event_id": self.event_id,
-            "event_type": "lane_change",
-            "timestamp": self.timestamp,
-            "video_timestamp_ms": self.video_timestamp_ms,
-            "frame_id": self.frame_id,
+            "type": "lane_change",
             "direction": self.direction_name(),
-            "confidence": self.confidence,
+            "timestamp_ms": self.video_timestamp_ms,
+            "frames": {
+                "start": self.start_frame_id,
+                "end": self.end_frame_id
+            },
+            "evidence": self.evidence_images,
             "duration_ms": self.duration_ms,
             "source_id": self.source_id,
             "metadata": self.metadata,
