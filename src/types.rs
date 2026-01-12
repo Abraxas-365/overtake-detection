@@ -4,18 +4,105 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ============================================================================
-// Lane Change State Machine States (matching Python)
+// Configuration Structs
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub model: ModelConfig,
+    pub inference: InferenceConfig,
+    pub detection: DetectionConfig,
+    pub video: VideoConfig,
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub path: String,
+    pub input_width: usize,
+    pub input_height: usize,
+    pub num_anchors: usize,
+    pub num_lanes: usize,
+    pub griding_num: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    pub use_tensorrt: bool,
+    pub use_fp16: bool,
+    pub enable_engine_cache: bool,
+    pub engine_cache_path: String,
+    pub num_threads: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionConfig {
+    pub confidence_threshold: f32,
+    pub min_points_per_lane: usize,
+    pub smoother_window_size: usize,
+    pub calibration_frames: usize,
+    pub debounce_frames: u32,
+    pub confirm_frames: u32,
+    pub min_lane_confidence: f32,
+    pub min_position_confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    pub input_dir: String,
+    pub output_dir: String,
+    pub source_width: usize,
+    pub source_height: usize,
+    pub target_fps: u32,
+    pub save_annotated: bool,
+    pub save_events_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+}
+
+impl Config {
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&contents)?;
+        Ok(config)
+    }
+}
+
+// ============================================================================
+// Frame Type
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub timestamp_ms: f64,
+}
+
+// ============================================================================
+// Lane Detection Types (for inference output)
+// ============================================================================
+
+/// Lane from detection (uses tuple points for compatibility)
+#[derive(Debug, Clone)]
+pub struct DetectedLane {
+    pub points: Vec<(f32, f32)>,
+    pub confidence: f32,
+}
+
+// ============================================================================
+// Analysis Types (Python-compatible)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LaneChangeState {
-    /// Vehicle is centered in lane
     Centered,
-    /// Vehicle is drifting toward lane boundary
     Drifting,
-    /// Vehicle is crossing lane boundary
     Crossing,
-    /// Lane change has completed
     Completed,
 }
 
@@ -36,10 +123,6 @@ impl std::fmt::Display for LaneChangeState {
     }
 }
 
-// ============================================================================
-// Point and Lane Types (matching Python)
-// ============================================================================
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Point {
     pub x: f32,
@@ -51,7 +134,6 @@ impl Point {
         Self { x, y }
     }
 
-    /// Calculate Euclidean distance to another point
     pub fn distance_to(&self, other: &Point) -> f32 {
         ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
     }
@@ -65,6 +147,7 @@ pub enum LanePosition {
     RightFar,
 }
 
+/// Lane for analysis (uses Point struct)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lane {
     pub lane_id: usize,
@@ -74,13 +157,25 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// Interpolate X coordinate at a given Y coordinate
+    /// Create from detected lane (tuple points)
+    pub fn from_detected(lane_id: usize, detected: &DetectedLane) -> Self {
+        Self {
+            lane_id,
+            points: detected
+                .points
+                .iter()
+                .map(|p| Point::new(p.0, p.1))
+                .collect(),
+            confidence: detected.confidence,
+            position: None,
+        }
+    }
+
     pub fn get_x_at_y(&self, target_y: f32) -> Option<f32> {
         if self.points.len() < 2 {
             return None;
         }
 
-        // Sort points by Y coordinate
         let mut sorted_points = self.points.clone();
         sorted_points.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -96,25 +191,9 @@ impl Lane {
                 return Some(p1.x + ratio * (p2.x - p1.x));
             }
         }
-
         None
     }
 
-    /// Get the bottom-most point (highest Y value, closest to vehicle)
-    pub fn bottom_point(&self) -> Option<&Point> {
-        self.points
-            .iter()
-            .max_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
-    }
-
-    /// Get the top-most point (lowest Y value, farthest from vehicle)
-    pub fn top_point(&self) -> Option<&Point> {
-        self.points
-            .iter()
-            .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
-    }
-
-    /// Calculate average X position of the lane
     pub fn avg_x(&self) -> f32 {
         if self.points.is_empty() {
             return 0.0;
@@ -124,25 +203,19 @@ impl Lane {
 }
 
 // ============================================================================
-// Vehicle State (matching Python's VehicleState)
+// Vehicle State
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct VehicleState {
-    /// Distance from lane center in pixels. Negative = left, Positive = right
     pub lateral_offset: f32,
-    /// Estimated lane width in pixels (None if unknown)
     pub lane_width: Option<f32>,
-    /// Angular offset from lane direction in radians
     pub heading_offset: f32,
-    /// Frame ID when this state was computed
     pub frame_id: u64,
-    /// Timestamp in milliseconds
     pub timestamp_ms: f64,
 }
 
 impl VehicleState {
-    /// Create an invalid/default vehicle state
     pub fn invalid() -> Self {
         Self {
             lateral_offset: 0.0,
@@ -153,7 +226,6 @@ impl VehicleState {
         }
     }
 
-    /// Lateral offset as fraction of lane width (-0.5 to 0.5, 0 = centered)
     pub fn normalized_offset(&self) -> Option<f32> {
         match self.lane_width {
             Some(width) if width > 1.0 => Some(self.lateral_offset / width),
@@ -161,7 +233,6 @@ impl VehicleState {
         }
     }
 
-    /// Check if we have enough lane information for analysis
     pub fn is_valid(&self) -> bool {
         self.lane_width.map_or(false, |w| w > 0.0)
     }
@@ -204,14 +275,6 @@ impl Direction {
             Direction::Unknown => 0,
         }
     }
-
-    pub fn opposite(&self) -> Self {
-        match self {
-            Direction::Left => Direction::Right,
-            Direction::Right => Direction::Left,
-            Direction::Unknown => Direction::Unknown,
-        }
-    }
 }
 
 impl std::fmt::Display for Direction {
@@ -221,28 +284,19 @@ impl std::fmt::Display for Direction {
 }
 
 // ============================================================================
-// Lane Change Event (matching Python's LaneChangeEvent)
+// Lane Change Event
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneChangeEvent {
-    /// Unique event identifier (UUID)
     pub event_id: String,
-    /// Event timestamp (ISO format string)
     pub timestamp: String,
-    /// Position in video in milliseconds
     pub video_timestamp_ms: f64,
-    /// Frame ID when event was detected
     pub frame_id: u64,
-    /// Direction of lane change: -1 = left, 1 = right, 0 = unknown
     pub direction: Direction,
-    /// Confidence in the event detection [0.0, 1.0]
     pub confidence: f32,
-    /// Duration of lane change maneuver in ms (for COMPLETED events)
     pub duration_ms: Option<f64>,
-    /// Identifier of the video source
     pub source_id: String,
-    /// Additional event metadata
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -266,12 +320,10 @@ impl LaneChangeEvent {
         }
     }
 
-    /// Human-readable direction name
     pub fn direction_name(&self) -> &'static str {
         self.direction.as_str()
     }
 
-    /// Convert to dictionary/map for JSON serialization
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "event_id": self.event_id,
@@ -289,22 +341,16 @@ impl LaneChangeEvent {
 }
 
 // ============================================================================
-// Configuration
+// Lane Change Config
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneChangeConfig {
-    /// Threshold (as fraction of lane width) to trigger drift (default: 0.2)
     pub drift_threshold: f32,
-    /// Threshold to detect lane crossing (default: 0.4)
     pub crossing_threshold: f32,
-    /// Frames required to confirm state change (default: 5)
     pub min_frames_confirm: u32,
-    /// Cooldown period after completed lane change (default: 30)
     pub cooldown_frames: u32,
-    /// EMA smoothing factor (higher = less smoothing) (default: 0.3)
     pub smoothing_alpha: f32,
-    /// Vertical position ratio for lane measurements (default: 0.8)
     pub reference_y_ratio: f32,
 }
 
@@ -319,18 +365,4 @@ impl Default for LaneChangeConfig {
             reference_y_ratio: 0.8,
         }
     }
-}
-
-// ============================================================================
-// Frame type
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub data: Vec<u8>,
-    pub width: usize,
-    pub height: usize,
-    pub frame_id: u64,
-    pub timestamp_ms: f64,
-    pub source_fps: f64,
 }
