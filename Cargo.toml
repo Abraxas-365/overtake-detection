@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0"
 # ONNX Runtime with TensorRT support
 ort = { version = "2.0.0-rc.11", features = ["cuda", "download-binaries"] }
 
@@ -20,7 +23,6 @@ thiserror = "1.0"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
-serde_json = "1.0"
 
 # Logging
 tracing = "0.1"
