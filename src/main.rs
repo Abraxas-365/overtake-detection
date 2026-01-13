@@ -186,25 +186,33 @@ async fn process_video(
     // Confidence threshold from config
     let lane_confidence_threshold = config.detection.min_lane_confidence;
 
+    // En la función process_video, reemplaza todo el loop while:
+
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
         if frame_count % 50 == 0 {
-            let (_total, _valid, ratio) = analyzer.get_stats();
             info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Valid: {:.1}% | Buffered: {}",
-                reader.progress(),
-                reader.current_frame,
-                reader.total_frames,
-                analyzer.current_state(),
-                lane_changes.len(),
-                ratio * 100.0,
-                frame_buffer.frame_count()
-            );
+            "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Buffered: {} | Pre-buffered: {}",
+            reader.progress(),
+            reader.current_frame,
+            reader.total_frames,
+            analyzer.current_state(),
+            lane_changes.len(),
+            frame_buffer.frame_count(),
+            frame_buffer.pre_buffer_count()
+        );
         }
 
-        match process_frame(&frame, inference_engine, config).await {
+        match process_frame(
+            &frame,
+            inference_engine,
+            config,
+            config.detection.min_lane_confidence,
+        )
+        .await
+        {
             Ok(detected_lanes) => {
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
@@ -212,47 +220,11 @@ async fn process_video(
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // ✅ IMPORTANTE: Agregar al pre-buffer ANTES de obtener el nuevo estado
-                // Usa previous_state para determinar si agregar
+                // ✅ IMPORTANTE: Agregar al pre-buffer ANTES de analizar (usa previous_state)
                 if previous_state == "CENTERED" {
                     frame_buffer.add_to_pre_buffer(frame.clone());
                 }
 
-                // Analizar y obtener nuevo estado
-                if let Some(mut event) = analyzer.analyze(
-                    &analysis_lanes,
-                    frame.width as u32,
-                    frame.height as u32,
-                    frame_count,
-                    timestamp_ms,
-                ) {
-                    // Lane change detected...
-                    // (resto del código de manejo de evento)
-                }
-
-                let current_state = analyzer.current_state().to_string();
-
-                // Start capturing when CENTERED -> DRIFTING
-                if previous_state == "CENTERED" && current_state == "DRIFTING" {
-                    frame_buffer.start_capture(frame_count);
-                    debug!(
-                        "📸 Started capturing at frame {} (with pre-buffer)",
-                        frame_count
-                    );
-                }
-
-                // Continue capturing during lane change
-                if frame_buffer.is_capturing() {
-                    frame_buffer.add_frame(frame.clone());
-                }
-
-                // Cancel if returned to CENTERED without completing
-                if current_state == "CENTERED" && frame_buffer.is_capturing() {
-                    frame_buffer.cancel_capture();
-                    debug!("❌ Lane change cancelled");
-                }
-
-                previous_state = current_state;
                 // Check if lane change completed
                 if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
@@ -262,15 +234,19 @@ async fn process_video(
                     timestamp_ms,
                 ) {
                     info!(
-                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {}) - confidence: {:.2}",
+                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.end_frame_id,
-                        event.confidence
+                        event.end_frame_id
                     );
 
-                    // Get captured frames
+                    // Get captured frames (includes pre-buffer)
                     let captured_frames = frame_buffer.stop_capture();
+
+                    info!(
+                        "📹 Captured {} frames total (includes pre-buffer context)",
+                        captured_frames.len()
+                    );
 
                     // Build and send legality request
                     if !captured_frames.is_empty() {
@@ -280,12 +256,10 @@ async fn process_video(
                             legality_config.num_frames_to_analyze,
                         ) {
                             Ok(request) => {
-                                // Print to console if enabled
                                 if legality_config.print_to_console {
                                     print_legality_request(&request);
                                 }
 
-                                // Save to file if enabled
                                 if legality_config.save_to_file {
                                     if let Err(e) = save_legality_request_to_file(
                                         &request,
@@ -295,7 +269,6 @@ async fn process_video(
                                     }
                                 }
 
-                                // Send to API if enabled
                                 if legality_config.send_to_api {
                                     match send_to_legality_api(&request, &legality_config.api_url)
                                         .await
@@ -323,7 +296,7 @@ async fn process_video(
                         warn!("No frames captured for lane change event");
                     }
 
-                    // Save evidence images
+                    // Save evidence images (use first captured frame as start)
                     let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
                     let start_filename =
                         format!("{}_event_{}_start.jpg", video_stem, event.event_id);
@@ -332,16 +305,13 @@ async fn process_video(
                     let mut start_path_str = String::new();
                     let mut end_path_str = String::new();
 
-                    if let Some(ref start_frame) = cached_start_frame {
+                    // Use first captured frame (from pre-buffer) as start
+                    if !captured_frames.is_empty() {
                         if let Ok(path) =
-                            video_processor.save_frame_to_disk(start_frame, &start_filename)
+                            video_processor.save_frame_to_disk(&captured_frames[0], &start_filename)
                         {
                             start_path_str = path.to_string_lossy().to_string();
                         }
-                    } else if let Ok(path) =
-                        video_processor.save_frame_to_disk(&frame, &start_filename)
-                    {
-                        start_path_str = path.to_string_lossy().to_string();
                     }
 
                     if let Ok(path) = video_processor.save_frame_to_disk(&frame, &end_filename) {
@@ -354,24 +324,49 @@ async fn process_video(
                     });
 
                     lane_changes.push(event);
-                    cached_start_frame = None;
                 }
 
-                // Debug logging every 50 frames
+                // ✅ Obtener current_state DESPUÉS del análisis
+                let current_state = analyzer.current_state().to_string();
+
+                // Start capturing when CENTERED -> DRIFTING
+                if previous_state == "CENTERED" && current_state == "DRIFTING" {
+                    frame_buffer.start_capture(frame_count);
+                    debug!(
+                        "📸 Started capturing at frame {} (with pre-buffer)",
+                        frame_count
+                    );
+                }
+
+                // Continue capturing during lane change
+                if frame_buffer.is_capturing() {
+                    frame_buffer.add_frame(frame.clone());
+                }
+
+                // Cancel if returned to CENTERED without completing
+                if current_state == "CENTERED" && frame_buffer.is_capturing() {
+                    frame_buffer.cancel_capture();
+                    debug!("❌ Lane change cancelled");
+                }
+
+                // ✅ Actualizar previous_state al final
+                previous_state = current_state;
+
                 if frame_count % 50 == 0 {
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         if vs.is_valid() {
                             let normalized = vs.normalized_offset().unwrap_or(0.0);
                             let width = vs.lane_width.unwrap_or(0.0);
-                            info!(
-                                "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px | Conf: {:.2}",
+                            if normalized.abs() > 0.1 {
+                                info!(
+                                "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px",
                                 frame_count,
                                 analyzer.current_state(),
                                 vs.lateral_offset,
                                 normalized * 100.0,
-                                width,
-                                vs.detection_confidence
+                                width
                             );
+                            }
                         }
                     }
                 }
@@ -397,11 +392,7 @@ async fn process_video(
                     }
                 }
             }
-            Err(e) => {
-                if frame_count % 100 == 0 {
-                    error!("Frame {} failed: {}", frame_count, e);
-                }
-            }
+            Err(e) => error!("Frame {} failed: {}", frame_count, e),
         }
     }
 
