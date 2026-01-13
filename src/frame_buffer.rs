@@ -129,7 +129,7 @@ pub struct LaneChangeLegalityResponse {
 // ============================================================================
 
 /// Extract evenly spaced key frames
-pub fn extract_key_frames(frames: &[Frame], count: usize) -> Vec<&Frame> {
+pub fn extract_key_frames_for_lane_change(frames: &[Frame], count: usize) -> Vec<&Frame> {
     if frames.is_empty() || count == 0 {
         return vec![];
     }
@@ -138,14 +138,54 @@ pub fn extract_key_frames(frames: &[Frame], count: usize) -> Vec<&Frame> {
         return frames.iter().collect();
     }
 
-    let step = (frames.len() - 1) as f32 / (count - 1) as f32;
+    let mut selected_indices = Vec::with_capacity(count);
 
-    (0..count)
-        .map(|i| {
-            let index = (i as f32 * step).round() as usize;
-            &frames[index.min(frames.len() - 1)]
-        })
-        .collect()
+    // Strategy: More frames from START and MIDDLE of maneuver
+    // This helps AI see the "before" context
+
+    match count {
+        1 => {
+            // Just middle frame
+            selected_indices.push(frames.len() / 2);
+        }
+        2 => {
+            // Start and end
+            selected_indices.push(0);
+            selected_indices.push(frames.len() - 1);
+        }
+        3 => {
+            // Start, middle, end
+            selected_indices.push(0);
+            selected_indices.push(frames.len() / 2);
+            selected_indices.push(frames.len() - 1);
+        }
+        4 => {
+            // Start, early-middle, late-middle, end
+            selected_indices.push(0);
+            selected_indices.push(frames.len() / 3);
+            selected_indices.push((frames.len() * 2) / 3);
+            selected_indices.push(frames.len() - 1);
+        }
+        5 => {
+            // Start, early-mid, middle, late-mid, end
+            // Bias toward earlier frames to show context
+            selected_indices.push(0);
+            selected_indices.push(frames.len() / 4);
+            selected_indices.push(frames.len() / 2);
+            selected_indices.push((frames.len() * 3) / 4);
+            selected_indices.push(frames.len() - 1);
+        }
+        _ => {
+            // For more frames, distribute evenly
+            let step = (frames.len() - 1) as f32 / (count - 1) as f32;
+            for i in 0..count {
+                let index = (i as f32 * step).round() as usize;
+                selected_indices.push(index.min(frames.len() - 1));
+            }
+        }
+    }
+
+    selected_indices.into_iter().map(|i| &frames[i]).collect()
 }
 
 /// Convert frame to base64 JPEG with quality optimization
