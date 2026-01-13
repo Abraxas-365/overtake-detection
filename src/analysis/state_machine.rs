@@ -1,6 +1,8 @@
 // src/analysis/state_machine.rs
 
-use crate::analysis::{CrossingType, CurveDetector, LateralVelocityTracker};
+use super::boundary_detector::CrossingType;
+use super::curve_detector::CurveDetector;
+use super::velocity_tracker::LateralVelocityTracker;
 use crate::types::{Direction, LaneChangeConfig, LaneChangeEvent, LaneChangeState, VehicleState};
 use tracing::{debug, info, warn};
 
