@@ -45,7 +45,6 @@ pub struct DetectionConfig {
     pub confirm_frames: u32,
     pub min_lane_confidence: f32,
     pub min_position_confidence: f32,
-    // New lane change specific settings
     #[serde(default = "default_drift_threshold")]
     pub drift_threshold: f32,
     #[serde(default = "default_crossing_threshold")]
@@ -55,13 +54,13 @@ pub struct DetectionConfig {
 }
 
 fn default_drift_threshold() -> f32 {
-    0.15
+    0.20
 }
 fn default_crossing_threshold() -> f32 {
-    0.35
+    0.40
 }
 fn default_cooldown_frames() -> u32 {
-    45
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,10 +100,9 @@ pub struct Frame {
 }
 
 // ============================================================================
-// Lane Detection Types (for inference output)
+// Lane Detection Types
 // ============================================================================
 
-/// Lane from detection (uses tuple points for compatibility)
 #[derive(Debug, Clone)]
 pub struct DetectedLane {
     pub points: Vec<(f32, f32)>,
@@ -112,7 +110,7 @@ pub struct DetectedLane {
 }
 
 // ============================================================================
-// Analysis Types (Python-compatible)
+// Analysis Types
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -164,7 +162,6 @@ pub enum LanePosition {
     RightFar,
 }
 
-/// Lane for analysis (uses Point struct)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lane {
     pub lane_id: usize,
@@ -174,7 +171,6 @@ pub struct Lane {
 }
 
 impl Lane {
-    /// Create from detected lane (tuple points)
     pub fn from_detected(lane_id: usize, detected: &DetectedLane) -> Self {
         Self {
             lane_id,
@@ -218,7 +214,6 @@ impl Lane {
         self.points.iter().map(|p| p.x).sum::<f32>() / self.points.len() as f32
     }
 
-    /// Get the bottom-most point (highest Y value, closest to vehicle)
     pub fn bottom_point(&self) -> Option<&Point> {
         self.points
             .iter()
@@ -237,9 +232,7 @@ pub struct VehicleState {
     pub heading_offset: f32,
     pub frame_id: u64,
     pub timestamp_ms: f64,
-    /// Raw offset before smoothing (for debugging)
     pub raw_offset: f32,
-    /// Confidence of the lane detection
     pub detection_confidence: f32,
 }
 
@@ -263,8 +256,9 @@ impl VehicleState {
         }
     }
 
+    /// Check if state is valid - ONLY requires lane width
     pub fn is_valid(&self) -> bool {
-        self.lane_width.map_or(false, |w| w > 0.0) && self.detection_confidence > 0.3
+        self.lane_width.map_or(false, |w| w > 50.0)
     }
 }
 
@@ -340,12 +334,10 @@ pub struct LaneChangeEvent {
     pub source_id: String,
     pub evidence_images: Option<EvidencePaths>,
     pub metadata: HashMap<String, serde_json::Value>,
-    /// Legality analysis result (populated after API call)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legality: Option<LegalityInfo>,
 }
 
-/// Information about lane change legality
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegalityInfo {
     pub is_legal: bool,
@@ -413,39 +405,33 @@ pub struct LaneChangeConfig {
     pub cooldown_frames: u32,
     pub smoothing_alpha: f32,
     pub reference_y_ratio: f32,
-    /// Hysteresis factor - must drop below threshold * hysteresis to cancel
     pub hysteresis_factor: f32,
-    /// Minimum confidence to consider a detection valid
-    pub min_detection_confidence: f32,
 }
 
 impl Default for LaneChangeConfig {
     fn default() -> Self {
         Self {
-            drift_threshold: 0.15,
-            crossing_threshold: 0.35,
+            drift_threshold: 0.20,
+            crossing_threshold: 0.40,
             min_frames_confirm: 5,
-            cooldown_frames: 45,
-            smoothing_alpha: 0.2,
+            cooldown_frames: 30,
+            smoothing_alpha: 0.3,
             reference_y_ratio: 0.8,
-            hysteresis_factor: 0.6,
-            min_detection_confidence: 0.4,
+            hysteresis_factor: 0.5,
         }
     }
 }
 
 impl LaneChangeConfig {
-    /// Create from detection config
     pub fn from_detection_config(detection: &DetectionConfig) -> Self {
         Self {
             drift_threshold: detection.drift_threshold,
             crossing_threshold: detection.crossing_threshold,
             min_frames_confirm: detection.confirm_frames,
             cooldown_frames: detection.cooldown_frames,
-            smoothing_alpha: 0.2,
+            smoothing_alpha: 0.3,
             reference_y_ratio: 0.8,
-            hysteresis_factor: 0.6,
-            min_detection_confidence: detection.min_lane_confidence,
+            hysteresis_factor: 0.5,
         }
     }
 }
