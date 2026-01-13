@@ -19,18 +19,18 @@ detection:
   min_points_per_lane: 3
   smoother_window_size: 10
   calibration_frames: 90
-  debounce_frames: 10
-  confirm_frames: 12             # Increased
+  debounce_frames: 8
+  confirm_frames: 10
   min_lane_confidence: 0.25
   min_position_confidence: 0.3
-  # Lane change thresholds - MUCH STRICTER
-  drift_threshold: 0.30          # Increased from 0.25
-  crossing_threshold: 0.55       # Increased from 0.50
-  cooldown_frames: 90            # Increased from 60
-  min_lane_change_duration_ms: 1500   # Increased from 800
-  max_lane_change_duration_ms: 5000   # Decreased from 6000
-  skip_initial_frames: 150       # Skip first 5 seconds
-  require_both_lanes: true       # NEW: Require both lanes visible
+  # Balanced thresholds
+  drift_threshold: 0.25
+  crossing_threshold: 0.45
+  cooldown_frames: 90
+  min_lane_change_duration_ms: 1000
+  max_lane_change_duration_ms: 8000
+  skip_initial_frames: 120
+  require_both_lanes: false  # Changed back to false
 
 overtake:
   lane_change_offset_threshold: 0.6
