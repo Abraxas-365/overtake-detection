@@ -1,5 +1,3 @@
-// src/frame_buffer.rs
-
 use crate::types::{Direction, Frame, LaneChangeEvent};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};

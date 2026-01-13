@@ -34,6 +34,7 @@ opencv = { version = "0.91", features = ["rgb"] }
 walkdir = "2.4"
 base64 = "0.22"
 image = "0.25"
+reqwest = { version = "0.11", features = ["json"] }
 [profile.release]
 opt-level = 3
 lto = true

@@ -12,7 +12,7 @@ use analysis::LaneChangeAnalyzer;
 use anyhow::Result;
 use frame_buffer::{
     build_legality_request, print_legality_request, save_legality_request_to_file,
-    LaneChangeFrameBuffer,
+    send_to_legality_api, LaneChangeFrameBuffer,
 };
 use std::path::Path;
 use tracing::{debug, error, info, warn};
@@ -20,10 +20,18 @@ use types::{DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 
 /// Configuration for legality analysis
 struct LegalityAnalysisConfig {
+    /// Number of frames to extract and send for analysis
     num_frames_to_analyze: usize,
+    /// Maximum frames to buffer during lane change
     max_buffer_frames: usize,
+    /// Whether to save the request payload to a file
     save_to_file: bool,
+    /// Whether to print the request to console
     print_to_console: bool,
+    /// Whether to send to the API
+    send_to_api: bool,
+    /// API URL for legality analysis
+    api_url: String,
 }
 
 impl Default for LegalityAnalysisConfig {
@@ -31,8 +39,10 @@ impl Default for LegalityAnalysisConfig {
         Self {
             num_frames_to_analyze: 5,
             max_buffer_frames: 90,
-            save_to_file: true,
+            save_to_file: false,
             print_to_console: true,
+            send_to_api: true,
+            api_url: "http://localhost:3000/api/analyze".to_string(),
         }
     }
 }
@@ -62,7 +72,18 @@ async fn main() -> Result<()> {
 
     info!("Found {} video file(s) to process", video_files.len());
 
-    let legality_config = LegalityAnalysisConfig::default();
+    // Legality analysis configuration
+    let legality_config = LegalityAnalysisConfig {
+        num_frames_to_analyze: 5,
+        max_buffer_frames: 90,
+        save_to_file: false,
+        print_to_console: true,
+        send_to_api: true,
+        api_url: std::env::var("LEGALITY_API_URL")
+            .unwrap_or_else(|_| "http://localhost:3000/api/analyze".to_string()),
+    };
+
+    info!("📡 Legality API URL: {}", legality_config.api_url);
 
     for (idx, video_path) in video_files.iter().enumerate() {
         info!("\n========================================");
@@ -87,6 +108,7 @@ async fn main() -> Result<()> {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
+                info!("  Events sent to API: {}", stats.events_sent_to_api);
             }
             Err(e) => {
                 error!("Failed to process video: {}", e);
@@ -102,6 +124,7 @@ struct ProcessingStats {
     #[allow(dead_code)]
     frames_with_position: u64,
     lane_changes_detected: usize,
+    events_sent_to_api: usize,
     #[allow(dead_code)]
     duration_secs: f64,
     #[allow(dead_code)]
@@ -139,6 +162,7 @@ async fn process_video(
     let mut lane_changes: Vec<LaneChangeEvent> = Vec::new();
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
+    let mut events_sent_to_api: usize = 0;
 
     let mut cached_start_frame: Option<Frame> = None;
     let mut previous_state = "CENTERED".to_string();
@@ -208,9 +232,10 @@ async fn process_video(
                         event.end_frame_id
                     );
 
-                    // Get captured frames and build legality request
+                    // Get captured frames
                     let captured_frames = frame_buffer.stop_capture();
 
+                    // Build and send legality request
                     if !captured_frames.is_empty() {
                         match build_legality_request(
                             &event,
@@ -218,16 +243,38 @@ async fn process_video(
                             legality_config.num_frames_to_analyze,
                         ) {
                             Ok(request) => {
+                                // Print to console if enabled
                                 if legality_config.print_to_console {
                                     print_legality_request(&request);
                                 }
 
+                                // Save to file if enabled
                                 if legality_config.save_to_file {
                                     if let Err(e) = save_legality_request_to_file(
                                         &request,
                                         &config.video.output_dir,
                                     ) {
                                         warn!("Failed to save legality request: {}", e);
+                                    }
+                                }
+
+                                // Send to API if enabled
+                                if legality_config.send_to_api {
+                                    match send_to_legality_api(&request, &legality_config.api_url)
+                                        .await
+                                    {
+                                        Ok(response) => {
+                                            info!(
+                                                "✅ Event {} sent to API: {} - {}",
+                                                response.event_id,
+                                                response.status,
+                                                response.message
+                                            );
+                                            events_sent_to_api += 1;
+                                        }
+                                        Err(e) => {
+                                            error!("❌ Failed to send event to API: {}", e);
+                                        }
                                     }
                                 }
                             }
@@ -327,6 +374,7 @@ async fn process_video(
 
     info!("\n📊 Final Report:");
     info!("  Total Lane Changes: {}", lane_changes.len());
+    info!("  Events Sent to API: {}", events_sent_to_api);
 
     for (i, event) in lane_changes.iter().enumerate() {
         info!(
@@ -343,6 +391,7 @@ async fn process_video(
         total_frames: frame_count,
         frames_with_position: frames_with_valid_position,
         lane_changes_detected: lane_changes.len(),
+        events_sent_to_api,
         duration_secs: duration.as_secs_f64(),
         avg_fps,
     })
@@ -403,4 +452,3 @@ fn save_results(
     info!("💾 Saved to: {}", jsonl_path.display());
     Ok(())
 }
-
