@@ -62,10 +62,6 @@ impl InferenceEngine {
         let output = &outputs[0];
         let (output_shape, data_slice) = output.try_extract_tensor::<f32>()?;
 
-        // DEBUG: Print actual output shape
-        info!("Model output shape: {:?}", output_shape);
-        info!("Model output size: {}", data_slice.len());
-
         // Convert slice to Vec
         let output_data: Vec<f32> = data_slice.to_vec();
 
