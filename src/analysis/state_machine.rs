@@ -193,7 +193,6 @@ impl LaneChangeStateMachine {
     fn determine_target_state(&self, deviation: f32) -> LaneChangeState {
         match self.state {
             LaneChangeState::Centered => {
-                // Need sustained high deviation to start
                 if deviation >= self.config.drift_threshold {
                     if self.is_deviation_sustained(self.config.drift_threshold * 0.9) {
                         return LaneChangeState::Drifting;
@@ -204,14 +203,14 @@ impl LaneChangeStateMachine {
             LaneChangeState::Drifting => {
                 if deviation >= self.config.crossing_threshold {
                     LaneChangeState::Crossing
-                } else if deviation < self.config.drift_threshold * 0.4 {
-                    // Returned to center without crossing - probably a curve or swerve
-                    if self.max_offset_in_change < self.config.crossing_threshold * 0.85 {
+                } else if deviation < self.config.drift_threshold * 0.5 {
+                    // Returned to center - check if this is completion or cancellation
+                    if self.max_offset_in_change >= self.config.crossing_threshold {
+                        // We DID reach crossing threshold at some point, this is completion!
+                        LaneChangeState::Completed
+                    } else {
                         // Never reached crossing threshold, cancel
                         LaneChangeState::Centered
-                    } else {
-                        // Did reach threshold, this is completion
-                        LaneChangeState::Completed
                     }
                 } else {
                     LaneChangeState::Drifting
