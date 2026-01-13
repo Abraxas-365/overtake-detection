@@ -20,17 +20,16 @@ detection:
   smoother_window_size: 10
   calibration_frames: 90
   debounce_frames: 8
-  confirm_frames: 10
+  confirm_frames: 12
   min_lane_confidence: 0.25
   min_position_confidence: 0.3
-  # Balanced thresholds
-  drift_threshold: 0.25
-  crossing_threshold: 0.45
+  drift_threshold: 0.30
+  crossing_threshold: 0.50
   cooldown_frames: 90
-  min_lane_change_duration_ms: 1000
-  max_lane_change_duration_ms: 8000
-  skip_initial_frames: 120
-  require_both_lanes: false  # Changed back to false
+  min_lane_change_duration_ms: 1200
+  max_lane_change_duration_ms: 6000
+  skip_initial_frames: 300       # Skip first 10 seconds!
+  require_both_lanes: false
 
 overtake:
   lane_change_offset_threshold: 0.6
