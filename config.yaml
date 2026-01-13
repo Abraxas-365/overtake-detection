@@ -23,9 +23,8 @@ detection:
   confirm_frames: 12
   min_lane_confidence: 0.25
   min_position_confidence: 0.3
-  # Improved thresholds with boundary detection
-  drift_threshold: 0.30           # Detect movement
-  crossing_threshold: 0.50        # Confirm lane change (balanced with boundary detection)
+  drift_threshold: 0.30           # Start noticing at 30%
+  crossing_threshold: 0.48        # Confirm at 48% (balanced)
   cooldown_frames: 90
   min_lane_change_duration_ms: 1200
   max_lane_change_duration_ms: 8000

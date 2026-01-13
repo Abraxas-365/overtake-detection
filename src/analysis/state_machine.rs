@@ -216,8 +216,7 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // CRITICAL: Only trigger if we detect actual boundary crossing
-                // AND there's sufficient lateral movement
+                // PRIMARY: Boundary crossing detection with velocity
                 if crossing_type != CrossingType::None
                     && lateral_velocity.abs() > MIN_LATERAL_VELOCITY
                 {
@@ -230,19 +229,45 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // Even with high deviation, don't trigger without boundary crossing
+                // FALLBACK: Very large deviation even without boundary crossing
+                // This handles cases where lane detection might be slightly off
+                if deviation >= 0.55 {
+                    // 55% is very obvious
+                    if self.is_deviation_sustained(self.config.drift_threshold)
+                        && lateral_velocity.abs() > 20.0
+                    // Lower threshold for obvious cases
+                    {
+                        info!(
+                        "🚨 Lane change trigger (fallback): large deviation {:.1}% + velocity {:.1}px/s",
+                        deviation * 100.0, lateral_velocity
+                    );
+                        return LaneChangeState::Drifting;
+                    }
+                }
+
+                // SECONDARY: Medium-high deviation with sustained movement
+                // More lenient than boundary crossing but still requires movement
+                if deviation >= self.config.drift_threshold + 0.10  // drift + 10%
+                && lateral_velocity.abs() > MIN_LATERAL_VELOCITY
+                {
+                    if self.is_deviation_sustained(self.config.drift_threshold) {
+                        info!(
+                        "🚨 Lane change trigger (deviation-based): dev={:.1}% + velocity {:.1}px/s",
+                        deviation * 100.0, lateral_velocity
+                    );
+                        return LaneChangeState::Drifting;
+                    }
+                }
+
                 LaneChangeState::Centered
             }
             LaneChangeState::Drifting => {
-                // Check if we've crossed the threshold to confirm
                 if deviation >= self.config.crossing_threshold {
                     LaneChangeState::Crossing
                 } else if deviation < self.config.drift_threshold * 0.5 {
-                    // Returned to center
                     if self.max_offset_in_change >= self.config.crossing_threshold {
                         LaneChangeState::Completed
                     } else {
-                        // Cancel if we never reached crossing threshold
                         warn!(
                             "❌ Lane change cancelled: max dev {:.1}% < threshold {:.1}%",
                             self.max_offset_in_change * 100.0,
