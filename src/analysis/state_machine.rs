@@ -1,7 +1,7 @@
 // src/analysis/state_machine.rs
 
 use crate::types::{Direction, LaneChangeConfig, LaneChangeEvent, LaneChangeState, VehicleState};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct LaneChangeStateMachine {
     config: LaneChangeConfig,
@@ -16,6 +16,8 @@ pub struct LaneChangeStateMachine {
     cooldown_remaining: u32,
     max_offset_in_change: f32,
     offset_history: Vec<f32>,
+    /// Count frames processed (for skipping initial frames)
+    total_frames_processed: u64,
 }
 
 impl LaneChangeStateMachine {
@@ -33,6 +35,7 @@ impl LaneChangeStateMachine {
             cooldown_remaining: 0,
             max_offset_in_change: 0.0,
             offset_history: Vec::with_capacity(20),
+            total_frames_processed: 0,
         }
     }
 
@@ -46,6 +49,13 @@ impl LaneChangeStateMachine {
         frame_id: u64,
         timestamp_ms: f64,
     ) -> Option<LaneChangeEvent> {
+        self.total_frames_processed += 1;
+
+        // Skip initial frames (camera initialization)
+        if self.total_frames_processed < self.config.skip_initial_frames {
+            return None;
+        }
+
         // Handle cooldown period
         if self.cooldown_remaining > 0 {
             self.cooldown_remaining -= 1;
@@ -57,7 +67,21 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Simple validity check - just need lane width
+        // Check for timeout - if stuck in DRIFTING or CROSSING too long, reset
+        if self.state == LaneChangeState::Drifting || self.state == LaneChangeState::Crossing {
+            if let Some(start_time) = self.change_start_time {
+                let elapsed = timestamp_ms - start_time;
+                if elapsed > self.config.max_duration_ms {
+                    warn!(
+                        "Lane change timeout after {:.0}ms, resetting to CENTERED",
+                        elapsed
+                    );
+                    self.reset_to_centered();
+                    return None;
+                }
+            }
+        }
+
         if !vehicle_state.is_valid() {
             debug!("Frame {}: Invalid vehicle state, skipping", frame_id);
             return None;
@@ -80,7 +104,7 @@ impl LaneChangeStateMachine {
             }
         }
 
-        // Determine target state with hysteresis
+        // Determine target state
         let target_state = self.determine_target_state_with_hysteresis(normalized_offset);
 
         debug!(
@@ -95,6 +119,18 @@ impl LaneChangeStateMachine {
         );
 
         self.check_transition(target_state, direction, frame_id, timestamp_ms)
+    }
+
+    fn reset_to_centered(&mut self) {
+        self.state = LaneChangeState::Centered;
+        self.frames_in_state = 0;
+        self.pending_state = None;
+        self.pending_frames = 0;
+        self.change_direction = Direction::Unknown;
+        self.change_start_frame = None;
+        self.change_start_time = None;
+        self.max_offset_in_change = 0.0;
+        self.offset_history.clear();
     }
 
     fn determine_target_state_with_hysteresis(&self, normalized_offset: f32) -> LaneChangeState {
@@ -112,7 +148,6 @@ impl LaneChangeStateMachine {
                 } else if normalized_offset
                     < self.config.drift_threshold * self.config.hysteresis_factor
                 {
-                    // Only cancel if clearly back to center
                     if self.is_trending_to_center() {
                         LaneChangeState::Centered
                     } else {
@@ -123,8 +158,8 @@ impl LaneChangeStateMachine {
                 }
             }
             LaneChangeState::Crossing => {
-                // Complete when offset drops back (we've moved to new lane)
-                if normalized_offset < self.config.drift_threshold {
+                // Complete when offset drops back significantly
+                if normalized_offset < self.config.drift_threshold * 0.8 {
                     LaneChangeState::Completed
                 } else {
                     LaneChangeState::Crossing
@@ -207,18 +242,45 @@ impl LaneChangeStateMachine {
             );
         }
 
+        // Calculate duration if completing
         let duration_ms = if target_state == LaneChangeState::Completed {
             self.change_start_time.map(|start| timestamp_ms - start)
         } else {
             None
         };
 
+        // Update state
         self.state = target_state;
         self.frames_in_state = 0;
         self.pending_state = None;
         self.pending_frames = 0;
 
+        // Generate event if completed
         if target_state == LaneChangeState::Completed {
+            // Check minimum duration
+            if let Some(dur) = duration_ms {
+                if dur < self.config.min_duration_ms {
+                    warn!(
+                        "Lane change too short ({:.0}ms < {:.0}ms), ignoring",
+                        dur, self.config.min_duration_ms
+                    );
+                    self.reset_to_centered();
+                    self.cooldown_remaining = self.config.cooldown_frames / 2;
+                    return None;
+                }
+            }
+
+            // Check that we actually crossed (max offset should exceed crossing threshold)
+            if self.max_offset_in_change < self.config.crossing_threshold * 0.8 {
+                warn!(
+                    "Max offset {:.2} never reached crossing threshold, ignoring",
+                    self.max_offset_in_change
+                );
+                self.reset_to_centered();
+                self.cooldown_remaining = self.config.cooldown_frames / 2;
+                return None;
+            }
+
             self.cooldown_remaining = self.config.cooldown_frames;
 
             let start_frame = self.change_start_frame.unwrap_or(frame_id);
@@ -235,10 +297,11 @@ impl LaneChangeStateMachine {
             event.source_id = self.source_id.clone();
 
             info!(
-                "✅ Lane change completed: {} (duration: {:.0}ms, confidence: {:.2}) at frame {}",
+                "✅ Lane change completed: {} (duration: {:.0}ms, confidence: {:.2}, max_offset: {:.2}) at frame {}",
                 event.direction_name(),
                 duration_ms.unwrap_or(0.0),
                 confidence,
+                self.max_offset_in_change,
                 frame_id
             );
 
@@ -256,15 +319,21 @@ impl LaneChangeStateMachine {
     }
 
     fn calculate_confidence(&self, duration_ms: Option<f64>) -> f32 {
-        let mut confidence: f32 = 0.7;
+        let mut confidence: f32 = 0.6;
 
-        if self.max_offset_in_change > self.config.crossing_threshold {
-            confidence += 0.15;
+        // Higher offset = more confident
+        if self.max_offset_in_change > self.config.crossing_threshold * 1.2 {
+            confidence += 0.2;
+        } else if self.max_offset_in_change > self.config.crossing_threshold {
+            confidence += 0.1;
         }
 
+        // Good duration range (1-4 seconds)
         if let Some(duration) = duration_ms {
-            if duration > 500.0 && duration < 5000.0 {
-                confidence += 0.1;
+            if duration > 1000.0 && duration < 4000.0 {
+                confidence += 0.15;
+            } else if duration > 800.0 && duration < 6000.0 {
+                confidence += 0.05;
             }
         }
 
@@ -272,16 +341,9 @@ impl LaneChangeStateMachine {
     }
 
     pub fn reset(&mut self) {
-        self.state = LaneChangeState::Centered;
-        self.frames_in_state = 0;
-        self.pending_state = None;
-        self.pending_frames = 0;
-        self.change_direction = Direction::Unknown;
-        self.change_start_frame = None;
-        self.change_start_time = None;
+        self.reset_to_centered();
         self.cooldown_remaining = 0;
-        self.max_offset_in_change = 0.0;
-        self.offset_history.clear();
+        self.total_frames_processed = 0;
     }
 
     pub fn set_source_id(&mut self, source_id: String) {

@@ -63,7 +63,6 @@ impl PositionEstimator {
         let vehicle_x = frame_width as f32 / 2.0;
         let reference_y = frame_height as f32 * self.reference_y_ratio;
 
-        // RELAXED filtering - accept more lanes
         let confident_lanes: Vec<&Lane> = lanes
             .iter()
             .filter(|l| l.confidence > 0.2 && l.points.len() >= 3)
@@ -75,10 +74,12 @@ impl PositionEstimator {
         let left_x = left_lane.and_then(|l| l.get_x_at_y(reference_y));
         let right_x = right_lane.and_then(|l| l.get_x_at_y(reference_y));
 
+        let both_lanes_detected = left_x.is_some() && right_x.is_some();
+
         let detection_confidence = match (&left_lane, &right_lane) {
             (Some(l), Some(r)) => (l.confidence + r.confidence) / 2.0,
-            (Some(l), None) => l.confidence * 0.8,
-            (None, Some(r)) => r.confidence * 0.8,
+            (Some(l), None) => l.confidence * 0.6,
+            (None, Some(r)) => r.confidence * 0.6,
             (None, None) => 0.0,
         };
 
@@ -132,6 +133,7 @@ impl PositionEstimator {
             timestamp_ms: 0.0,
             raw_offset,
             detection_confidence,
+            both_lanes_detected,
         }
     }
 
@@ -203,7 +205,7 @@ impl PositionSmoother {
                     Some(width)
                 }
                 Some(prev) => {
-                    let new_val = 0.1 * width + 0.9 * prev; // Very stable width
+                    let new_val = 0.1 * width + 0.9 * prev;
                     self.smoothed_width = Some(new_val);
                     Some(new_val)
                 }
@@ -220,6 +222,7 @@ impl PositionSmoother {
             timestamp_ms: state.timestamp_ms,
             raw_offset: state.raw_offset,
             detection_confidence: state.detection_confidence,
+            both_lanes_detected: state.both_lanes_detected,
         }
     }
 

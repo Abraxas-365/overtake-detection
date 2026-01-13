@@ -51,16 +51,31 @@ pub struct DetectionConfig {
     pub crossing_threshold: f32,
     #[serde(default = "default_cooldown_frames")]
     pub cooldown_frames: u32,
+    #[serde(default = "default_min_duration")]
+    pub min_lane_change_duration_ms: f64,
+    #[serde(default = "default_max_duration")]
+    pub max_lane_change_duration_ms: f64,
+    #[serde(default = "default_skip_initial")]
+    pub skip_initial_frames: u64,
 }
 
 fn default_drift_threshold() -> f32 {
-    0.20
+    0.25
 }
 fn default_crossing_threshold() -> f32 {
-    0.40
+    0.50
 }
 fn default_cooldown_frames() -> u32 {
-    30
+    60
+}
+fn default_min_duration() -> f64 {
+    800.0
+}
+fn default_max_duration() -> f64 {
+    6000.0
+}
+fn default_skip_initial() -> u64 {
+    90
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +249,8 @@ pub struct VehicleState {
     pub timestamp_ms: f64,
     pub raw_offset: f32,
     pub detection_confidence: f32,
+    /// True if both lanes were detected (more reliable)
+    pub both_lanes_detected: bool,
 }
 
 impl VehicleState {
@@ -246,6 +263,7 @@ impl VehicleState {
             timestamp_ms: 0.0,
             raw_offset: 0.0,
             detection_confidence: 0.0,
+            both_lanes_detected: false,
         }
     }
 
@@ -256,7 +274,6 @@ impl VehicleState {
         }
     }
 
-    /// Check if state is valid - ONLY requires lane width
     pub fn is_valid(&self) -> bool {
         self.lane_width.map_or(false, |w| w > 50.0)
     }
@@ -406,18 +423,24 @@ pub struct LaneChangeConfig {
     pub smoothing_alpha: f32,
     pub reference_y_ratio: f32,
     pub hysteresis_factor: f32,
+    pub min_duration_ms: f64,
+    pub max_duration_ms: f64,
+    pub skip_initial_frames: u64,
 }
 
 impl Default for LaneChangeConfig {
     fn default() -> Self {
         Self {
-            drift_threshold: 0.20,
-            crossing_threshold: 0.40,
-            min_frames_confirm: 5,
-            cooldown_frames: 30,
+            drift_threshold: 0.25,
+            crossing_threshold: 0.50,
+            min_frames_confirm: 8,
+            cooldown_frames: 60,
             smoothing_alpha: 0.3,
             reference_y_ratio: 0.8,
             hysteresis_factor: 0.5,
+            min_duration_ms: 800.0,
+            max_duration_ms: 6000.0,
+            skip_initial_frames: 90,
         }
     }
 }
@@ -432,6 +455,9 @@ impl LaneChangeConfig {
             smoothing_alpha: 0.3,
             reference_y_ratio: 0.8,
             hysteresis_factor: 0.5,
+            min_duration_ms: detection.min_lane_change_duration_ms,
+            max_duration_ms: detection.max_lane_change_duration_ms,
+            skip_initial_frames: detection.skip_initial_frames,
         }
     }
 }

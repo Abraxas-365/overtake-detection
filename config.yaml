@@ -15,15 +15,24 @@ inference:
   num_threads: 4
 
 detection:
-  confidence_threshold: 0.5
-  min_points_per_lane: 5
+  confidence_threshold: 0.25
+  min_points_per_lane: 3
   smoother_window_size: 10
   calibration_frames: 90
-  debounce_frames: 15
-  confirm_frames: 20
-  min_lane_confidence: 0.6
-  min_position_confidence: 0.5
-  
+  debounce_frames: 8
+  confirm_frames: 8              # Increased from 5
+  min_lane_confidence: 0.25
+  min_position_confidence: 0.3
+  # Lane change thresholds - LESS SENSITIVE
+  drift_threshold: 0.25          # Increased from 0.20
+  crossing_threshold: 0.50       # Increased from 0.40
+  cooldown_frames: 60            # Increased from 30
+  # NEW: Duration limits
+  min_lane_change_duration_ms: 800    # Minimum 800ms
+  max_lane_change_duration_ms: 6000   # Maximum 6 seconds
+  # NEW: Skip initial frames
+  skip_initial_frames: 90        # Skip first 3 seconds
+
 overtake:
   lane_change_offset_threshold: 0.6
   debounce_frames: 5
@@ -32,16 +41,14 @@ overtake:
   min_interval_seconds: 2.0
 
 video:
-  # Input video settings
-  input_dir: "/home/edartru/InEdge/poc-minsur/videos"
+  input_dir: "/home/edartru/InEdge/poc-minsur/videos/lima"
   output_dir: "/home/edartru/InEdge/poc-minsur/output"
   source_width: 1280
   source_height: 720
   target_fps: 30
-  
-  # Video output settings
   save_annotated: true
   save_events_only: false
 
 logging:
   level: "info"
+
