@@ -3,7 +3,6 @@
 use crate::analysis::position_estimator::{PositionEstimator, PositionSmoother};
 use crate::analysis::state_machine::LaneChangeStateMachine;
 use crate::types::{Lane, LaneChangeConfig, LaneChangeEvent, VehicleState};
-use tracing::debug;
 
 pub struct LaneChangeAnalyzer {
     position_estimator: PositionEstimator,

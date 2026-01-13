@@ -2,7 +2,7 @@
 
 use crate::types::{Lane, VehicleState};
 use std::collections::VecDeque;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Estimates vehicle position relative to lane boundaries
 pub struct PositionEstimator {

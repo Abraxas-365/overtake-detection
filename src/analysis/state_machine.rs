@@ -1,7 +1,5 @@
-// src/analysis/state_machine.rs
-
 use crate::types::{Direction, LaneChangeConfig, LaneChangeEvent, LaneChangeState, VehicleState};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct LaneChangeStateMachine {
     config: LaneChangeConfig,
@@ -297,7 +295,7 @@ impl LaneChangeStateMachine {
 
     /// Calculate confidence based on detection quality and lane change characteristics
     fn calculate_confidence(&self, duration_ms: Option<f64>) -> f32 {
-        let mut confidence = 0.7; // Base confidence
+        let mut confidence: f32 = 0.7; // Base confidence
 
         // Boost confidence if we saw a significant offset
         if self.max_offset_in_change > self.config.crossing_threshold {

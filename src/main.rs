@@ -191,7 +191,7 @@ async fn process_video(
         let timestamp_ms = frame.timestamp_ms;
 
         if frame_count % 50 == 0 {
-            let (total, valid, ratio) = analyzer.get_stats();
+            let (_total, _valid, ratio) = analyzer.get_stats();
             info!(
                 "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Valid: {:.1}% | Buffered: {}",
                 reader.progress(),
