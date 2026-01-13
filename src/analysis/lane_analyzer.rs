@@ -1,5 +1,6 @@
 // src/analysis/lane_analyzer.rs
 
+use crate::analysis::boundary_detector::{CrossingType, LaneBoundaryCrossingDetector};
 use crate::analysis::position_estimator::{PositionEstimator, PositionSmoother};
 use crate::analysis::state_machine::LaneChangeStateMachine;
 use crate::types::{Lane, LaneChangeConfig, LaneChangeEvent, VehicleState};
@@ -8,11 +9,10 @@ pub struct LaneChangeAnalyzer {
     position_estimator: PositionEstimator,
     smoother: PositionSmoother,
     state_machine: LaneChangeStateMachine,
+    boundary_detector: LaneBoundaryCrossingDetector,
     config: LaneChangeConfig,
     last_state: Option<VehicleState>,
-    /// Count of frames analyzed
     frame_count: u64,
-    /// Count of valid position estimates
     valid_estimates: u64,
 }
 
@@ -21,11 +21,13 @@ impl LaneChangeAnalyzer {
         let position_estimator = PositionEstimator::new(config.reference_y_ratio);
         let smoother = PositionSmoother::new(config.smoothing_alpha);
         let state_machine = LaneChangeStateMachine::new(config.clone());
+        let boundary_detector = LaneBoundaryCrossingDetector::new();
 
         Self {
             position_estimator,
             smoother,
             state_machine,
+            boundary_detector,
             config,
             last_state: None,
             frame_count: 0,
@@ -43,6 +45,9 @@ impl LaneChangeAnalyzer {
     ) -> Option<LaneChangeEvent> {
         self.frame_count += 1;
 
+        // Update curve detector with current lanes
+        let _is_in_curve = self.state_machine.curve_detector.is_in_curve(lanes);
+
         // Get raw position estimate
         let mut raw_state = self
             .position_estimator
@@ -57,11 +62,41 @@ impl LaneChangeAnalyzer {
             self.valid_estimates += 1;
         }
 
+        // Detect lane boundary crossing
+        let (left_x, right_x) = self.get_lane_boundaries(lanes, frame_height);
+        let vehicle_x = frame_width as f32 / 2.0;
+
+        let crossing_type = self
+            .boundary_detector
+            .detect_crossing(left_x, right_x, vehicle_x);
+
         self.last_state = Some(smoothed_state);
 
-        // Update state machine
+        // Update state machine with crossing info
         self.state_machine
-            .update(&smoothed_state, frame_id, timestamp_ms)
+            .update(&smoothed_state, frame_id, timestamp_ms, crossing_type)
+    }
+
+    fn get_lane_boundaries(&self, lanes: &[Lane], frame_height: u32) -> (Option<f32>, Option<f32>) {
+        let reference_y = frame_height as f32 * self.config.reference_y_ratio;
+
+        // Find left and right ego lanes
+        let mut left_x = None;
+        let mut right_x = None;
+
+        let vehicle_x = 640.0; // Approximate center, adjust if needed
+
+        for lane in lanes {
+            if let Some(x) = lane.get_x_at_y(reference_y) {
+                if x < vehicle_x && (left_x.is_none() || x > left_x.unwrap()) {
+                    left_x = Some(x);
+                } else if x > vehicle_x && (right_x.is_none() || x < right_x.unwrap()) {
+                    right_x = Some(x);
+                }
+            }
+        }
+
+        (left_x, right_x)
     }
 
     pub fn current_state(&self) -> &str {
@@ -76,6 +111,7 @@ impl LaneChangeAnalyzer {
         self.state_machine.reset();
         self.smoother.reset();
         self.position_estimator.reset();
+        self.boundary_detector.reset();
         self.last_state = None;
         self.frame_count = 0;
         self.valid_estimates = 0;
@@ -89,7 +125,6 @@ impl LaneChangeAnalyzer {
         &self.config
     }
 
-    /// Get statistics about detection quality
     pub fn get_stats(&self) -> (u64, u64, f32) {
         let valid_ratio = if self.frame_count > 0 {
             self.valid_estimates as f32 / self.frame_count as f32

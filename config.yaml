@@ -19,17 +19,17 @@ detection:
   min_points_per_lane: 3
   smoother_window_size: 10
   calibration_frames: 90
-  debounce_frames: 8
-  confirm_frames: 10
+  debounce_frames: 10
+  confirm_frames: 12
   min_lane_confidence: 0.25
   min_position_confidence: 0.3
-  # Adjusted thresholds
-  drift_threshold: 0.25           # Lowered from 0.30
-  crossing_threshold: 0.40        # Lowered from 0.50 - so 42% will be detected!
+  # Improved thresholds with boundary detection
+  drift_threshold: 0.30           # Detect movement
+  crossing_threshold: 0.50        # Confirm lane change (balanced with boundary detection)
   cooldown_frames: 90
-  min_lane_change_duration_ms: 1000
+  min_lane_change_duration_ms: 1200
   max_lane_change_duration_ms: 8000
-  skip_initial_frames: 300
+  skip_initial_frames: 100
   require_both_lanes: false
 
 overtake:
