@@ -37,7 +37,7 @@ struct LegalityAnalysisConfig {
 impl Default for LegalityAnalysisConfig {
     fn default() -> Self {
         Self {
-            num_frames_to_analyze: 5,
+            num_frames_to_analyze: 7,
             max_buffer_frames: 90,
             save_to_file: false,
             print_to_console: true,

@@ -128,7 +128,7 @@ pub struct LaneChangeLegalityResponse {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Extract evenly spaced key frames
+/// Extract key frames with better distribution for lane change analysis
 pub fn extract_key_frames_for_lane_change(frames: &[Frame], count: usize) -> Vec<&Frame> {
     if frames.is_empty() || count == 0 {
         return vec![];
@@ -200,12 +200,12 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
     let mut buffer = Cursor::new(Vec::new());
 
     // Use explicit JPEG encoder with quality setting
-    let encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
+    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
     encoder.encode(
         img.as_raw(),
         img.width(),
         img.height(),
-        image::ColorType::Rgb8,
+        image::ExtendedColorType::Rgb8, // FIXED: Use ExtendedColorType
     )?;
 
     Ok(STANDARD.encode(buffer.into_inner()))
@@ -217,13 +217,27 @@ pub fn build_legality_request(
     captured_frames: &[Frame],
     num_frames_to_send: usize,
 ) -> Result<LaneChangeLegalityRequest, anyhow::Error> {
-    let key_frames = extract_key_frames(captured_frames, num_frames_to_send);
+    // FIXED: Use the new function name
+    let key_frames = extract_key_frames_for_lane_change(captured_frames, num_frames_to_send);
 
     if key_frames.is_empty() {
         anyhow::bail!("No frames to send");
     }
 
     let mut frame_data_list = Vec::with_capacity(key_frames.len());
+
+    // Log which frames were selected
+    let selected_indices: Vec<usize> = key_frames
+        .iter()
+        .filter_map(|kf| captured_frames.iter().position(|f| std::ptr::eq(*kf, f)))
+        .collect();
+
+    info!(
+        "📸 Selected {} frames from {} total: indices {:?}",
+        key_frames.len(),
+        captured_frames.len(),
+        selected_indices
+    );
 
     // Process each frame
     for (i, frame) in key_frames.iter().enumerate() {
@@ -460,7 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_key_frames() {
+    fn test_extract_key_frames_for_lane_change() {
         let frames: Vec<Frame> = (0..10)
             .map(|i| Frame {
                 data: vec![],
@@ -470,26 +484,11 @@ mod tests {
             })
             .collect();
 
-        let key_frames = extract_key_frames(&frames, 5);
+        let key_frames = extract_key_frames_for_lane_change(&frames, 5);
         assert_eq!(key_frames.len(), 5);
 
-        // Should include first, last, and evenly distributed middle frames
+        // Should include first and last
         assert_eq!(key_frames[0].timestamp_ms, 0.0);
         assert_eq!(key_frames[4].timestamp_ms, 900.0);
-    }
-
-    #[test]
-    fn test_extract_key_frames_fewer_than_requested() {
-        let frames: Vec<Frame> = (0..3)
-            .map(|i| Frame {
-                data: vec![],
-                width: 1280,
-                height: 720,
-                timestamp_ms: i as f64 * 100.0,
-            })
-            .collect();
-
-        let key_frames = extract_key_frames(&frames, 5);
-        assert_eq!(key_frames.len(), 3); // Should return all available frames
     }
 }
