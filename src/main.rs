@@ -49,10 +49,6 @@ impl Default for LegalityAnalysisConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("overtake_detection=info,ort=warn")
-        .init();
-
     info!("🚗 Lane Change Detection System Starting");
 
     let config = types::Config::load("config.yaml")?;
