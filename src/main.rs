@@ -204,7 +204,7 @@ async fn process_video(
             );
         }
 
-        match process_frame(&frame, inference_engine, config, lane_confidence_threshold).await {
+        match process_frame(&frame, inference_engine, config).await {
             Ok(detected_lanes) => {
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
@@ -212,13 +212,33 @@ async fn process_video(
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
+                // ✅ IMPORTANTE: Agregar al pre-buffer ANTES de obtener el nuevo estado
+                // Usa previous_state para determinar si agregar
+                if previous_state == "CENTERED" {
+                    frame_buffer.add_to_pre_buffer(frame.clone());
+                }
+
+                // Analizar y obtener nuevo estado
+                if let Some(mut event) = analyzer.analyze(
+                    &analysis_lanes,
+                    frame.width as u32,
+                    frame.height as u32,
+                    frame_count,
+                    timestamp_ms,
+                ) {
+                    // Lane change detected...
+                    // (resto del código de manejo de evento)
+                }
+
                 let current_state = analyzer.current_state().to_string();
 
                 // Start capturing when CENTERED -> DRIFTING
                 if previous_state == "CENTERED" && current_state == "DRIFTING" {
-                    cached_start_frame = Some(frame.clone());
                     frame_buffer.start_capture(frame_count);
-                    debug!("📸 Started capturing at frame {}", frame_count);
+                    debug!(
+                        "📸 Started capturing at frame {} (with pre-buffer)",
+                        frame_count
+                    );
                 }
 
                 // Continue capturing during lane change
@@ -227,17 +247,12 @@ async fn process_video(
                 }
 
                 // Cancel if returned to CENTERED without completing
-                if current_state == "CENTERED"
-                    && previous_state == "DRIFTING"
-                    && frame_buffer.is_capturing()
-                {
+                if current_state == "CENTERED" && frame_buffer.is_capturing() {
                     frame_buffer.cancel_capture();
-                    cached_start_frame = None;
-                    debug!("❌ Lane change cancelled (returned to centered from drifting)");
+                    debug!("❌ Lane change cancelled");
                 }
 
                 previous_state = current_state;
-
                 // Check if lane change completed
                 if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
