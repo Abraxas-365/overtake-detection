@@ -351,10 +351,12 @@ impl LaneChangeStateMachine {
             self.cooldown_remaining = self.config.cooldown_frames;
 
             let start_frame = self.change_start_frame.unwrap_or(frame_id);
+            let start_time = self.change_start_time.unwrap_or(timestamp_ms); // ← OBTENER START TIME
             let confidence = self.calculate_confidence(duration_ms);
 
+            // ✅ CAMBIO CLAVE: Usar start_time en lugar de timestamp_ms
             let mut event = LaneChangeEvent::new(
-                timestamp_ms,
+                start_time, // ← USAR START TIME (53.33s), NO timestamp_ms (55.28s)
                 start_frame,
                 frame_id,
                 self.change_direction,
@@ -363,10 +365,12 @@ impl LaneChangeStateMachine {
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
 
+            // ✅ MEJORADO: Mostrar tanto inicio como final
             info!(
-                "✅ LANE CHANGE CONFIRMED: {} at {:.2}s (duration: {:.0}ms, max_dev: {:.1}%)",
+                "✅ LANE CHANGE CONFIRMED: {} started at {:.2}s, ended at {:.2}s (duration: {:.0}ms, max_dev: {:.1}%)",
                 event.direction_name(),
-                timestamp_ms / 1000.0,
+                start_time / 1000.0,      // ← Inicio de la maniobra
+                timestamp_ms / 1000.0,     // ← Final de la maniobra
                 duration_ms.unwrap_or(0.0),
                 self.max_offset_in_change * 100.0
             );
