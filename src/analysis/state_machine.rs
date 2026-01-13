@@ -1,5 +1,6 @@
 // src/analysis/state_machine.rs
 
+use crate::analysis::{CrossingType, CurveDetector, LateralVelocityTracker};
 use crate::types::{Direction, LaneChangeConfig, LaneChangeEvent, LaneChangeState, VehicleState};
 use tracing::{debug, info, warn};
 
@@ -17,15 +18,17 @@ pub struct LaneChangeStateMachine {
     max_offset_in_change: f32,
     total_frames_processed: u64,
 
-    // Baseline tracking - MUST be established before detection
+    // Baseline tracking
     offset_history: Vec<f32>,
     baseline_offset: f32,
     baseline_samples: Vec<f32>,
     is_baseline_established: bool,
     frames_since_baseline: u32,
-
-    // Track if we're in a stable centered period
     stable_centered_frames: u32,
+
+    // Enhanced detectors
+    curve_detector: CurveDetector,
+    velocity_tracker: LateralVelocityTracker,
 }
 
 impl LaneChangeStateMachine {
@@ -49,6 +52,8 @@ impl LaneChangeStateMachine {
             is_baseline_established: false,
             frames_since_baseline: 0,
             stable_centered_frames: 0,
+            curve_detector: CurveDetector::new(),
+            velocity_tracker: LateralVelocityTracker::new(),
         }
     }
 
@@ -56,15 +61,20 @@ impl LaneChangeStateMachine {
         self.state.as_str()
     }
 
+    pub fn update_curve_detector(&mut self, lanes: &[crate::types::Lane]) -> bool {
+        self.curve_detector.is_in_curve(lanes)
+    }
+
     pub fn update(
         &mut self,
         vehicle_state: &VehicleState,
         frame_id: u64,
         timestamp_ms: f64,
+        crossing_type: CrossingType,
     ) -> Option<LaneChangeEvent> {
         self.total_frames_processed += 1;
 
-        // Skip initial frames completely
+        // Skip initial frames
         if self.total_frames_processed < self.config.skip_initial_frames {
             return None;
         }
@@ -79,7 +89,7 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Check timeout for ongoing lane change
+        // Check timeout
         if self.state == LaneChangeState::Drifting || self.state == LaneChangeState::Crossing {
             if let Some(start_time) = self.change_start_time {
                 let elapsed = timestamp_ms - start_time;
@@ -100,27 +110,29 @@ impl LaneChangeStateMachine {
         let normalized_offset = vehicle_state.lateral_offset / lane_width;
         let abs_offset = normalized_offset.abs();
 
+        // Update velocity tracker
+        let lateral_velocity = self
+            .velocity_tracker
+            .get_velocity(vehicle_state.lateral_offset, timestamp_ms);
+
         // Update offset history
         self.offset_history.push(normalized_offset);
         if self.offset_history.len() > 60 {
             self.offset_history.remove(0);
         }
 
-        // PHASE 1: Establish baseline (need stable centered driving)
+        // PHASE 1: Establish baseline
         if !self.is_baseline_established {
-            // Only collect samples when offset is relatively small (< 15%)
             if abs_offset < 0.15 {
                 self.baseline_samples.push(normalized_offset);
                 self.stable_centered_frames += 1;
             } else {
-                // Large offset during baseline collection - could be curve, reset
                 if self.stable_centered_frames < 30 {
                     self.baseline_samples.clear();
                     self.stable_centered_frames = 0;
                 }
             }
 
-            // Need 60 stable frames to establish baseline
             if self.baseline_samples.len() >= 60 && self.stable_centered_frames >= 60 {
                 let mut sorted = self.baseline_samples.clone();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -138,10 +150,8 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Count frames since baseline
         self.frames_since_baseline += 1;
 
-        // Need some frames after baseline before detecting
         if self.frames_since_baseline < 30 {
             return None;
         }
@@ -156,7 +166,7 @@ impl LaneChangeStateMachine {
             }
         }
 
-        // Track stable centered for curve rejection
+        // Track stable centered
         if deviation < 0.10 {
             self.stable_centered_frames += 1;
         } else {
@@ -164,14 +174,17 @@ impl LaneChangeStateMachine {
         }
 
         let direction = Direction::from_offset(normalized_offset - self.baseline_offset);
-        let target_state = self.determine_target_state(deviation);
+
+        // Determine target state with enhanced logic
+        let target_state = self.determine_target_state(deviation, crossing_type, lateral_velocity);
 
         debug!(
-            "F{}: offset={:.1}%, base={:.1}%, dev={:.1}%, state={:?}→{:?}",
+            "F{}: offset={:.1}%, dev={:.1}%, vel={:.1}px/s, cross={:?}, state={:?}→{:?}",
             frame_id,
             normalized_offset * 100.0,
-            self.baseline_offset * 100.0,
             deviation * 100.0,
+            lateral_velocity,
+            crossing_type,
             self.state,
             target_state
         );
@@ -190,26 +203,49 @@ impl LaneChangeStateMachine {
         self.max_offset_in_change = 0.0;
     }
 
-    fn determine_target_state(&self, deviation: f32) -> LaneChangeState {
+    fn determine_target_state(
+        &self,
+        deviation: f32,
+        crossing_type: CrossingType,
+        lateral_velocity: f32,
+    ) -> LaneChangeState {
+        // Minimum lateral velocity required (pixels per second)
+        const MIN_LATERAL_VELOCITY: f32 = 30.0;
+
         match self.state {
             LaneChangeState::Centered => {
-                if deviation >= self.config.drift_threshold {
+                // CRITICAL: Only trigger if we detect actual boundary crossing
+                // AND there's sufficient lateral movement
+                if crossing_type != CrossingType::None
+                    && lateral_velocity.abs() > MIN_LATERAL_VELOCITY
+                {
                     if self.is_deviation_sustained(self.config.drift_threshold * 0.9) {
+                        info!(
+                            "🚨 Lane change trigger: boundary crossing {:?} + velocity {:.1}px/s",
+                            crossing_type, lateral_velocity
+                        );
                         return LaneChangeState::Drifting;
                     }
                 }
+
+                // Even with high deviation, don't trigger without boundary crossing
                 LaneChangeState::Centered
             }
             LaneChangeState::Drifting => {
+                // Check if we've crossed the threshold to confirm
                 if deviation >= self.config.crossing_threshold {
                     LaneChangeState::Crossing
                 } else if deviation < self.config.drift_threshold * 0.5 {
-                    // Returned to center - check if this is completion or cancellation
+                    // Returned to center
                     if self.max_offset_in_change >= self.config.crossing_threshold {
-                        // We DID reach crossing threshold at some point, this is completion!
                         LaneChangeState::Completed
                     } else {
-                        // Never reached crossing threshold, cancel
+                        // Cancel if we never reached crossing threshold
+                        warn!(
+                            "❌ Lane change cancelled: max dev {:.1}% < threshold {:.1}%",
+                            self.max_offset_in_change * 100.0,
+                            self.config.crossing_threshold * 100.0
+                        );
                         LaneChangeState::Centered
                     }
                 } else {
@@ -232,7 +268,6 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // Check last 6 frames all have high deviation from baseline
         let high_count = self
             .offset_history
             .iter()
@@ -302,7 +337,7 @@ impl LaneChangeStateMachine {
             );
         }
 
-        // Cancellation (Drifting back to Centered without completing)
+        // Cancellation
         if target_state == LaneChangeState::Centered && from_state == LaneChangeState::Drifting {
             info!("↩️ Lane change cancelled (returned to center)");
             self.reset_lane_change();
@@ -351,12 +386,11 @@ impl LaneChangeStateMachine {
             self.cooldown_remaining = self.config.cooldown_frames;
 
             let start_frame = self.change_start_frame.unwrap_or(frame_id);
-            let start_time = self.change_start_time.unwrap_or(timestamp_ms); // ← OBTENER START TIME
+            let start_time = self.change_start_time.unwrap_or(timestamp_ms);
             let confidence = self.calculate_confidence(duration_ms);
 
-            // ✅ CAMBIO CLAVE: Usar start_time en lugar de timestamp_ms
             let mut event = LaneChangeEvent::new(
-                start_time, // ← USAR START TIME (53.33s), NO timestamp_ms (55.28s)
+                start_time,
                 start_frame,
                 frame_id,
                 self.change_direction,
@@ -365,18 +399,17 @@ impl LaneChangeStateMachine {
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
 
-            // ✅ MEJORADO: Mostrar tanto inicio como final
             info!(
                 "✅ LANE CHANGE CONFIRMED: {} started at {:.2}s, ended at {:.2}s (duration: {:.0}ms, max_dev: {:.1}%)",
                 event.direction_name(),
-                start_time / 1000.0,      // ← Inicio de la maniobra
-                timestamp_ms / 1000.0,     // ← Final de la maniobra
+                start_time / 1000.0,
+                timestamp_ms / 1000.0,
                 duration_ms.unwrap_or(0.0),
                 self.max_offset_in_change * 100.0
             );
 
-            // Update baseline after lane change (we're now in a new lane)
-            self.baseline_offset = 0.0; // Will be re-established
+            // Reset baseline after lane change
+            self.baseline_offset = 0.0;
             self.baseline_samples.clear();
             self.is_baseline_established = false;
             self.stable_centered_frames = 0;
@@ -421,6 +454,8 @@ impl LaneChangeStateMachine {
         self.is_baseline_established = false;
         self.frames_since_baseline = 0;
         self.stable_centered_frames = 0;
+        self.curve_detector.reset();
+        self.velocity_tracker.reset();
     }
 
     pub fn set_source_id(&mut self, source_id: String) {

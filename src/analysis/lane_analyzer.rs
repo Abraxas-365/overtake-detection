@@ -46,7 +46,7 @@ impl LaneChangeAnalyzer {
         self.frame_count += 1;
 
         // Update curve detector with current lanes
-        let _is_in_curve = self.state_machine.curve_detector.is_in_curve(lanes);
+        let _is_in_curve = self.state_machine.update_curve_detector(lanes);
 
         // Get raw position estimate
         let mut raw_state = self
