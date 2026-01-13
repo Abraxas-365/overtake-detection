@@ -1,8 +1,10 @@
-use crate::types::{Direction, Frame, LaneChangeEvent};
+// src/frame_buffer.rs
+
+use crate::types::{Frame, LaneChangeEvent};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tracing::info;
+use tracing::{error, info};
 
 /// Buffer to capture frames during a lane change event
 pub struct LaneChangeFrameBuffer {
@@ -80,6 +82,14 @@ pub struct FrameData {
     pub base64_image: String,
 }
 
+/// Response from the legality API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneChangeLegalityResponse {
+    pub event_id: String,
+    pub status: String,
+    pub message: String,
+}
+
 /// Extract evenly spaced key frames
 pub fn extract_key_frames(frames: &[Frame], count: usize) -> Vec<&Frame> {
     if frames.is_empty() || count == 0 {
@@ -149,6 +159,47 @@ pub fn build_legality_request(
     })
 }
 
+/// Send the request to the legality analysis API
+pub async fn send_to_legality_api(
+    request: &LaneChangeLegalityRequest,
+    api_url: &str,
+) -> Result<LaneChangeLegalityResponse, anyhow::Error> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    info!(
+        "📤 Sending event {} to legality API at {}",
+        request.event_id, api_url
+    );
+
+    let response = client.post(api_url).json(request).send().await;
+
+    match response {
+        Ok(resp) => {
+            let status = resp.status();
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("API error {}: {}", status, body);
+            }
+
+            let result = resp.json::<LaneChangeLegalityResponse>().await?;
+
+            info!(
+                "📨 API response for {}: {} - {}",
+                result.event_id, result.status, result.message
+            );
+
+            Ok(result)
+        }
+        Err(e) => {
+            error!("❌ Failed to connect to API: {}", e);
+            anyhow::bail!("Failed to connect to API: {}", e)
+        }
+    }
+}
+
 /// Print the request payload to console
 pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     println!("\n============================================================");
@@ -166,37 +217,16 @@ pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     }
     println!("Source: {}", request.source_id);
     println!("Number of frames for analysis: {}", request.frames.len());
-    println!("\n--- FRAME DATA ---");
 
     for frame_data in &request.frames {
         println!(
-            "Frame {}: {}x{} @ {:.2}s | base64 length: {} chars",
+            "  Frame {}: {}x{} @ {:.2}s | base64: {} chars",
             frame_data.frame_index,
             frame_data.width,
             frame_data.height,
             frame_data.timestamp_ms / 1000.0,
             frame_data.base64_image.len()
         );
-
-        // Print first 100 chars of base64 for verification
-        let preview: String = frame_data.base64_image.chars().take(100).collect();
-        println!("  Preview: {}...", preview);
-    }
-
-    println!("\n--- FULL JSON PAYLOAD ---");
-    match serde_json::to_string_pretty(&request) {
-        Ok(json) => {
-            if json.len() > 5000 {
-                println!(
-                    "{}...\n[Truncated - total {} bytes]",
-                    &json[..5000],
-                    json.len()
-                );
-            } else {
-                println!("{}", json);
-            }
-        }
-        Err(e) => println!("Error serializing to JSON: {}", e),
     }
     println!("============================================================\n");
 }
