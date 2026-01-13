@@ -426,21 +426,23 @@ pub struct LaneChangeConfig {
     pub min_duration_ms: f64,
     pub max_duration_ms: f64,
     pub skip_initial_frames: u64,
+    pub require_both_lanes: bool,
 }
 
 impl Default for LaneChangeConfig {
     fn default() -> Self {
         Self {
-            drift_threshold: 0.25,
-            crossing_threshold: 0.50,
-            min_frames_confirm: 8,
-            cooldown_frames: 60,
+            drift_threshold: 0.30,
+            crossing_threshold: 0.55,
+            min_frames_confirm: 12,
+            cooldown_frames: 90,
             smoothing_alpha: 0.3,
             reference_y_ratio: 0.8,
             hysteresis_factor: 0.5,
-            min_duration_ms: 800.0,
-            max_duration_ms: 6000.0,
-            skip_initial_frames: 90,
+            min_duration_ms: 1500.0,
+            max_duration_ms: 5000.0,
+            skip_initial_frames: 150,
+            require_both_lanes: true,
         }
     }
 }
@@ -458,6 +460,55 @@ impl LaneChangeConfig {
             min_duration_ms: detection.min_lane_change_duration_ms,
             max_duration_ms: detection.max_lane_change_duration_ms,
             skip_initial_frames: detection.skip_initial_frames,
+            require_both_lanes: detection.require_both_lanes,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionConfig {
+    pub confidence_threshold: f32,
+    pub min_points_per_lane: usize,
+    pub smoother_window_size: usize,
+    pub calibration_frames: usize,
+    pub debounce_frames: u32,
+    pub confirm_frames: u32,
+    pub min_lane_confidence: f32,
+    pub min_position_confidence: f32,
+    #[serde(default = "default_drift_threshold")]
+    pub drift_threshold: f32,
+    #[serde(default = "default_crossing_threshold")]
+    pub crossing_threshold: f32,
+    #[serde(default = "default_cooldown_frames")]
+    pub cooldown_frames: u32,
+    #[serde(default = "default_min_duration")]
+    pub min_lane_change_duration_ms: f64,
+    #[serde(default = "default_max_duration")]
+    pub max_lane_change_duration_ms: f64,
+    #[serde(default = "default_skip_initial")]
+    pub skip_initial_frames: u64,
+    #[serde(default = "default_require_both_lanes")]
+    pub require_both_lanes: bool,
+}
+
+fn default_drift_threshold() -> f32 {
+    0.30
+}
+fn default_crossing_threshold() -> f32 {
+    0.55
+}
+fn default_cooldown_frames() -> u32 {
+    90
+}
+fn default_min_duration() -> f64 {
+    1500.0
+}
+fn default_max_duration() -> f64 {
+    5000.0
+}
+fn default_skip_initial() -> u64 {
+    150
+}
+fn default_require_both_lanes() -> bool {
+    true
 }
