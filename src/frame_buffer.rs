@@ -217,19 +217,14 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
     use image::{codecs::jpeg::JpegEncoder, ImageBuffer, Rgb};
     use std::io::Cursor;
 
-    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_raw(frame.width as u32, frame.height as u32, frame.data.clone())
             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
 
-    // ✅ NUEVO: Aumentar brillo para escenas nocturnas
-    for pixel in img.pixels_mut() {
-        pixel[0] = (pixel[0] as f32 * 1.5).min(255.0) as u8; // R
-        pixel[1] = (pixel[1] as f32 * 1.5).min(255.0) as u8; // G
-        pixel[2] = (pixel[2] as f32 * 1.5).min(255.0) as u8; // B
-    }
-
     let mut buffer = Cursor::new(Vec::new());
-    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 90); // Aumenta calidad
+
+    // Use explicit JPEG encoder with quality setting
+    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, 85);
     encoder.encode(
         img.as_raw(),
         img.width(),
