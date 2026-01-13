@@ -3,24 +3,41 @@
 use crate::types::{Frame, LaneChangeEvent};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 use tracing::{error, info};
 
-/// Buffer to capture frames during a lane change event
+/// Buffer to capture frames during a lane change event with pre-buffering
 pub struct LaneChangeFrameBuffer {
     frames: Vec<Frame>,
     max_frames: usize,
     is_capturing: bool,
     capture_start_frame_id: Option<u64>,
+    /// Pre-buffer: keeps last N frames before lane change starts
+    pre_buffer: VecDeque<Frame>,
+    pre_buffer_size: usize,
 }
 
 impl LaneChangeFrameBuffer {
     pub fn new(max_frames: usize) -> Self {
+        // Pre-buffer holds frames BEFORE lane change starts (e.g., 20 frames)
+        let pre_buffer_size = 20;
+
         Self {
             frames: Vec::with_capacity(max_frames),
             max_frames,
             is_capturing: false,
             capture_start_frame_id: None,
+            pre_buffer: VecDeque::with_capacity(pre_buffer_size),
+            pre_buffer_size,
+        }
+    }
+
+    /// Add frame to pre-buffer (called continuously while in CENTERED state)
+    pub fn add_to_pre_buffer(&mut self, frame: Frame) {
+        self.pre_buffer.push_back(frame);
+        if self.pre_buffer.len() > self.pre_buffer_size {
+            self.pre_buffer.pop_front();
         }
     }
 
@@ -28,7 +45,19 @@ impl LaneChangeFrameBuffer {
         self.frames.clear();
         self.is_capturing = true;
         self.capture_start_frame_id = Some(frame_id);
-        info!("📹 Started capturing frames at frame {}", frame_id);
+
+        // Transfer pre-buffer frames to main buffer
+        let pre_buffer_count = self.pre_buffer.len();
+        for frame in self.pre_buffer.drain(..) {
+            if self.frames.len() < self.max_frames {
+                self.frames.push(frame);
+            }
+        }
+
+        info!(
+            "📹 Started capturing at frame {} (included {} pre-buffered frames)",
+            frame_id, pre_buffer_count
+        );
     }
 
     pub fn add_frame(&mut self, frame: Frame) {
@@ -57,6 +86,10 @@ impl LaneChangeFrameBuffer {
         self.frames.clear();
         self.is_capturing = false;
         self.capture_start_frame_id = None;
+    }
+
+    pub fn pre_buffer_count(&self) -> usize {
+        self.pre_buffer.len()
     }
 }
 
@@ -128,7 +161,7 @@ pub struct LaneChangeLegalityResponse {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Extract key frames with better distribution for lane change analysis
+/// Extract key frames emphasizing CONTEXT and PROGRESSION
 pub fn extract_key_frames_for_lane_change(frames: &[Frame], count: usize) -> Vec<&Frame> {
     if frames.is_empty() || count == 0 {
         return vec![];
@@ -140,43 +173,34 @@ pub fn extract_key_frames_for_lane_change(frames: &[Frame], count: usize) -> Vec
 
     let mut selected_indices = Vec::with_capacity(count);
 
-    // Strategy: More frames from START and MIDDLE of maneuver
-    // This helps AI see the "before" context
+    // Strategy: Include frames from BEFORE, DURING, and AFTER the maneuver
+    // This gives the AI context about what was "normal" before the change
 
     match count {
-        1 => {
-            // Just middle frame
-            selected_indices.push(frames.len() / 2);
-        }
-        2 => {
-            // Start and end
-            selected_indices.push(0);
-            selected_indices.push(frames.len() - 1);
-        }
-        3 => {
-            // Start, middle, end
-            selected_indices.push(0);
-            selected_indices.push(frames.len() / 2);
-            selected_indices.push(frames.len() - 1);
-        }
-        4 => {
-            // Start, early-middle, late-middle, end
-            selected_indices.push(0);
-            selected_indices.push(frames.len() / 3);
-            selected_indices.push((frames.len() * 2) / 3);
-            selected_indices.push(frames.len() - 1);
-        }
         5 => {
-            // Start, early-mid, middle, late-mid, end
-            // Bias toward earlier frames to show context
+            // Frame 0: Start (should be from pre-buffer, BEFORE maneuver)
+            // Frame 1: Early (25%)
+            // Frame 2: Middle (50%)
+            // Frame 3: Late (75%)
+            // Frame 4: End (100%)
             selected_indices.push(0);
             selected_indices.push(frames.len() / 4);
             selected_indices.push(frames.len() / 2);
             selected_indices.push((frames.len() * 3) / 4);
             selected_indices.push(frames.len() - 1);
         }
+        7 => {
+            // More granular: every ~16%
+            selected_indices.push(0); // 0%
+            selected_indices.push(frames.len() / 6); // 16%
+            selected_indices.push(frames.len() / 3); // 33%
+            selected_indices.push(frames.len() / 2); // 50%
+            selected_indices.push((frames.len() * 2) / 3); // 66%
+            selected_indices.push((frames.len() * 5) / 6); // 83%
+            selected_indices.push(frames.len() - 1); // 100%
+        }
         _ => {
-            // For more frames, distribute evenly
+            // Evenly distributed
             let step = (frames.len() - 1) as f32 / (count - 1) as f32;
             for i in 0..count {
                 let index = (i as f32 * step).round() as usize;
@@ -205,7 +229,7 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
         img.as_raw(),
         img.width(),
         img.height(),
-        image::ExtendedColorType::Rgb8, // FIXED: Use ExtendedColorType
+        image::ExtendedColorType::Rgb8,
     )?;
 
     Ok(STANDARD.encode(buffer.into_inner()))
@@ -217,7 +241,6 @@ pub fn build_legality_request(
     captured_frames: &[Frame],
     num_frames_to_send: usize,
 ) -> Result<LaneChangeLegalityRequest, anyhow::Error> {
-    // FIXED: Use the new function name
     let key_frames = extract_key_frames_for_lane_change(captured_frames, num_frames_to_send);
 
     if key_frames.is_empty() {
@@ -243,8 +266,6 @@ pub fn build_legality_request(
     for (i, frame) in key_frames.iter().enumerate() {
         let base64_image = frame_to_base64(frame)?;
 
-        // TODO: Extract per-frame metadata if available in Frame struct
-        // For now, these are None - you can enhance Frame struct to include these
         let lane_confidence = None;
         let offset_percentage = None;
 
@@ -273,44 +294,39 @@ pub fn build_legality_request(
         if time_span > 0.0 {
             ((key_frames.len() - 1) as f64 / (time_span / 1000.0)) as f32
         } else {
-            25.0 // Default fallback
+            25.0
         }
     } else {
-        25.0 // Default fallback
+        25.0
     };
 
-    // Extract max_offset from event metadata if available
     let max_offset_normalized = event
         .metadata
         .get("max_offset_normalized")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .unwrap_or(0.5); // Default if not available
+        .unwrap_or(0.5);
 
-    // Extract both_lanes_ratio from event metadata if available
     let both_lanes_ratio = event
         .metadata
         .get("both_lanes_ratio")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .unwrap_or(0.7); // Assume decent ratio if not tracked
+        .unwrap_or(0.7);
 
-    // Extract average lane confidence from event metadata if available
     let avg_lane_confidence = event
         .metadata
         .get("avg_lane_confidence")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .unwrap_or(0.6); // Default moderate confidence
+        .unwrap_or(0.6);
 
-    // Extract average lane width if available
     let avg_lane_width_px = event
         .metadata
         .get("avg_lane_width_px")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32);
 
-    // Build detection metadata
     let metadata = DetectionMetadata {
         detection_confidence: event.confidence,
         max_offset_normalized,
@@ -318,7 +334,7 @@ pub fn build_legality_request(
         both_lanes_ratio,
         video_resolution,
         fps,
-        region: "PE".to_string(), // Peru
+        region: "PE".to_string(),
         avg_lane_width_px,
     };
 
@@ -348,7 +364,7 @@ pub async fn send_to_legality_api(
     api_url: &str,
 ) -> Result<LaneChangeLegalityResponse, anyhow::Error> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60)) // Increased timeout
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
     info!(
@@ -400,7 +416,6 @@ pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     }
     println!("Source: {}", request.source_id);
 
-    // Print detection metadata
     println!("\n📊 Detection Quality:");
     println!(
         "  • Confidence:       {:.0}%",
@@ -483,11 +498,9 @@ mod tests {
                 timestamp_ms: i as f64 * 100.0,
             })
             .collect();
-
         let key_frames = extract_key_frames_for_lane_change(&frames, 5);
         assert_eq!(key_frames.len(), 5);
 
-        // Should include first and last
         assert_eq!(key_frames[0].timestamp_ms, 0.0);
         assert_eq!(key_frames[4].timestamp_ms, 900.0);
     }
