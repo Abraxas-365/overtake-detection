@@ -20,13 +20,9 @@ use types::{DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 
 /// Configuration for legality analysis
 struct LegalityAnalysisConfig {
-    /// Number of frames to extract and send for analysis
     num_frames_to_analyze: usize,
-    /// Maximum frames to buffer during lane change (e.g., 90 = 3 seconds at 30fps)
     max_buffer_frames: usize,
-    /// Whether to save the request payload to a file
     save_to_file: bool,
-    /// Whether to print the base64 payload to console
     print_to_console: bool,
 }
 
@@ -66,7 +62,6 @@ async fn main() -> Result<()> {
 
     info!("Found {} video file(s) to process", video_files.len());
 
-    // Legality analysis configuration
     let legality_config = LegalityAnalysisConfig::default();
 
     for (idx, video_path) in video_files.iter().enumerate() {
@@ -80,7 +75,7 @@ async fn main() -> Result<()> {
         info!("========================================\n");
 
         match process_video(
-            &video_path,
+            video_path,
             &mut inference_engine,
             &video_processor,
             &config,
@@ -104,9 +99,12 @@ async fn main() -> Result<()> {
 
 struct ProcessingStats {
     total_frames: u64,
+    #[allow(dead_code)]
     frames_with_position: u64,
     lane_changes_detected: usize,
+    #[allow(dead_code)]
     duration_secs: f64,
+    #[allow(dead_code)]
     avg_fps: f64,
 }
 
@@ -154,7 +152,7 @@ async fn process_video(
 
         if frame_count % 30 == 0 {
             info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Buffered frames: {}",
+                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Buffered: {}",
                 reader.progress(),
                 reader.current_frame,
                 reader.total_frames,
@@ -174,26 +172,23 @@ async fn process_video(
 
                 let current_state = analyzer.current_state().to_string();
 
-                // State transition: CENTERED -> DRIFTING (start of potential lane change)
+                // Start capturing when CENTERED -> DRIFTING
                 if previous_state == "CENTERED" && current_state == "DRIFTING" {
                     cached_start_frame = Some(frame.clone());
                     frame_buffer.start_capture(frame_count);
-                    debug!(
-                        "📸 Started capturing lane change frames at frame {}",
-                        frame_count
-                    );
+                    debug!("📸 Started capturing at frame {}", frame_count);
                 }
 
-                // Continue capturing frames during lane change (DRIFTING or CROSSING)
+                // Continue capturing during lane change
                 if frame_buffer.is_capturing() {
                     frame_buffer.add_frame(frame.clone());
                 }
 
-                // State transition back to CENTERED without completing (false alarm)
+                // Cancel if returned to CENTERED without completing
                 if current_state == "CENTERED" && frame_buffer.is_capturing() {
                     frame_buffer.cancel_capture();
                     cached_start_frame = None;
-                    debug!("❌ Lane change cancelled - returned to CENTERED");
+                    debug!("❌ Lane change cancelled");
                 }
 
                 previous_state = current_state;
@@ -213,10 +208,9 @@ async fn process_video(
                         event.end_frame_id
                     );
 
-                    // Stop capturing and get all frames
+                    // Get captured frames and build legality request
                     let captured_frames = frame_buffer.stop_capture();
 
-                    // Build and process legality request
                     if !captured_frames.is_empty() {
                         match build_legality_request(
                             &event,
@@ -224,12 +218,10 @@ async fn process_video(
                             legality_config.num_frames_to_analyze,
                         ) {
                             Ok(request) => {
-                                // Print to console
                                 if legality_config.print_to_console {
                                     print_legality_request(&request);
                                 }
 
-                                // Save to file
                                 if legality_config.save_to_file {
                                     if let Err(e) = save_legality_request_to_file(
                                         &request,
@@ -238,25 +230,6 @@ async fn process_video(
                                         warn!("Failed to save legality request: {}", e);
                                     }
                                 }
-
-                                // TODO: When API is ready, uncomment this:
-                                // match send_to_legality_api(&request, "https://your-api.com/analyze").await {
-                                //     Ok(response) => {
-                                //         event.legality = Some(types::LegalityInfo {
-                                //             is_legal: response.is_legal,
-                                //             lane_line_type: response.lane_line_type,
-                                //             confidence: response.confidence,
-                                //             analysis_details: response.analysis_details,
-                                //         });
-                                //         info!("✓ Legality analysis: {} ({})",
-                                //             if response.is_legal { "LEGAL" } else { "ILLEGAL" },
-                                //             response.lane_line_type
-                                //         );
-                                //     }
-                                //     Err(e) => {
-                                //         warn!("Failed to get legality analysis: {}", e);
-                                //     }
-                                // }
                             }
                             Err(e) => {
                                 warn!("Failed to build legality request: {}", e);
@@ -296,7 +269,7 @@ async fn process_video(
                         end_image_path: end_path_str,
                     });
 
-                    lane_changes.push(event.clone());
+                    lane_changes.push(event);
                     cached_start_frame = None;
                 }
 
@@ -356,20 +329,11 @@ async fn process_video(
     info!("  Total Lane Changes: {}", lane_changes.len());
 
     for (i, event) in lane_changes.iter().enumerate() {
-        let legality_str = match &event.legality {
-            Some(l) => format!(
-                " | {} ({})",
-                if l.is_legal { "LEGAL" } else { "ILLEGAL" },
-                l.lane_line_type
-            ),
-            None => " | Legality: PENDING".to_string(),
-        };
         info!(
-            "  {}. {} at {:.2}s{}",
+            "  {}. {} at {:.2}s",
             i + 1,
             event.direction_name(),
-            event.video_timestamp_ms / 1000.0,
-            legality_str
+            event.video_timestamp_ms / 1000.0
         );
     }
 
@@ -407,7 +371,6 @@ async fn process_frame(
         frame.timestamp_ms,
     )?;
 
-    // Low confidence threshold to catch single lanes
     let threshold = 0.20;
 
     let high_confidence_lanes: Vec<DetectedLane> = lane_detection
@@ -440,3 +403,4 @@ fn save_results(
     info!("💾 Saved to: {}", jsonl_path.display());
     Ok(())
 }
+

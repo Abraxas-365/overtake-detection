@@ -28,8 +28,6 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Image and video processing
-image = "0.24"
 opencv = { version = "0.91", features = ["rgb"] }
 
 # File system
