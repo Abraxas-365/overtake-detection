@@ -45,6 +45,23 @@ pub struct DetectionConfig {
     pub confirm_frames: u32,
     pub min_lane_confidence: f32,
     pub min_position_confidence: f32,
+    // New lane change specific settings
+    #[serde(default = "default_drift_threshold")]
+    pub drift_threshold: f32,
+    #[serde(default = "default_crossing_threshold")]
+    pub crossing_threshold: f32,
+    #[serde(default = "default_cooldown_frames")]
+    pub cooldown_frames: u32,
+}
+
+fn default_drift_threshold() -> f32 {
+    0.15
+}
+fn default_crossing_threshold() -> f32 {
+    0.35
+}
+fn default_cooldown_frames() -> u32 {
+    45
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +237,10 @@ pub struct VehicleState {
     pub heading_offset: f32,
     pub frame_id: u64,
     pub timestamp_ms: f64,
+    /// Raw offset before smoothing (for debugging)
+    pub raw_offset: f32,
+    /// Confidence of the lane detection
+    pub detection_confidence: f32,
 }
 
 impl VehicleState {
@@ -230,6 +251,8 @@ impl VehicleState {
             heading_offset: 0.0,
             frame_id: 0,
             timestamp_ms: 0.0,
+            raw_offset: 0.0,
+            detection_confidence: 0.0,
         }
     }
 
@@ -241,7 +264,7 @@ impl VehicleState {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.lane_width.map_or(false, |w| w > 0.0)
+        self.lane_width.map_or(false, |w| w > 0.0) && self.detection_confidence > 0.3
     }
 }
 
@@ -390,17 +413,39 @@ pub struct LaneChangeConfig {
     pub cooldown_frames: u32,
     pub smoothing_alpha: f32,
     pub reference_y_ratio: f32,
+    /// Hysteresis factor - must drop below threshold * hysteresis to cancel
+    pub hysteresis_factor: f32,
+    /// Minimum confidence to consider a detection valid
+    pub min_detection_confidence: f32,
 }
 
 impl Default for LaneChangeConfig {
     fn default() -> Self {
         Self {
-            drift_threshold: 0.2,
-            crossing_threshold: 0.4,
+            drift_threshold: 0.15,
+            crossing_threshold: 0.35,
             min_frames_confirm: 5,
-            cooldown_frames: 30,
-            smoothing_alpha: 0.3,
+            cooldown_frames: 45,
+            smoothing_alpha: 0.2,
             reference_y_ratio: 0.8,
+            hysteresis_factor: 0.6,
+            min_detection_confidence: 0.4,
+        }
+    }
+}
+
+impl LaneChangeConfig {
+    /// Create from detection config
+    pub fn from_detection_config(detection: &DetectionConfig) -> Self {
+        Self {
+            drift_threshold: detection.drift_threshold,
+            crossing_threshold: detection.crossing_threshold,
+            min_frames_confirm: detection.confirm_frames,
+            cooldown_frames: detection.cooldown_frames,
+            smoothing_alpha: 0.2,
+            reference_y_ratio: 0.8,
+            hysteresis_factor: 0.6,
+            min_detection_confidence: detection.min_lane_confidence,
         }
     }
 }

@@ -58,6 +58,14 @@ async fn main() -> Result<()> {
     let config = types::Config::load("config.yaml")?;
     info!("✓ Configuration loaded");
 
+    // Log key detection parameters
+    info!(
+        "Detection thresholds: drift={:.2}, crossing={:.2}, confirm_frames={}",
+        config.detection.drift_threshold,
+        config.detection.crossing_threshold,
+        config.detection.confirm_frames
+    );
+
     let mut inference_engine = inference::InferenceEngine::new(config.clone())?;
     info!("✓ Inference engine ready");
 
@@ -107,6 +115,11 @@ async fn main() -> Result<()> {
             Ok(stats) => {
                 info!("\n✓ Video processed successfully!");
                 info!("  Total frames: {}", stats.total_frames);
+                info!(
+                    "  Valid position frames: {} ({:.1}%)",
+                    stats.frames_with_position,
+                    100.0 * stats.frames_with_position as f64 / stats.total_frames as f64
+                );
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
                 info!("  Events sent to API: {}", stats.events_sent_to_api);
             }
@@ -121,13 +134,10 @@ async fn main() -> Result<()> {
 
 struct ProcessingStats {
     total_frames: u64,
-    #[allow(dead_code)]
     frames_with_position: u64,
     lane_changes_detected: usize,
     events_sent_to_api: usize,
-    #[allow(dead_code)]
     duration_secs: f64,
-    #[allow(dead_code)]
     avg_fps: f64,
 }
 
@@ -147,14 +157,17 @@ async fn process_video(
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
-    let lane_change_config = LaneChangeConfig {
-        drift_threshold: 0.2,
-        crossing_threshold: 0.4,
-        min_frames_confirm: 3,
-        cooldown_frames: 30,
-        smoothing_alpha: 0.3,
-        reference_y_ratio: 0.8,
-    };
+    // *** USE CONFIG VALUES INSTEAD OF HARDCODED ***
+    let lane_change_config = LaneChangeConfig::from_detection_config(&config.detection);
+
+    info!(
+        "Lane change config: drift={:.2}, crossing={:.2}, confirm={}, cooldown={}, hysteresis={:.2}",
+        lane_change_config.drift_threshold,
+        lane_change_config.crossing_threshold,
+        lane_change_config.min_frames_confirm,
+        lane_change_config.cooldown_frames,
+        lane_change_config.hysteresis_factor
+    );
 
     let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
     analyzer.set_source_id(video_path.to_string_lossy().to_string());
@@ -170,23 +183,28 @@ async fn process_video(
     // Frame buffer for capturing lane change frames
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
 
+    // Confidence threshold from config
+    let lane_confidence_threshold = config.detection.min_lane_confidence;
+
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
-        if frame_count % 30 == 0 {
+        if frame_count % 50 == 0 {
+            let (total, valid, ratio) = analyzer.get_stats();
             info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Buffered: {}",
+                "Progress: {:.1}% ({}/{}) | State: {} | Lane changes: {} | Valid: {:.1}% | Buffered: {}",
                 reader.progress(),
                 reader.current_frame,
                 reader.total_frames,
                 analyzer.current_state(),
                 lane_changes.len(),
+                ratio * 100.0,
                 frame_buffer.frame_count()
             );
         }
 
-        match process_frame(&frame, inference_engine, config).await {
+        match process_frame(&frame, inference_engine, config, lane_confidence_threshold).await {
             Ok(detected_lanes) => {
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
@@ -209,10 +227,13 @@ async fn process_video(
                 }
 
                 // Cancel if returned to CENTERED without completing
-                if current_state == "CENTERED" && frame_buffer.is_capturing() {
+                if current_state == "CENTERED"
+                    && previous_state == "DRIFTING"
+                    && frame_buffer.is_capturing()
+                {
                     frame_buffer.cancel_capture();
                     cached_start_frame = None;
-                    debug!("❌ Lane change cancelled");
+                    debug!("❌ Lane change cancelled (returned to centered from drifting)");
                 }
 
                 previous_state = current_state;
@@ -226,10 +247,11 @@ async fn process_video(
                     timestamp_ms,
                 ) {
                     info!(
-                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
+                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {}) - confidence: {:.2}",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.end_frame_id
+                        event.end_frame_id,
+                        event.confidence
                     );
 
                     // Get captured frames
@@ -320,25 +342,20 @@ async fn process_video(
                     cached_start_frame = None;
                 }
 
-                if frame_count % 30 == 0 {
+                // Debug logging every 50 frames
+                if frame_count % 50 == 0 {
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         if vs.is_valid() {
                             let normalized = vs.normalized_offset().unwrap_or(0.0);
                             let width = vs.lane_width.unwrap_or(0.0);
-                            if normalized.abs() > 0.1 {
-                                info!(
-                                    "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px",
-                                    frame_count,
-                                    analyzer.current_state(),
-                                    vs.lateral_offset,
-                                    normalized * 100.0,
-                                    width
-                                );
-                            }
-                        } else {
-                            warn!(
-                                "Frame {}: Invalid vehicle state (no lane width)",
-                                frame_count
+                            info!(
+                                "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px | Conf: {:.2}",
+                                frame_count,
+                                analyzer.current_state(),
+                                vs.lateral_offset,
+                                normalized * 100.0,
+                                width,
+                                vs.detection_confidence
                             );
                         }
                     }
@@ -365,7 +382,11 @@ async fn process_video(
                     }
                 }
             }
-            Err(e) => error!("Frame {} failed: {}", frame_count, e),
+            Err(e) => {
+                if frame_count % 100 == 0 {
+                    error!("Frame {} failed: {}", frame_count, e);
+                }
+            }
         }
     }
 
@@ -375,13 +396,15 @@ async fn process_video(
     info!("\n📊 Final Report:");
     info!("  Total Lane Changes: {}", lane_changes.len());
     info!("  Events Sent to API: {}", events_sent_to_api);
+    info!("  Processing Speed: {:.1} FPS", avg_fps);
 
     for (i, event) in lane_changes.iter().enumerate() {
         info!(
-            "  {}. {} at {:.2}s",
+            "  {}. {} at {:.2}s (confidence: {:.2})",
             i + 1,
             event.direction_name(),
-            event.video_timestamp_ms / 1000.0
+            event.video_timestamp_ms / 1000.0,
+            event.confidence
         );
     }
 
@@ -401,6 +424,7 @@ async fn process_frame(
     frame: &Frame,
     inference_engine: &mut inference::InferenceEngine,
     config: &types::Config,
+    confidence_threshold: f32,
 ) -> Result<Vec<DetectedLane>> {
     let preprocessed = preprocessing::preprocess(
         &frame.data,
@@ -420,12 +444,14 @@ async fn process_frame(
         frame.timestamp_ms,
     )?;
 
-    let threshold = 0.20;
-
+    // Use config threshold instead of hardcoded
     let high_confidence_lanes: Vec<DetectedLane> = lane_detection
         .lanes
         .into_iter()
-        .filter(|lane| lane.confidence > threshold)
+        .filter(|lane| {
+            lane.confidence > confidence_threshold
+                && lane.points.len() >= config.detection.min_points_per_lane
+        })
         .collect();
 
     Ok(high_confidence_lanes)
