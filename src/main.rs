@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     };
 
     info!("📡 Legality API URL: {}", legality_config.api_url);
+    info!("🎨 Contrast enhancement: ENABLED (CLAHE + Lane Boost)");
 
     for (idx, video_path) in video_files.iter().enumerate() {
         info!("\n========================================");
@@ -137,7 +138,9 @@ struct ProcessingStats {
     frames_with_position: u64,
     lane_changes_detected: usize,
     events_sent_to_api: usize,
+    #[allow(dead_code)]
     duration_secs: f64,
+    #[allow(dead_code)]
     avg_fps: f64,
 }
 
@@ -177,16 +180,10 @@ async fn process_video(
     let mut frames_with_valid_position: u64 = 0;
     let mut events_sent_to_api: usize = 0;
 
-    let mut cached_start_frame: Option<Frame> = None;
     let mut previous_state = "CENTERED".to_string();
 
     // Frame buffer for capturing lane change frames
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
-
-    // Confidence threshold from config
-    let lane_confidence_threshold = config.detection.min_lane_confidence;
-
-    // En la función process_video, reemplaza todo el loop while:
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
@@ -205,7 +202,8 @@ async fn process_video(
         );
         }
 
-        match process_frame(
+        // 🆕 Use enhanced preprocessing for better lane detection
+        match process_frame_enhanced(
             &frame,
             inference_engine,
             config,
@@ -426,6 +424,47 @@ async fn process_video(
     })
 }
 
+/// 🆕 Process frame WITH contrast enhancement for better lane detection
+async fn process_frame_enhanced(
+    frame: &Frame,
+    inference_engine: &mut inference::InferenceEngine,
+    config: &types::Config,
+    confidence_threshold: f32,
+) -> Result<Vec<DetectedLane>> {
+    // Use the enhanced preprocessing with CLAHE and lane marking boost
+    let preprocessed = preprocessing::preprocess_with_enhancement(
+        &frame.data,
+        frame.width,
+        frame.height,
+        config.model.input_width,
+        config.model.input_height,
+    )?;
+
+    let output = inference_engine.infer(&preprocessed)?;
+
+    let lane_detection = lane_detection::parse_lanes(
+        &output,
+        frame.width as f32,
+        frame.height as f32,
+        config,
+        frame.timestamp_ms,
+    )?;
+
+    // Use config threshold instead of hardcoded
+    let high_confidence_lanes: Vec<DetectedLane> = lane_detection
+        .lanes
+        .into_iter()
+        .filter(|lane| {
+            lane.confidence > confidence_threshold
+                && lane.points.len() >= config.detection.min_points_per_lane
+        })
+        .collect();
+
+    Ok(high_confidence_lanes)
+}
+
+/// Original process frame WITHOUT enhancement (kept for reference/comparison)
+#[allow(dead_code)]
 async fn process_frame(
     frame: &Frame,
     inference_engine: &mut inference::InferenceEngine,
