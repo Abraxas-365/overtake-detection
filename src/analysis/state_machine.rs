@@ -1,14 +1,11 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v2.4
+// LANE CHANGE DETECTION v2.4 - FALSE POSITIVE PREVENTION
 //
-// Features:
-// - Kalman filter for position smoothing
-// - EWMA adaptive baseline (STICKY - slow adaptation)
-// - Early baseline freeze when potential lane change detected
-// - 8 detection paths including VELOCITY SPIKE for zigzags
-// - Tracks max offset during pending phase
-// - ✅ NEW: Stricter validation (duration + offset thresholds)
+// NEW VALIDATIONS:
+// - Initial vs Final position comparison
+// - Baseline freeze only on stable position
+// - Net displacement validation
 //
 
 use super::boundary_detector::CrossingType;
@@ -51,13 +48,13 @@ const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 const CURVE_COMPENSATION_FACTOR: f32 = 1.15;
 const MAX_DRIFTING_MS: f64 = 8000.0;
 
-// Velocity spike detection thresholds
+// Velocity spike detection
 const VELOCITY_SPIKE_THRESHOLD: f32 = 180.0;
 const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
-// ✅ NEW: Stricter validation thresholds
-const MIN_OFFSET_FOR_SHORT_DURATION: f32 = 0.50; // 50% offset required if duration < 2s
-const MIN_DURATION_FOR_LOW_OFFSET: f64 = 2000.0; // 2s duration required if offset < 50%
+// 🆕 FALSE POSITIVE PREVENTION
+const MIN_NET_DISPLACEMENT: f32 = 0.25; // 25% minimum net change to be valid
+const MIN_STABLE_FRAMES_BEFORE_FREEZE: u32 = 20; // Frames needed for stable baseline
 
 // ============================================================================
 // KALMAN FILTER
@@ -134,6 +131,13 @@ impl AdaptiveBaseline {
             is_frozen: false,
             frozen_value: 0.0,
         }
+    }
+
+    // 🆕 Check if baseline is stable enough to freeze
+    fn is_stable_enough(&self) -> bool {
+        self.stable_frames >= MIN_STABLE_FRAMES_BEFORE_FREEZE
+            && self.variance < STABILITY_VARIANCE_THRESHOLD
+            && self.is_valid
     }
 
     fn freeze(&mut self) {
@@ -281,6 +285,9 @@ pub struct LaneChangeStateMachine {
     change_detection_path: Option<DetectionPath>,
     max_offset_in_change: f32,
 
+    // 🆕 Track initial position when baseline freezes
+    initial_position_frozen: Option<f32>,
+
     cooldown_remaining: u32,
     total_frames_processed: u64,
     post_lane_change_grace: u32,
@@ -325,6 +332,7 @@ impl LaneChangeStateMachine {
             change_start_time: None,
             change_detection_path: None,
             max_offset_in_change: 0.0,
+            initial_position_frozen: None,
             cooldown_remaining: 0,
             total_frames_processed: 0,
             post_lane_change_grace: 0,
@@ -542,6 +550,7 @@ impl LaneChangeStateMachine {
             lateral_velocity,
             current_direction,
             &window_metrics,
+            normalized_offset,
         );
 
         debug!(
@@ -566,6 +575,7 @@ impl LaneChangeStateMachine {
             frame_id,
             timestamp_ms,
             deviation,
+            normalized_offset,
         )
     }
 
@@ -690,6 +700,7 @@ impl LaneChangeStateMachine {
         lateral_velocity: f32,
         current_direction: Direction,
         metrics: &WindowMetrics,
+        normalized_offset: f32,
     ) -> LaneChangeState {
         let drift_threshold = self.config.drift_threshold * self.curve_compensation_factor;
         let crossing_threshold = self.config.crossing_threshold * self.curve_compensation_factor;
@@ -699,9 +710,12 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
+                // 🆕 VALIDATION: Only freeze baseline if it's stable enough
+                let can_freeze = self.adaptive_baseline.is_stable_enough();
+
                 // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
-                    if self.is_deviation_sustained(drift_threshold * 0.9) {
+                    if self.is_deviation_sustained(drift_threshold * 0.9) && can_freeze {
                         self.change_detection_path = Some(DetectionPath::BoundaryCrossing);
                         info!(
                             "🚨 [BOUNDARY] {:?}, vel={:.1}px/s",
@@ -713,7 +727,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 2: HIGH VELOCITY + DEVIATION
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
-                    if self.is_velocity_sustained(vel_medium) {
+                    if self.is_velocity_sustained(vel_medium) && can_freeze {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
                         info!(
                             "🚨 [HIGH-VEL] vel={:.1}px/s, dev={:.1}%",
@@ -726,7 +740,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 8: VELOCITY SPIKE
                 if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD {
-                    if self.is_velocity_sustained(vel_fast) {
+                    if self.is_velocity_sustained(vel_fast) && can_freeze {
                         let position_change = self.get_recent_position_change();
                         if position_change >= POSITION_CHANGE_THRESHOLD {
                             self.change_detection_path = Some(DetectionPath::VelocitySpike);
@@ -746,6 +760,7 @@ impl LaneChangeStateMachine {
                     if tlc < TLC_WARNING_THRESHOLD
                         && deviation >= drift_threshold
                         && metrics.is_sustained_movement
+                        && can_freeze
                     {
                         self.change_detection_path = Some(DetectionPath::TLCBased);
                         info!("🚨 [TLC] TLC={:.2}s, dev={:.1}%", tlc, deviation * 100.0);
@@ -755,7 +770,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 4: MEDIUM SPEED + HIGH DEVIATION
                 if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
-                    if self.is_deviation_sustained(drift_threshold) {
+                    if self.is_deviation_sustained(drift_threshold) && can_freeze {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
                         info!(
                             "🚨 [MEDIUM] dev={:.1}%, vel={:.1}px/s",
@@ -768,7 +783,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 5: GRADUAL CHANGE
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
-                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) {
+                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) && can_freeze {
                         self.change_detection_path = Some(DetectionPath::GradualChange);
                         info!(
                             "🚨 [GRADUAL] max={:.1}%, span={:.1}s",
@@ -781,7 +796,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 6: LARGE DEVIATION
                 if deviation >= DEVIATION_LANE_CENTER {
-                    if self.is_deviation_sustained(drift_threshold) {
+                    if self.is_deviation_sustained(drift_threshold) && can_freeze {
                         self.change_detection_path = Some(DetectionPath::LargeDeviation);
                         info!("🚨 [LARGE] dev={:.1}%", deviation * 100.0);
                         return LaneChangeState::Drifting;
@@ -793,6 +808,7 @@ impl LaneChangeStateMachine {
                     && metrics.direction_consistency >= DIRECTION_CONSISTENCY_THRESHOLD
                     && metrics.time_span_ms >= 2500.0
                     && !self.is_in_curve
+                    && can_freeze
                 {
                     self.change_detection_path = Some(DetectionPath::CumulativeDisplacement);
                     info!(
@@ -959,6 +975,7 @@ impl LaneChangeStateMachine {
         self.change_start_time = None;
         self.change_detection_path = None;
         self.max_offset_in_change = 0.0;
+        self.initial_position_frozen = None; // 🆕
         self.stable_deviation_frames = 0;
         self.last_deviation = 0.0;
         self.recent_deviations.clear();
@@ -976,6 +993,7 @@ impl LaneChangeStateMachine {
         frame_id: u64,
         timestamp_ms: f64,
         current_deviation: f32,
+        normalized_offset: f32,
     ) -> Option<LaneChangeEvent> {
         if target_state == self.state {
             self.pending_state = None;
@@ -984,16 +1002,28 @@ impl LaneChangeStateMachine {
             return None;
         }
 
+        // 🆕 Freeze baseline and save initial position
         if target_state == LaneChangeState::Drifting && self.state == LaneChangeState::Centered {
             if self.pending_state != Some(LaneChangeState::Drifting) {
-                self.adaptive_baseline.freeze();
-                self.pending_change_direction = direction;
-                self.pending_max_offset = current_deviation;
-                info!(
-                    "🧊 Early freeze: baseline at {:.1}%, initial dev={:.1}%",
-                    self.adaptive_baseline.effective_value() * 100.0,
-                    current_deviation * 100.0
-                );
+                // Only freeze if baseline is stable
+                if self.adaptive_baseline.is_stable_enough() {
+                    self.adaptive_baseline.freeze();
+                    self.initial_position_frozen = Some(normalized_offset);
+                    self.pending_change_direction = direction;
+                    self.pending_max_offset = current_deviation;
+                    info!(
+                        "🧊 Baseline frozen at {:.1}%, initial position saved: {:.1}%",
+                        self.adaptive_baseline.effective_value() * 100.0,
+                        normalized_offset * 100.0
+                    );
+                } else {
+                    debug!(
+                        "⏸️  Baseline not stable enough to freeze (variance={:.4}, stable_frames={})",
+                        self.adaptive_baseline.variance,
+                        self.adaptive_baseline.stable_frames
+                    );
+                    return None; // Don't allow transition if baseline not stable
+                }
             }
         }
 
@@ -1004,12 +1034,14 @@ impl LaneChangeStateMachine {
             self.pending_frames = 1;
         }
 
+        // Unfreeze if we're NOT going to transition after all
         if target_state != LaneChangeState::Drifting
             && self.adaptive_baseline.is_frozen
             && self.state == LaneChangeState::Centered
             && self.pending_frames < self.config.min_frames_confirm
         {
             self.adaptive_baseline.unfreeze();
+            self.initial_position_frozen = None;
             self.pending_max_offset = 0.0;
         }
 
@@ -1017,7 +1049,13 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        self.execute_transition(target_state, direction, frame_id, timestamp_ms)
+        self.execute_transition(
+            target_state,
+            direction,
+            frame_id,
+            timestamp_ms,
+            normalized_offset,
+        )
     }
 
     fn execute_transition(
@@ -1026,6 +1064,7 @@ impl LaneChangeStateMachine {
         direction: Direction,
         frame_id: u64,
         timestamp_ms: f64,
+        final_position: f32,
     ) -> Option<LaneChangeEvent> {
         let from_state = self.state;
 
@@ -1051,6 +1090,7 @@ impl LaneChangeStateMachine {
 
             if !self.adaptive_baseline.is_frozen {
                 self.adaptive_baseline.freeze();
+                self.initial_position_frozen = Some(final_position);
             }
 
             info!(
@@ -1082,17 +1122,17 @@ impl LaneChangeStateMachine {
         self.pending_frames = 0;
 
         if target_state == LaneChangeState::Completed {
-            // ✅ NEW VALIDATION: Reject if BOTH duration AND offset are insufficient
-            if let Some(dur) = duration_ms {
-                if dur < MIN_DURATION_FOR_LOW_OFFSET
-                    && self.max_offset_in_change < MIN_OFFSET_FOR_SHORT_DURATION
-                {
+            // 🆕 VALIDATION 1: Compare initial vs final position
+            if let Some(initial_pos) = self.initial_position_frozen {
+                let net_displacement = (final_position - initial_pos).abs();
+
+                if net_displacement < MIN_NET_DISPLACEMENT {
                     warn!(
-                        "❌ Rejected: insufficient evidence (dur={:.0}ms < {:.0}ms AND max={:.1}% < {:.1}%)",
-                        dur,
-                        MIN_DURATION_FOR_LOW_OFFSET,
-                        self.max_offset_in_change * 100.0,
-                        MIN_OFFSET_FOR_SHORT_DURATION * 100.0
+                        "❌ Rejected: no real lane change (initial={:.1}%, final={:.1}%, net={:.1}% < {:.1}%)",
+                        initial_pos * 100.0,
+                        final_position * 100.0,
+                        net_displacement * 100.0,
+                        MIN_NET_DISPLACEMENT * 100.0
                     );
                     self.adaptive_baseline.unfreeze();
                     self.reset_lane_change();
@@ -1100,14 +1140,23 @@ impl LaneChangeStateMachine {
                     return None;
                 }
 
-                // Existing minimum duration check
+                info!(
+                    "✅ Net displacement validated: {:.1}% (initial={:.1}%, final={:.1}%)",
+                    net_displacement * 100.0,
+                    initial_pos * 100.0,
+                    final_position * 100.0
+                );
+            }
+
+            // Existing validation: duration
+            if let Some(dur) = duration_ms {
                 if dur < self.config.min_duration_ms
                     && self.max_offset_in_change < DEVIATION_SIGNIFICANT
                 {
-                    warn!(
-                        "❌ Rejected: short + low dev (dur={:.0}ms < {:.0}ms)",
-                        dur, self.config.min_duration_ms
-                    );
+                    warn!("❌ Rejected: insufficient evidence (dur={:.0}ms < {:.0}ms AND max={:.1}% < {:.1}%)",
+                          dur, self.config.min_duration_ms,
+                          self.max_offset_in_change * 100.0,
+                          DEVIATION_SIGNIFICANT * 100.0);
                     self.adaptive_baseline.unfreeze();
                     self.reset_lane_change();
                     self.cooldown_remaining = 60;
@@ -1115,6 +1164,7 @@ impl LaneChangeStateMachine {
                 }
             }
 
+            // Existing validation: max offset
             let min_offset_for_valid = self.config.drift_threshold + 0.05;
             if self.max_offset_in_change < min_offset_for_valid {
                 warn!(
