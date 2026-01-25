@@ -1,10 +1,13 @@
 // src/analysis/state_machine.rs
 //
-// STATE-OF-THE-ART LANE CHANGE DETECTION v2.2
+// LANE CHANGE DETECTION v2.3
 //
-// FIX: Freeze baseline when PENDING, not when CONFIRMED
-// FIX: Track max offset during pending phase
-// FIX: Allow completion from DRIFTING state
+// Features:
+// - Kalman filter for position smoothing
+// - EWMA adaptive baseline (STICKY - slow adaptation)
+// - Early baseline freeze when potential lane change detected
+// - 8 detection paths including VELOCITY SPIKE for zigzags
+// - Tracks max offset during pending phase
 //
 
 use super::boundary_detector::CrossingType;
@@ -33,19 +36,23 @@ const HYSTERESIS_EXIT: f32 = 0.6;
 const DIRECTION_CONSISTENCY_THRESHOLD: f32 = 0.65;
 const POST_CHANGE_GRACE_FRAMES: u32 = 90;
 
+// Kalman filter
 const KALMAN_PROCESS_NOISE: f32 = 0.001;
 const KALMAN_MEASUREMENT_NOISE: f32 = 0.01;
 
-const EWMA_ALPHA_STABLE: f32 = 0.02;
-const EWMA_ALPHA_ADAPTING: f32 = 0.08;
+// 🆕 STICKY EWMA baseline - much slower adaptation!
+const EWMA_ALPHA_STABLE: f32 = 0.003; // Was 0.02 → 6x slower
+const EWMA_ALPHA_ADAPTING: f32 = 0.015; // Was 0.08 → 5x slower
 const EWMA_MIN_SAMPLES: u32 = 30;
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 
 const CURVE_COMPENSATION_FACTOR: f32 = 1.15;
-
-// 🆕 Max time in DRIFTING before auto-completing if we have enough deviation
 const MAX_DRIFTING_MS: f64 = 8000.0;
+
+// 🆕 Velocity spike detection thresholds
+const VELOCITY_SPIKE_THRESHOLD: f32 = 180.0; // Very high velocity
+const POSITION_CHANGE_THRESHOLD: f32 = 0.15; // 15% position swing
 
 // ============================================================================
 // KALMAN FILTER
@@ -93,7 +100,7 @@ impl SimpleKalmanFilter {
 }
 
 // ============================================================================
-// ADAPTIVE BASELINE
+// ADAPTIVE BASELINE (STICKY)
 // ============================================================================
 
 #[derive(Clone)]
@@ -247,6 +254,7 @@ enum DetectionPath {
     LargeDeviation,
     TLCBased,
     CumulativeDisplacement,
+    VelocitySpike, // 🆕 NEW: For zigzags with high velocity but low baseline deviation
 }
 
 // ============================================================================
@@ -294,7 +302,6 @@ pub struct LaneChangeStateMachine {
     is_in_curve: bool,
     curve_compensation_factor: f32,
 
-    // 🆕 Track when we first detected potential lane change (for early freeze)
     pending_change_direction: Direction,
     pending_max_offset: f32,
 }
@@ -377,22 +384,22 @@ impl LaneChangeStateMachine {
             self.post_lane_change_grace -= 1;
         }
 
-        // 🆕 IMPROVED TIMEOUT: Only timeout from DRIFTING, and allow completion if we have enough data
+        // Timeout handling
         if self.state == LaneChangeState::Drifting {
             if let Some(start_time) = self.change_start_time {
                 let elapsed = timestamp_ms - start_time;
 
-                // If we've been drifting a long time but have good data, try to complete
                 if elapsed > MAX_DRIFTING_MS {
                     if self.max_offset_in_change >= self.config.crossing_threshold {
-                        info!("⏰ Long DRIFTING ({:.0}ms) with good offset ({:.1}%) - auto-completing", 
-                              elapsed, self.max_offset_in_change * 100.0);
-                        // Force completion
+                        info!(
+                            "⏰ Long DRIFTING ({:.0}ms) with good offset ({:.1}%) - auto-completing",
+                            elapsed,
+                            self.max_offset_in_change * 100.0
+                        );
                         return self.force_complete(frame_id, timestamp_ms);
                     }
                 }
 
-                // Full timeout
                 if elapsed > self.config.max_duration_ms {
                     if self.max_offset_in_change >= self.config.crossing_threshold {
                         info!("⏰ Timeout but good offset - completing");
@@ -411,12 +418,10 @@ impl LaneChangeStateMachine {
             }
         }
 
-        // Timeout for CROSSING state (shouldn't take too long)
         if self.state == LaneChangeState::Crossing {
             if let Some(start_time) = self.change_start_time {
                 let elapsed = timestamp_ms - start_time;
                 if elapsed > self.config.max_duration_ms {
-                    // Complete anyway since we reached CROSSING
                     info!("⏰ Timeout in CROSSING - completing anyway");
                     return self.force_complete(frame_id, timestamp_ms);
                 }
@@ -476,7 +481,7 @@ impl LaneChangeStateMachine {
         let deviation = signed_deviation.abs();
         let current_direction = Direction::from_offset(signed_deviation);
 
-        // 🆕 Track max offset during PENDING phase too!
+        // Track max offset during pending and active phases
         if self.pending_state == Some(LaneChangeState::Drifting)
             || self.state == LaneChangeState::Drifting
             || self.state == LaneChangeState::Crossing
@@ -484,7 +489,6 @@ impl LaneChangeStateMachine {
             if deviation > self.max_offset_in_change {
                 self.max_offset_in_change = deviation;
             }
-            // Also track pending max
             if deviation > self.pending_max_offset {
                 self.pending_max_offset = deviation;
             }
@@ -535,12 +539,33 @@ impl LaneChangeStateMachine {
             &window_metrics,
         );
 
+        // 🆕 Debug logging for zigzag investigation (around 202s = frame ~6060)
+        if frame_id >= 6000 && frame_id <= 6150 {
+            info!(
+                "🔍 F{}: pos={:.1}%, base={:.1}%, dev={:.1}%, vel={:.1}px/s, swing={:.1}%",
+                frame_id,
+                normalized_offset * 100.0,
+                baseline * 100.0,
+                deviation * 100.0,
+                lateral_velocity,
+                self.get_recent_position_change() * 100.0
+            );
+        }
+
         debug!(
-            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, pend_max={:.1}%, state={:?}→{:?}",
-            frame_id, normalized_offset * 100.0, baseline * 100.0,
-            if self.adaptive_baseline.is_frozen { "🧊" } else { "" },
-            deviation * 100.0, self.max_offset_in_change * 100.0, self.pending_max_offset * 100.0,
-            self.state, target_state
+            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, state={:?}→{:?}",
+            frame_id,
+            normalized_offset * 100.0,
+            baseline * 100.0,
+            if self.adaptive_baseline.is_frozen {
+                "🧊"
+            } else {
+                ""
+            },
+            deviation * 100.0,
+            self.max_offset_in_change * 100.0,
+            self.state,
+            target_state
         );
 
         self.check_transition(
@@ -552,7 +577,6 @@ impl LaneChangeStateMachine {
         )
     }
 
-    // 🆕 Force complete a lane change
     fn force_complete(&mut self, frame_id: u64, timestamp_ms: f64) -> Option<LaneChangeEvent> {
         let start_frame = self.change_start_frame.unwrap_or(frame_id);
         let start_time = self.change_start_time.unwrap_or(timestamp_ms);
@@ -588,6 +612,26 @@ impl LaneChangeStateMachine {
         self.reset_lane_change();
 
         Some(event)
+    }
+
+    /// 🆕 Get the total position change over recent frames (ignoring baseline)
+    /// Used for detecting zigzags where baseline has adapted
+    fn get_recent_position_change(&self) -> f32 {
+        if self.offset_history.len() < 10 {
+            return 0.0;
+        }
+
+        let recent = &self.offset_history[self.offset_history.len() - 10..];
+        let first = recent[0];
+        let last = recent[recent.len() - 1];
+
+        // Also check max swing (for zigzags that return to center)
+        let max = recent.iter().fold(f32::MIN, |a, &b| a.max(b));
+        let min = recent.iter().fold(f32::MAX, |a, &b| a.min(b));
+        let swing = max - min;
+
+        // Return the larger of: end-to-end change or total swing
+        (last - first).abs().max(swing)
     }
 
     fn calculate_window_metrics(&self, _current_time_ms: f64, lane_width: f32) -> WindowMetrics {
@@ -679,7 +723,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 2: HIGH VELOCITY
+                // PATH 2: HIGH VELOCITY + DEVIATION
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
                     if self.is_velocity_sustained(vel_medium) {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
@@ -689,6 +733,24 @@ impl LaneChangeStateMachine {
                             deviation * 100.0
                         );
                         return LaneChangeState::Drifting;
+                    }
+                }
+
+                // 🆕 PATH 8: VELOCITY SPIKE (for zigzags where baseline has adapted)
+                // High velocity movement should trigger even if baseline deviation is low
+                if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD {
+                    if self.is_velocity_sustained(vel_fast) {
+                        let position_change = self.get_recent_position_change();
+                        if position_change >= POSITION_CHANGE_THRESHOLD {
+                            self.change_detection_path = Some(DetectionPath::VelocitySpike);
+                            info!(
+                                "🚨 [VELOCITY-SPIKE] vel={:.1}px/s, pos_change={:.1}%, dev={:.1}%",
+                                lateral_velocity,
+                                position_change * 100.0,
+                                deviation * 100.0
+                            );
+                            return LaneChangeState::Drifting;
+                        }
                     }
                 }
 
@@ -704,7 +766,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 4: MEDIUM SPEED
+                // PATH 4: MEDIUM SPEED + HIGH DEVIATION
                 if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
@@ -763,13 +825,12 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Crossing;
                 }
 
-                // 🆕 Also check max_offset (might have already crossed even if current deviation is lower)
+                // Also check max_offset
                 if self.max_offset_in_change >= crossing_threshold {
                     return LaneChangeState::Crossing;
                 }
 
-                // 🆕 Check if we should complete based on sustained high deviation
-                // (vehicle may have settled at new position without hitting crossing threshold)
+                // Check if we should complete based on sustained high deviation
                 if self.frames_in_state > 30 && self.max_offset_in_change >= drift_threshold + 0.08
                 {
                     if self.is_deviation_stable() {
@@ -940,10 +1001,9 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // 🆕 FREEZE BASELINE IMMEDIATELY when we first detect potential lane change!
+        // Freeze baseline immediately when we first detect potential lane change
         if target_state == LaneChangeState::Drifting && self.state == LaneChangeState::Centered {
             if self.pending_state != Some(LaneChangeState::Drifting) {
-                // First frame of potential lane change - freeze NOW!
                 self.adaptive_baseline.freeze();
                 self.pending_change_direction = direction;
                 self.pending_max_offset = current_deviation;
@@ -962,14 +1022,12 @@ impl LaneChangeStateMachine {
             self.pending_frames = 1;
         }
 
-        // 🆕 Unfreeze if we're NOT going to transition after all
-        if self.pending_frames >= self.config.min_frames_confirm {
-            // We're going to transition
-        } else if target_state != LaneChangeState::Drifting
+        // Unfreeze if we're NOT going to transition after all
+        if target_state != LaneChangeState::Drifting
             && self.adaptive_baseline.is_frozen
             && self.state == LaneChangeState::Centered
+            && self.pending_frames < self.config.min_frames_confirm
         {
-            // We detected something but it's not DRIFTING anymore - unfreeze
             self.adaptive_baseline.unfreeze();
             self.pending_max_offset = 0.0;
         }
@@ -1006,12 +1064,10 @@ impl LaneChangeStateMachine {
             };
             self.change_start_frame = Some(frame_id);
             self.change_start_time = Some(timestamp_ms);
-            // 🆕 Use pending_max_offset which was tracked during confirmation frames
             self.max_offset_in_change = self.pending_max_offset;
             self.stable_deviation_frames = 0;
             self.last_deviation = 0.0;
 
-            // Baseline should already be frozen from check_transition
             if !self.adaptive_baseline.is_frozen {
                 self.adaptive_baseline.freeze();
             }
@@ -1057,8 +1113,7 @@ impl LaneChangeStateMachine {
                 }
             }
 
-            // 🆕 Lower threshold for completion validation (was crossing_threshold)
-            let min_offset_for_valid = self.config.drift_threshold + 0.05; // 25% instead of 28%
+            let min_offset_for_valid = self.config.drift_threshold + 0.05;
             if self.max_offset_in_change < min_offset_for_valid {
                 warn!(
                     "❌ Rejected: max={:.1}% < {:.1}%",
@@ -1135,7 +1190,7 @@ impl LaneChangeStateMachine {
         if let Some(path) = &self.change_detection_path {
             match path {
                 DetectionPath::BoundaryCrossing | DetectionPath::TLCBased => confidence += 0.05,
-                DetectionPath::HighVelocity => confidence += 0.03,
+                DetectionPath::HighVelocity | DetectionPath::VelocitySpike => confidence += 0.03,
                 _ => {}
             }
         }
