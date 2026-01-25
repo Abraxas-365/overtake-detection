@@ -31,6 +31,16 @@ pub struct LaneChangeStateMachine {
     // Enhanced detectors
     curve_detector: CurveDetector,
     velocity_tracker: LateralVelocityTracker,
+
+    // ============================================================================
+    // 🆕 NUEVOS CAMPOS PARA DETECCIÓN DE ESTABILIZACIÓN
+    // ============================================================================
+    /// Contador de frames consecutivos donde la desviación se mantiene estable
+    stable_deviation_frames: u32,
+    /// Última desviación registrada para calcular el cambio
+    last_deviation: f32,
+    /// Historial de desviaciones recientes para detección de estabilización
+    recent_deviations: Vec<f32>,
 }
 
 impl LaneChangeStateMachine {
@@ -56,6 +66,10 @@ impl LaneChangeStateMachine {
             stable_centered_frames: 0,
             curve_detector: CurveDetector::new(),
             velocity_tracker: LateralVelocityTracker::new(),
+            // 🆕 Inicializar nuevos campos
+            stable_deviation_frames: 0,
+            last_deviation: 0.0,
+            recent_deviations: Vec::with_capacity(30),
         }
     }
 
@@ -168,6 +182,12 @@ impl LaneChangeStateMachine {
             }
         }
 
+        // 🆕 Actualizar historial de desviaciones para detección de estabilización
+        self.recent_deviations.push(deviation);
+        if self.recent_deviations.len() > 30 {
+            self.recent_deviations.remove(0);
+        }
+
         // Track stable centered
         if deviation < 0.10 {
             self.stable_centered_frames += 1;
@@ -203,10 +223,68 @@ impl LaneChangeStateMachine {
         self.change_start_frame = None;
         self.change_start_time = None;
         self.max_offset_in_change = 0.0;
+        // 🆕 Resetear campos de estabilización
+        self.stable_deviation_frames = 0;
+        self.last_deviation = 0.0;
+        self.recent_deviations.clear();
     }
 
+    // ============================================================================
+    // 🆕 NUEVA FUNCIÓN: Detectar si la desviación se ha estabilizado
+    // ============================================================================
+    /// Determina si la desviación se ha mantenido estable durante suficientes frames
+    ///
+    /// Criterios:
+    /// 1. Suficiente historial (mínimo 15 frames)
+    /// 2. La desviación no cambia más de STABLE_THRESHOLD entre frames consecutivos
+    /// 3. El rango (max - min) en la ventana reciente es pequeño
+    fn is_deviation_stable(&self) -> bool {
+        const MIN_HISTORY_SIZE: usize = 15;
+        const STABLE_THRESHOLD: f32 = 0.03; // 3% de cambio máximo
+        const MAX_RANGE: f32 = 0.08; // 8% de rango máximo
+
+        if self.recent_deviations.len() < MIN_HISTORY_SIZE {
+            return false;
+        }
+
+        // Tomar los últimos N frames
+        let window_size = 15;
+        let recent = &self.recent_deviations[self.recent_deviations.len() - window_size..];
+
+        // Calcular rango (max - min)
+        let max_dev = recent
+            .iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let min_dev = recent
+            .iter()
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        let range = max_dev - min_dev;
+
+        // Verificar que el rango sea pequeño
+        if range > MAX_RANGE {
+            return false;
+        }
+
+        // Verificar que los cambios frame-a-frame sean pequeños
+        let mut large_changes = 0;
+        for window in recent.windows(2) {
+            let change = (window[1] - window[0]).abs();
+            if change > STABLE_THRESHOLD {
+                large_changes += 1;
+            }
+        }
+
+        // Permitir máximo 2 cambios grandes en la ventana
+        large_changes <= 2
+    }
+
+    // ============================================================================
+    // 🔧 FUNCIÓN MODIFICADA: Lógica mejorada para CROSSING → COMPLETED
+    // ============================================================================
     fn determine_target_state(
-        &self,
+        &mut self,
         deviation: f32,
         crossing_type: CrossingType,
         lateral_velocity: f32,
@@ -230,31 +308,27 @@ impl LaneChangeStateMachine {
                 }
 
                 // FALLBACK: Very large deviation even without boundary crossing
-                // This handles cases where lane detection might be slightly off
                 if deviation >= 0.55 {
-                    // 55% is very obvious
                     if self.is_deviation_sustained(self.config.drift_threshold)
                         && lateral_velocity.abs() > 20.0
-                    // Lower threshold for obvious cases
                     {
                         info!(
-                        "🚨 Lane change trigger (fallback): large deviation {:.1}% + velocity {:.1}px/s",
-                        deviation * 100.0, lateral_velocity
-                    );
+                            "🚨 Lane change trigger (fallback): large deviation {:.1}% + velocity {:.1}px/s",
+                            deviation * 100.0, lateral_velocity
+                        );
                         return LaneChangeState::Drifting;
                     }
                 }
 
                 // SECONDARY: Medium-high deviation with sustained movement
-                // More lenient than boundary crossing but still requires movement
-                if deviation >= self.config.drift_threshold + 0.10  // drift + 10%
-                && lateral_velocity.abs() > MIN_LATERAL_VELOCITY
+                if deviation >= self.config.drift_threshold + 0.10
+                    && lateral_velocity.abs() > MIN_LATERAL_VELOCITY
                 {
                     if self.is_deviation_sustained(self.config.drift_threshold) {
                         info!(
-                        "🚨 Lane change trigger (deviation-based): dev={:.1}% + velocity {:.1}px/s",
-                        deviation * 100.0, lateral_velocity
-                    );
+                            "🚨 Lane change trigger (deviation-based): dev={:.1}% + velocity {:.1}px/s",
+                            deviation * 100.0, lateral_velocity
+                        );
                         return LaneChangeState::Drifting;
                     }
                 }
@@ -262,29 +336,81 @@ impl LaneChangeStateMachine {
                 LaneChangeState::Centered
             }
             LaneChangeState::Drifting => {
+                // Transición a CROSSING si supera el umbral
                 if deviation >= self.config.crossing_threshold {
-                    LaneChangeState::Crossing
-                } else if deviation < self.config.drift_threshold * 0.5 {
+                    return LaneChangeState::Crossing;
+                }
+
+                // Regresar a CENTERED si la desviación cae mucho (cancelación)
+                if deviation < self.config.drift_threshold * 0.5 {
                     if self.max_offset_in_change >= self.config.crossing_threshold {
-                        LaneChangeState::Completed
+                        // Ya cruzó, completar
+                        return LaneChangeState::Completed;
                     } else {
+                        // No cruzó lo suficiente, cancelar
                         warn!(
                             "❌ Lane change cancelled: max dev {:.1}% < threshold {:.1}%",
                             self.max_offset_in_change * 100.0,
                             self.config.crossing_threshold * 100.0
                         );
-                        LaneChangeState::Centered
+                        return LaneChangeState::Centered;
                     }
-                } else {
-                    LaneChangeState::Drifting
                 }
+
+                LaneChangeState::Drifting
             }
+            // ============================================================================
+            // 🆕 LÓGICA MEJORADA: CROSSING → COMPLETED con detección de estabilización
+            // ============================================================================
             LaneChangeState::Crossing => {
-                if deviation < self.config.drift_threshold * 0.5 {
-                    LaneChangeState::Completed
+                // Actualizar contador de estabilización
+                let deviation_change = (deviation - self.last_deviation).abs();
+                const FRAME_TO_FRAME_THRESHOLD: f32 = 0.03; // 3%
+
+                if deviation_change < FRAME_TO_FRAME_THRESHOLD {
+                    self.stable_deviation_frames += 1;
                 } else {
-                    LaneChangeState::Crossing
+                    self.stable_deviation_frames = 0;
                 }
+
+                self.last_deviation = deviation;
+
+                // CRITERIO 1: Estabilización detectada + desviación razonable
+                // El vehículo se ha estabilizado en el nuevo carril
+                if self.is_deviation_stable() && deviation < 0.35 {
+                    // Máximo 35% de desviación permitida
+                    info!(
+                        "✅ Lane change completing: stabilized at {:.1}% deviation (stable for {} frames)",
+                        deviation * 100.0,
+                        self.stable_deviation_frames
+                    );
+                    return LaneChangeState::Completed;
+                }
+
+                // CRITERIO 2: Volvió muy cerca del centro (retorno rápido)
+                // Esto cubre casos donde el vehículo vuelve casi al centro original
+                if deviation < self.config.drift_threshold * 0.5 {
+                    info!(
+                        "✅ Lane change completing: returned close to center ({:.1}%)",
+                        deviation * 100.0
+                    );
+                    return LaneChangeState::Completed;
+                }
+
+                // CRITERIO 3: Estabilización prolongada incluso con desviación mayor
+                // Si ha estado estable por MUCHO tiempo (30+ frames), probablemente completó
+                if self.stable_deviation_frames >= 30 && deviation < 0.45 {
+                    // Máximo 45%
+                    info!(
+                        "✅ Lane change completing: prolonged stability ({} frames) at {:.1}%",
+                        self.stable_deviation_frames,
+                        deviation * 100.0
+                    );
+                    return LaneChangeState::Completed;
+                }
+
+                // Seguir en CROSSING
+                LaneChangeState::Crossing
             }
             LaneChangeState::Completed => LaneChangeState::Centered,
         }
@@ -357,6 +483,9 @@ impl LaneChangeStateMachine {
             self.change_start_frame = Some(frame_id);
             self.change_start_time = Some(timestamp_ms);
             self.max_offset_in_change = 0.0;
+            // 🆕 Resetear contadores de estabilización al iniciar
+            self.stable_deviation_frames = 0;
+            self.last_deviation = 0.0;
             info!(
                 "🚗 Lane change started: {} at {:.2}s",
                 direction.as_str(),
@@ -483,6 +612,10 @@ impl LaneChangeStateMachine {
         self.stable_centered_frames = 0;
         self.curve_detector.reset();
         self.velocity_tracker.reset();
+        // 🆕 Resetear campos de estabilización
+        self.stable_deviation_frames = 0;
+        self.last_deviation = 0.0;
+        self.recent_deviations.clear();
     }
 
     pub fn set_source_id(&mut self, source_id: String) {
