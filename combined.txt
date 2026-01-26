@@ -136,6 +136,686 @@ pub static OVERRIDE_VARIABLES_USED: [&str; 0] = [];
 //
 // EVERYTHING ABOVE THIS POINT WAS AUTO-GENERATED DURING COMPILATION. DO NOT MODIFY.
 //
+// SPDX-License-Identifier: Apache-2.0
+
+macro_rules! test {
+    () => (cfg!(test) && ::std::env::var("_CLANG_SYS_TEST").is_ok());
+}
+
+macro_rules! target_os {
+    ($os:expr) => {
+        if cfg!(test) && ::std::env::var("_CLANG_SYS_TEST").is_ok() {
+            let var = ::std::env::var("_CLANG_SYS_TEST_OS");
+            var.map_or(false, |v| v == $os)
+        } else {
+            cfg!(target_os = $os)
+        }
+    };
+}
+
+macro_rules! target_arch {
+    ($arch:expr) => {
+        if cfg!(test) && ::std::env::var("_CLANG_SYS_TEST").is_ok() {
+            let var = ::std::env::var("_CLANG_SYS_TEST_ARCH");
+            var.map_or(false, |v| v == $arch)
+        } else {
+            cfg!(target_arch = $arch)
+        }
+    };
+}
+
+macro_rules! target_pointer_width {
+    ($pointer_width:expr) => {
+        if cfg!(test) && ::std::env::var("_CLANG_SYS_TEST").is_ok() {
+            let var = ::std::env::var("_CLANG_SYS_TEST_POINTER_WIDTH");
+            var.map_or(false, |v| v == $pointer_width)
+        } else {
+            cfg!(target_pointer_width = $pointer_width)
+        }
+    };
+}
+
+macro_rules! target_env {
+    ($env:expr) => {
+        if cfg!(test) && ::std::env::var("_CLANG_SYS_TEST").is_ok() {
+            let var = ::std::env::var("_CLANG_SYS_TEST_ENV");
+            var.map_or(false, |v| v == $env)
+        } else {
+            cfg!(target_env = $env)
+        }
+    };
+}
+// SPDX-License-Identifier: Apache-2.0
+
+use std::env;
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use super::common;
+
+//================================================
+// Validation
+//================================================
+
+/// Extracts the ELF class from the ELF header in a shared library.
+fn parse_elf_header(path: &Path) -> io::Result<u8> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0; 5];
+    file.read_exact(&mut buffer)?;
+    if buffer[..4] == [127, 69, 76, 70] {
+        Ok(buffer[4])
+    } else {
+        Err(Error::new(ErrorKind::InvalidData, "invalid ELF header"))
+    }
+}
+
+/// Extracts the magic number and machine type from the PE header in a shared library.
+fn parse_pe_header(path: &Path) -> io::Result<(u16, u16)> {
+    let mut file = File::open(path)?;
+
+    // Extract the header offset.
+    let mut buffer = [0; 4];
+    let start = SeekFrom::Start(0x3C);
+    file.seek(start)?;
+    file.read_exact(&mut buffer)?;
+    let offset = i32::from_le_bytes(buffer);
+
+    // Check the validity of the header.
+    file.seek(SeekFrom::Start(offset as u64))?;
+    file.read_exact(&mut buffer)?;
+    if buffer != [80, 69, 0, 0] {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid PE header"));
+    }
+
+    // Extract the magic number.
+    let mut buffer = [0; 2];
+    file.seek(SeekFrom::Current(20))?;
+    file.read_exact(&mut buffer)?;
+    let magic_number = u16::from_le_bytes(buffer);
+
+    // Extract the machine type.
+    let mut buffer = [0; 2];
+    file.seek(SeekFrom::Current(-22))?;
+    file.read_exact(&mut buffer)?;
+    let machine_type = u16::from_le_bytes(buffer);
+
+    return Ok((magic_number, machine_type));
+}
+
+/// Checks that a `libclang` shared library matches the target platform.
+fn validate_library(path: &Path) -> Result<(), String> {
+    if target_os!("linux") || target_os!("freebsd") {
+        let class = parse_elf_header(path).map_err(|e| e.to_string())?;
+
+        if target_pointer_width!("32") && class != 1 {
+            return Err("invalid ELF class (64-bit)".into());
+        }
+
+        if target_pointer_width!("64") && class != 2 {
+            return Err("invalid ELF class (32-bit)".into());
+        }
+
+        Ok(())
+    } else if target_os!("windows") {
+        let (magic, machine_type) = parse_pe_header(path).map_err(|e| e.to_string())?;
+
+        if target_pointer_width!("32") && magic != 267 {
+            return Err("invalid DLL (64-bit)".into());
+        }
+
+        if target_pointer_width!("64") && magic != 523 {
+            return Err("invalid DLL (32-bit)".into());
+        }
+
+        let arch_mismatch = match machine_type {
+            0x014C if !target_arch!("x86") => Some("x86"),
+            0x8664 if !target_arch!("x86_64") => Some("x86-64"),
+            0xAA64 if !target_arch!("aarch64") => Some("ARM64"),
+            _ => None,
+        };
+
+        if let Some(arch) = arch_mismatch {
+            Err(format!("invalid DLL ({arch})"))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
+//================================================
+// Searching
+//================================================
+
+/// Extracts the version components in a `libclang` shared library filename.
+fn parse_version(filename: &str) -> Vec<u32> {
+    let version = if let Some(version) = filename.strip_prefix("libclang.so.") {
+        version
+    } else if filename.starts_with("libclang-") {
+        &filename[9..filename.len() - 3]
+    } else {
+        return vec![];
+    };
+
+    version.split('.').map(|s| s.parse().unwrap_or(0)).collect()
+}
+
+/// Finds `libclang` shared libraries and returns the paths to, filenames of,
+/// and versions of those shared libraries.
+fn search_libclang_directories(runtime: bool) -> Result<Vec<(PathBuf, String, Vec<u32>)>, String> {
+    let mut files = vec![format!(
+        "{}clang{}",
+        env::consts::DLL_PREFIX,
+        env::consts::DLL_SUFFIX
+    )];
+
+    if target_os!("linux") {
+        // Some Linux distributions don't create a `libclang.so` symlink, so we
+        // need to look for versioned files (e.g., `libclang-3.9.so`).
+        files.push("libclang-*.so".into());
+
+        // Some Linux distributions don't create a `libclang.so` symlink and
+        // don't have versioned files as described above, so we need to look for
+        // suffix versioned files (e.g., `libclang.so.1`). However, `ld` cannot
+        // link to these files, so this will only be included when linking at
+        // runtime.
+        if runtime {
+            files.push("libclang.so.*".into());
+            files.push("libclang-*.so.*".into());
+        }
+    }
+
+    if target_os!("freebsd") || target_os!("haiku") || target_os!("netbsd") || target_os!("openbsd") {
+        // Some BSD distributions don't create a `libclang.so` symlink either,
+        // but use a different naming scheme for versioned files (e.g.,
+        // `libclang.so.7.0`).
+        files.push("libclang.so.*".into());
+    }
+
+    if target_os!("windows") {
+        // The official LLVM build uses `libclang.dll` on Windows instead of
+        // `clang.dll`. However, unofficial builds such as MinGW use `clang.dll`.
+        files.push("libclang.dll".into());
+    }
+
+    // Find and validate `libclang` shared libraries and collect the versions.
+    let mut valid = vec![];
+    let mut invalid = vec![];
+    for (directory, filename) in common::search_libclang_directories(&files, "LIBCLANG_PATH") {
+        let path = directory.join(&filename);
+        match validate_library(&path) {
+            Ok(()) => {
+                let version = parse_version(&filename);
+                valid.push((directory, filename, version))
+            }
+            Err(message) => invalid.push(format!("({}: {})", path.display(), message)),
+        }
+    }
+
+    if !valid.is_empty() {
+        return Ok(valid);
+    }
+
+    let message = format!(
+        "couldn't find any valid shared libraries matching: [{}], set the \
+         `LIBCLANG_PATH` environment variable to a path where one of these files \
+         can be found (invalid: [{}])",
+        files
+            .iter()
+            .map(|f| format!("'{}'", f))
+            .collect::<Vec<_>>()
+            .join(", "),
+        invalid.join(", "),
+    );
+
+    Err(message)
+}
+
+/// Finds the "best" `libclang` shared library and returns the directory and
+/// filename of that library.
+pub fn find(runtime: bool) -> Result<(PathBuf, String), String> {
+    search_libclang_directories(runtime)?
+        .iter()
+        // We want to find the `libclang` shared library with the highest
+        // version number, hence `max_by_key` below.
+        //
+        // However, in the case where there are multiple such `libclang` shared
+        // libraries, we want to use the order in which they appeared in the
+        // list returned by `search_libclang_directories` as a tiebreaker since
+        // that function returns `libclang` shared libraries in descending order
+        // of preference by how they were found.
+        //
+        // `max_by_key`, perhaps surprisingly, returns the *last* item with the
+        // maximum key rather than the first which results in the opposite of
+        // the tiebreaking behavior we want. This is easily fixed by reversing
+        // the list first.
+        .rev()
+        .max_by_key(|f| &f.2)
+        .cloned()
+        .map(|(path, filename, _)| (path, filename))
+        .ok_or_else(|| "unreachable".into())
+}
+
+//================================================
+// Linking
+//================================================
+
+/// Finds and links to a `libclang` shared library.
+#[cfg(not(feature = "runtime"))]
+pub fn link() {
+    let cep = common::CommandErrorPrinter::default();
+
+    use std::fs;
+
+    let (directory, filename) = find(false).unwrap();
+    println!("cargo:rustc-link-search={}", directory.display());
+
+    if cfg!(all(target_os = "windows", target_env = "msvc")) {
+        // Find the `libclang` stub static library required for the MSVC
+        // toolchain.
+        let lib = if !directory.ends_with("bin") {
+            directory
+        } else {
+            directory.parent().unwrap().join("lib")
+        };
+
+        if lib.join("libclang.lib").exists() {
+            println!("cargo:rustc-link-search={}", lib.display());
+        } else if lib.join("libclang.dll.a").exists() {
+            // MSYS and MinGW use `libclang.dll.a` instead of `libclang.lib`.
+            // It is linkable with the MSVC linker, but Rust doesn't recognize
+            // the `.a` suffix, so we need to copy it with a different name.
+            //
+            // FIXME: Maybe we can just hardlink or symlink it?
+            let out = env::var("OUT_DIR").unwrap();
+            fs::copy(
+                lib.join("libclang.dll.a"),
+                Path::new(&out).join("libclang.lib"),
+            )
+            .unwrap();
+            println!("cargo:rustc-link-search=native={}", out);
+        } else {
+            panic!(
+                "using '{}', so 'libclang.lib' or 'libclang.dll.a' must be \
+                 available in {}",
+                filename,
+                lib.display(),
+            );
+        }
+
+        println!("cargo:rustc-link-lib=dylib=libclang");
+    } else {
+        let name = filename.trim_start_matches("lib");
+
+        // Strip extensions and trailing version numbers (e.g., the `.so.7.0` in
+        // `libclang.so.7.0`).
+        let name = match name.find(".dylib").or_else(|| name.find(".so")) {
+            Some(index) => &name[0..index],
+            None => name,
+        };
+
+        println!("cargo:rustc-link-lib=dylib={}", name);
+    }
+
+    cep.discard();
+}
+// SPDX-License-Identifier: Apache-2.0
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use glob::{MatchOptions, Pattern};
+
+//================================================
+// Commands
+//================================================
+
+thread_local! {
+    /// The errors encountered by the build script while executing commands.
+    static COMMAND_ERRORS: RefCell<HashMap<String, Vec<String>>> = RefCell::default();
+}
+
+/// Adds an error encountered by the build script while executing a command.
+fn add_command_error(name: &str, path: &str, arguments: &[&str], message: String) {
+    COMMAND_ERRORS.with(|e| {
+        e.borrow_mut()
+            .entry(name.into())
+            .or_default()
+            .push(format!(
+                "couldn't execute `{} {}` (path={}) ({})",
+                name,
+                arguments.join(" "),
+                path,
+                message,
+            ))
+    });
+}
+
+/// A struct that prints the errors encountered by the build script while
+/// executing commands when dropped (unless explictly discarded).
+///
+/// This is handy because we only want to print these errors when the build
+/// script fails to link to an instance of `libclang`. For example, if
+/// `llvm-config` couldn't be executed but an instance of `libclang` was found
+/// anyway we don't want to pollute the build output with irrelevant errors.
+#[derive(Default)]
+pub struct CommandErrorPrinter {
+    discard: bool,
+}
+
+impl CommandErrorPrinter {
+    pub fn discard(mut self) {
+        self.discard = true;
+    }
+}
+
+impl Drop for CommandErrorPrinter {
+    fn drop(&mut self) {
+        if self.discard {
+            return;
+        }
+
+        let errors = COMMAND_ERRORS.with(|e| e.borrow().clone());
+
+        if let Some(errors) = errors.get("llvm-config") {
+            println!(
+                "cargo:warning=could not execute `llvm-config` one or more \
+                times, if the LLVM_CONFIG_PATH environment variable is set to \
+                a full path to valid `llvm-config` executable it will be used \
+                to try to find an instance of `libclang` on your system: {}",
+                errors
+                    .iter()
+                    .map(|e| format!("\"{}\"", e))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            )
+        }
+
+        if let Some(errors) = errors.get("xcode-select") {
+            println!(
+                "cargo:warning=could not execute `xcode-select` one or more \
+                times, if a valid instance of this executable is on your PATH \
+                it will be used to try to find an instance of `libclang` on \
+                your system: {}",
+                errors
+                    .iter()
+                    .map(|e| format!("\"{}\"", e))
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+lazy_static::lazy_static! {
+    pub static ref RUN_COMMAND_MOCK: std::sync::Mutex<
+        Option<Box<dyn Fn(&str, &str, &[&str]) -> Option<String> + Send + Sync + 'static>>,
+    > = std::sync::Mutex::new(None);
+}
+
+/// Executes a command and returns the `stdout` output if the command was
+/// successfully executed (errors are added to `COMMAND_ERRORS`).
+fn run_command(name: &str, path: &str, arguments: &[&str]) -> Option<String> {
+    #[cfg(test)]
+    if let Some(command) = &*RUN_COMMAND_MOCK.lock().unwrap() {
+        return command(name, path, arguments);
+    }
+
+    let output = match Command::new(path).args(arguments).output() {
+        Ok(output) => output,
+        Err(error) => {
+            let message = format!("error: {}", error);
+            add_command_error(name, path, arguments, message);
+            return None;
+        }
+    };
+
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let message = format!("exit code: {}", output.status);
+        add_command_error(name, path, arguments, message);
+        None
+    }
+}
+
+/// Executes the `llvm-config` command and returns the `stdout` output if the
+/// command was successfully executed (errors are added to `COMMAND_ERRORS`).
+pub fn run_llvm_config(arguments: &[&str]) -> Option<String> {
+    let path = env::var("LLVM_CONFIG_PATH").unwrap_or_else(|_| "llvm-config".into());
+    run_command("llvm-config", &path, arguments)
+}
+
+/// Executes the `xcode-select` command and returns the `stdout` output if the
+/// command was successfully executed (errors are added to `COMMAND_ERRORS`).
+pub fn run_xcode_select(arguments: &[&str]) -> Option<String> {
+    run_command("xcode-select", "xcode-select", arguments)
+}
+
+//================================================
+// Search Directories
+//================================================
+// These search directories are listed in order of
+// preference, so if multiple `libclang` instances
+// are found when searching matching directories,
+// the `libclang` instances from earlier
+// directories will be preferred (though version
+// takes precedence over location).
+//================================================
+
+/// `libclang` directory patterns for Haiku.
+const DIRECTORIES_HAIKU: &[&str] = &[
+    "/boot/home/config/non-packaged/develop/lib",
+    "/boot/home/config/non-packaged/lib",
+    "/boot/system/non-packaged/develop/lib",
+    "/boot/system/non-packaged/lib",
+    "/boot/system/develop/lib",
+    "/boot/system/lib",
+];
+
+/// `libclang` directory patterns for Linux (and FreeBSD).
+const DIRECTORIES_LINUX: &[&str] = &[
+    "/usr/local/llvm*/lib*",
+    "/usr/local/lib*/*/*",
+    "/usr/local/lib*/*",
+    "/usr/local/lib*",
+    "/usr/lib*/*/*",
+    "/usr/lib*/*",
+    "/usr/lib*",
+];
+
+/// `libclang` directory patterns for macOS.
+const DIRECTORIES_MACOS: &[&str] = &[
+    "/usr/local/opt/llvm*/lib/llvm*/lib",
+    "/Library/Developer/CommandLineTools/usr/lib",
+    "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib",
+    "/usr/local/opt/llvm*/lib",
+];
+
+/// `libclang` directory patterns for Windows.
+///
+/// The boolean indicates whether the directory pattern should be used when
+/// compiling for an MSVC target environment.
+const DIRECTORIES_WINDOWS: &[(&str, bool)] = &[
+    // LLVM + Clang can be installed using Scoop (https://scoop.sh).
+    // Other Windows package managers install LLVM + Clang to other listed
+    // system-wide directories.
+    ("C:\\Users\\*\\scoop\\apps\\llvm\\current\\lib", true),
+    ("C:\\MSYS*\\MinGW*\\lib", false),
+    ("C:\\Program Files*\\LLVM\\lib", true),
+    ("C:\\LLVM\\lib", true),
+    // LLVM + Clang can be installed as a component of Visual Studio.
+    // https://github.com/KyleMayes/clang-sys/issues/121
+    ("C:\\Program Files*\\Microsoft Visual Studio\\*\\VC\\Tools\\Llvm\\**\\lib", true),
+];
+
+/// `libclang` directory patterns for illumos
+const DIRECTORIES_ILLUMOS: &[&str] = &[
+    "/opt/ooce/llvm-*/lib",
+    "/opt/ooce/clang-*/lib",
+];
+
+//================================================
+// Searching
+//================================================
+
+/// Finds the files in a directory that match one or more filename glob patterns
+/// and returns the paths to and filenames of those files.
+fn search_directory(directory: &Path, filenames: &[String]) -> Vec<(PathBuf, String)> {
+    // Escape the specified directory in case it contains characters that have
+    // special meaning in glob patterns (e.g., `[` or `]`).
+    let directory = Pattern::escape(directory.to_str().unwrap());
+    let directory = Path::new(&directory);
+
+    // Join the escaped directory to the filename glob patterns to obtain
+    // complete glob patterns for the files being searched for.
+    let paths = filenames
+        .iter()
+        .map(|f| directory.join(f).to_str().unwrap().to_owned());
+
+    // Prevent wildcards from matching path separators to ensure that the search
+    // is limited to the specified directory.
+    let mut options = MatchOptions::new();
+    options.require_literal_separator = true;
+
+    paths
+        .map(|p| glob::glob_with(&p, options))
+        .filter_map(Result::ok)
+        .flatten()
+        .filter_map(|p| {
+            let path = p.ok()?;
+            let filename = path.file_name()?.to_str().unwrap();
+
+            // The `libclang_shared` library has been renamed to `libclang-cpp`
+            // in Clang 10. This can cause instances of this library (e.g.,
+            // `libclang-cpp.so.10`) to be matched by patterns looking for
+            // instances of `libclang`.
+            if filename.contains("-cpp.") {
+                return None;
+            }
+
+            Some((path.parent().unwrap().to_owned(), filename.into()))
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Finds the files in a directory (and any relevant sibling directories) that
+/// match one or more filename glob patterns and returns the paths to and
+/// filenames of those files.
+fn search_directories(directory: &Path, filenames: &[String]) -> Vec<(PathBuf, String)> {
+    let mut results = search_directory(directory, filenames);
+
+    // On Windows, `libclang.dll` is usually found in the LLVM `bin` directory
+    // while `libclang.lib` is usually found in the LLVM `lib` directory. To
+    // keep things consistent with other platforms, only LLVM `lib` directories
+    // are included in the backup search directory globs so we need to search
+    // the LLVM `bin` directory here.
+    if target_os!("windows") && directory.ends_with("lib") {
+        let sibling = directory.parent().unwrap().join("bin");
+        results.extend(search_directory(&sibling, filenames));
+    }
+
+    results
+}
+
+/// Finds the `libclang` static or dynamic libraries matching one or more
+/// filename glob patterns and returns the paths to and filenames of those files.
+pub fn search_libclang_directories(filenames: &[String], variable: &str) -> Vec<(PathBuf, String)> {
+    // Search only the path indicated by the relevant environment variable
+    // (e.g., `LIBCLANG_PATH`) if it is set.
+    if let Ok(path) = env::var(variable).map(|d| Path::new(&d).to_path_buf()) {
+        // Check if the path is a matching file.
+        if let Some(parent) = path.parent() {
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            let libraries = search_directories(parent, filenames);
+            if libraries.iter().any(|(_, f)| f == filename) {
+                return vec![(parent.into(), filename.into())];
+            }
+        }
+
+        // Check if the path is directory containing a matching file.
+        return search_directories(&path, filenames);
+    }
+
+    let mut found = vec![];
+
+    // Search the `bin` and `lib` directories in the directory returned by
+    // `llvm-config --prefix`.
+    if let Some(output) = run_llvm_config(&["--prefix"]) {
+        let directory = Path::new(output.lines().next().unwrap()).to_path_buf();
+        found.extend(search_directories(&directory.join("bin"), filenames));
+        found.extend(search_directories(&directory.join("lib"), filenames));
+        found.extend(search_directories(&directory.join("lib64"), filenames));
+    }
+
+    // Search the toolchain directory in the directory returned by
+    // `xcode-select --print-path`.
+    if target_os!("macos") {
+        if let Some(output) = run_xcode_select(&["--print-path"]) {
+            let directory = Path::new(output.lines().next().unwrap()).to_path_buf();
+            let directory = directory.join("Toolchains/XcodeDefault.xctoolchain/usr/lib");
+            found.extend(search_directories(&directory, filenames));
+        }
+    }
+
+    // Search the directories in the `LD_LIBRARY_PATH` environment variable.
+    if let Ok(path) = env::var("LD_LIBRARY_PATH") {
+        for directory in env::split_paths(&path) {
+            found.extend(search_directories(&directory, filenames));
+        }
+    }
+
+    // Determine the `libclang` directory patterns.
+    let directories: Vec<&str> = if target_os!("haiku") {
+        DIRECTORIES_HAIKU.into()
+    } else if target_os!("linux") || target_os!("freebsd") {
+        DIRECTORIES_LINUX.into()
+    } else if target_os!("macos") {
+        DIRECTORIES_MACOS.into()
+    } else if target_os!("windows") {
+        let msvc = target_env!("msvc");
+        DIRECTORIES_WINDOWS
+            .iter()
+            .filter(|d| d.1 || !msvc)
+            .map(|d| d.0)
+            .collect()
+    } else if target_os!("illumos") {
+        DIRECTORIES_ILLUMOS.into()
+    } else {
+        vec![]
+    };
+
+    // We use temporary directories when testing the build script so we'll
+    // remove the prefixes that make the directories absolute.
+    let directories = if test!() {
+        directories
+            .iter()
+            .map(|d| d.strip_prefix('/').or_else(|| d.strip_prefix("C:\\")).unwrap_or(d))
+            .collect::<Vec<_>>()
+    } else {
+        directories
+    };
+
+    // Search the directories provided by the `libclang` directory patterns.
+    let mut options = MatchOptions::new();
+    options.case_sensitive = false;
+    options.require_literal_separator = true;
+    for directory in directories.iter() {
+        if let Ok(directories) = glob::glob_with(directory, options) {
+            for directory in directories.filter_map(Result::ok).filter(|p| p.is_dir()) {
+                found.extend(search_directories(&directory, filenames));
+            }
+        }
+    }
+
+    found
+}
 #[doc(hidden)]
 pub mod __private17 {
     #[doc(hidden)]
@@ -1535,14 +2215,7 @@ pub fn draw_lanes_with_state(
 }
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v2.3
-//
-// Features:
-// - Kalman filter for position smoothing
-// - EWMA adaptive baseline (STICKY - slow adaptation)
-// - Early baseline freeze when potential lane change detected
-// - 8 detection paths including VELOCITY SPIKE for zigzags
-// - Tracks max offset during pending phase
+// LANE CHANGE DETECTION v3.4 - BALANCED VALIDATION
 //
 
 use super::boundary_detector::CrossingType;
@@ -1553,41 +2226,83 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 // ============================================================================
-// CONSTANTS
+// VELOCITY THRESHOLDS
 // ============================================================================
-
 const MIN_VELOCITY_FAST: f32 = 120.0;
 const MIN_VELOCITY_MEDIUM: f32 = 60.0;
 const MIN_VELOCITY_SLOW: f32 = 20.0;
-const TLC_WARNING_THRESHOLD: f64 = 1.5;
+const VELOCITY_SPIKE_THRESHOLD: f32 = 200.0;
+
+// ============================================================================
+// ANALYSIS WINDOWS
+// ============================================================================
 const ANALYSIS_WINDOW_MS: f64 = 4000.0;
+const TRAJECTORY_WINDOW_SIZE: usize = 90;
 
-const DEVIATION_DRIFT_START: f32 = 0.20;
+// ============================================================================
+// DEVIATION THRESHOLDS
+// ============================================================================
+const DEVIATION_DRIFT_START: f32 = 0.22;
 const DEVIATION_CROSSING: f32 = 0.30;
-const DEVIATION_LANE_CENTER: f32 = 0.50;
-const DEVIATION_SIGNIFICANT: f32 = 0.40;
+const DEVIATION_LANE_CENTER: f32 = 0.55;
+const DEVIATION_SIGNIFICANT: f32 = 0.45;
 
-const HYSTERESIS_EXIT: f32 = 0.6;
+// ============================================================================
+// STATE MACHINE BEHAVIOR
+// ============================================================================
+const HYSTERESIS_EXIT: f32 = 0.5;
 const DIRECTION_CONSISTENCY_THRESHOLD: f32 = 0.65;
 const POST_CHANGE_GRACE_FRAMES: u32 = 90;
+const MAX_DRIFTING_MS: f64 = 10000.0;
 
-// Kalman filter
+// ============================================================================
+// KALMAN FILTER
+// ============================================================================
 const KALMAN_PROCESS_NOISE: f32 = 0.001;
 const KALMAN_MEASUREMENT_NOISE: f32 = 0.01;
 
-// 🆕 STICKY EWMA baseline - much slower adaptation!
-const EWMA_ALPHA_STABLE: f32 = 0.003; // Was 0.02 → 6x slower
-const EWMA_ALPHA_ADAPTING: f32 = 0.015; // Was 0.08 → 5x slower
+// ============================================================================
+// ADAPTIVE BASELINE
+// ============================================================================
+const EWMA_ALPHA_STABLE: f32 = 0.003;
+const EWMA_ALPHA_ADAPTING: f32 = 0.015;
 const EWMA_MIN_SAMPLES: u32 = 30;
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
+const BASELINE_MAX_DRIFT: f32 = 0.25;
+const BASELINE_SANITY_CHECK: f32 = 0.35; // Increased to allow more baseline variation
 
-const CURVE_COMPENSATION_FACTOR: f32 = 1.15;
-const MAX_DRIFTING_MS: f64 = 8000.0;
+// ============================================================================
+// CURVE DETECTION
+// ============================================================================
+const CURVE_COMPENSATION_FACTOR: f32 = 1.0;
+const CURVE_CURVATURE_THRESHOLD: f32 = 0.015;
 
-// 🆕 Velocity spike detection thresholds
-const VELOCITY_SPIKE_THRESHOLD: f32 = 180.0; // Very high velocity
-const POSITION_CHANGE_THRESHOLD: f32 = 0.15; // 15% position swing
+// ============================================================================
+// VALIDATION THRESHOLDS - BALANCED
+// ============================================================================
+const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55; // 55% = very confident, minimal checks
+const HIGH_OFFSET_THRESHOLD: f32 = 0.45; // 45% = confident, need some duration
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35; // 35% = need duration + trajectory
+const LOW_OFFSET_THRESHOLD: f32 = 0.25; // 25% = strict validation
+
+// Duration thresholds - RELAXED
+const MIN_DURATION_VERY_HIGH: f64 = 800.0; // 0.8s for very high offset
+const MIN_DURATION_HIGH: f64 = 1000.0; // 1.2s for high offset
+const MIN_DURATION_MEDIUM: f64 = 1500.0; // 2.0s for medium offset
+const MIN_DURATION_LOW: f64 = 2500.0; // 3.0s for low offset
+
+const MIN_NET_DISPLACEMENT: f32 = 0.15;
+
+// ============================================================================
+// TRAJECTORY ANALYSIS - MORE PERMISSIVE
+// ============================================================================
+const RETURN_TO_CENTER_THRESHOLD: f32 = 0.35;
+const MIN_EXCURSION_FOR_OVERTAKE: f32 = 0.30;
+const TRAJECTORY_SMOOTHNESS_THRESHOLD: f32 = 0.25;
+const MIN_TRAJECTORY_POINTS: usize = 8;
+
+const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
 // ============================================================================
 // KALMAN FILTER
@@ -1635,12 +2350,13 @@ impl SimpleKalmanFilter {
 }
 
 // ============================================================================
-// ADAPTIVE BASELINE (STICKY)
+// ADAPTIVE BASELINE
 // ============================================================================
 
 #[derive(Clone)]
 struct AdaptiveBaseline {
     value: f32,
+    initial_value: f32,
     variance: f32,
     sample_count: u32,
     is_valid: bool,
@@ -1649,12 +2365,14 @@ struct AdaptiveBaseline {
     stable_frames: u32,
     is_frozen: bool,
     frozen_value: f32,
+    has_initial: bool,
 }
 
 impl AdaptiveBaseline {
     fn new() -> Self {
         Self {
             value: 0.0,
+            initial_value: 0.0,
             variance: 1.0,
             sample_count: 0,
             is_valid: false,
@@ -1663,6 +2381,7 @@ impl AdaptiveBaseline {
             stable_frames: 0,
             is_frozen: false,
             frozen_value: 0.0,
+            has_initial: false,
         }
     }
 
@@ -1687,6 +2406,10 @@ impl AdaptiveBaseline {
         } else {
             self.value
         }
+    }
+
+    fn is_sane(&self) -> bool {
+        self.value.abs() < BASELINE_SANITY_CHECK
     }
 
     fn update(&mut self, measurement: f32) -> f32 {
@@ -1731,7 +2454,25 @@ impl AdaptiveBaseline {
         if self.sample_count == 1 {
             self.value = measurement;
         } else {
-            self.value = alpha * measurement + (1.0 - alpha) * self.value;
+            let new_value = alpha * measurement + (1.0 - alpha) * self.value;
+
+            if self.has_initial {
+                let drift = (new_value - self.initial_value).abs();
+                if drift <= BASELINE_MAX_DRIFT {
+                    self.value = new_value;
+                }
+            } else {
+                self.value = new_value;
+            }
+        }
+
+        if !self.has_initial
+            && self.sample_count >= EWMA_MIN_SAMPLES
+            && self.variance < INSTABILITY_VARIANCE_THRESHOLD
+        {
+            self.initial_value = self.value;
+            self.has_initial = true;
+            self.is_valid = true;
         }
 
         if self.sample_count >= EWMA_MIN_SAMPLES && self.variance < INSTABILITY_VARIANCE_THRESHOLD {
@@ -1743,6 +2484,7 @@ impl AdaptiveBaseline {
 
     fn reset(&mut self) {
         self.value = 0.0;
+        self.initial_value = 0.0;
         self.variance = 1.0;
         self.sample_count = 0;
         self.is_valid = false;
@@ -1751,6 +2493,200 @@ impl AdaptiveBaseline {
         self.stable_frames = 0;
         self.is_frozen = false;
         self.frozen_value = 0.0;
+        self.has_initial = false;
+    }
+}
+
+// ============================================================================
+// TRAJECTORY ANALYZER - MORE PERMISSIVE
+// ============================================================================
+
+#[derive(Clone)]
+struct TrajectoryAnalyzer {
+    positions: VecDeque<f32>,
+    timestamps: VecDeque<f64>,
+    velocities: VecDeque<f32>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct OvertakeAnalysis {
+    excursion_sufficient: bool,
+    returned_to_start: bool,
+    is_smooth: bool,
+    has_reversal: bool,
+    shape_score: f32,
+    smoothness: f32,
+    is_valid_overtake: bool,
+}
+
+impl TrajectoryAnalyzer {
+    fn new() -> Self {
+        Self {
+            positions: VecDeque::with_capacity(TRAJECTORY_WINDOW_SIZE),
+            timestamps: VecDeque::with_capacity(TRAJECTORY_WINDOW_SIZE),
+            velocities: VecDeque::with_capacity(TRAJECTORY_WINDOW_SIZE),
+        }
+    }
+
+    fn add_sample(&mut self, position: f32, timestamp: f64, velocity: f32) {
+        self.positions.push_back(position);
+        self.timestamps.push_back(timestamp);
+        self.velocities.push_back(velocity);
+
+        if self.positions.len() > TRAJECTORY_WINDOW_SIZE {
+            self.positions.pop_front();
+            self.timestamps.pop_front();
+            self.velocities.pop_front();
+        }
+    }
+
+    fn analyze_overtake_pattern(
+        &self,
+        start_pos: f32,
+        current_pos: f32,
+        max_excursion: f32,
+    ) -> OvertakeAnalysis {
+        let mut analysis = OvertakeAnalysis::default();
+
+        // Be permissive if not enough data - assume valid
+        if self.positions.len() < MIN_TRAJECTORY_POINTS {
+            analysis.excursion_sufficient = max_excursion >= MIN_EXCURSION_FOR_OVERTAKE;
+            analysis.shape_score = 0.6;
+            analysis.is_valid_overtake = analysis.excursion_sufficient;
+            return analysis;
+        }
+
+        analysis.excursion_sufficient = max_excursion >= MIN_EXCURSION_FOR_OVERTAKE;
+
+        let return_distance = (current_pos - start_pos).abs();
+        analysis.returned_to_start = return_distance < RETURN_TO_CENTER_THRESHOLD;
+
+        analysis.smoothness = self.calculate_smoothness();
+        analysis.is_smooth = analysis.smoothness < TRAJECTORY_SMOOTHNESS_THRESHOLD;
+
+        analysis.has_reversal = self.detect_direction_reversal();
+        analysis.shape_score = self.calculate_shape_score(start_pos, max_excursion);
+
+        // More permissive: valid if excursion OR good shape OR has reversal
+        analysis.is_valid_overtake = analysis.excursion_sufficient
+            || analysis.shape_score >= 0.5
+            || (analysis.has_reversal && max_excursion >= 0.25);
+
+        analysis
+    }
+
+    fn calculate_smoothness(&self) -> f32 {
+        if self.positions.len() < 3 {
+            return 0.0; // Assume smooth if no data
+        }
+
+        let positions: Vec<f32> = self.positions.iter().copied().collect();
+        let mut jitter_sum = 0.0;
+        let mut count = 0;
+
+        for i in 2..positions.len() {
+            let accel = positions[i] - 2.0 * positions[i - 1] + positions[i - 2];
+            jitter_sum += accel.abs();
+            count += 1;
+        }
+
+        if count > 0 {
+            jitter_sum / count as f32
+        } else {
+            0.0
+        }
+    }
+
+    fn detect_direction_reversal(&self) -> bool {
+        if self.velocities.len() < 8 {
+            return true; // Assume reversal if not enough data
+        }
+
+        let velocities: Vec<f32> = self.velocities.iter().copied().collect();
+        let mut sign_changes = 0;
+        let mut last_sign: Option<bool> = None;
+
+        for v in &velocities {
+            if v.abs() > 15.0 {
+                let current_sign = *v > 0.0;
+                if let Some(last) = last_sign {
+                    if current_sign != last {
+                        sign_changes += 1;
+                    }
+                }
+                last_sign = Some(current_sign);
+            }
+        }
+
+        sign_changes >= 1
+    }
+
+    fn calculate_shape_score(&self, start_pos: f32, max_excursion: f32) -> f32 {
+        if self.positions.len() < MIN_TRAJECTORY_POINTS {
+            return 0.6; // Default acceptable score
+        }
+
+        let positions: Vec<f32> = self.positions.iter().copied().collect();
+        let n = positions.len();
+
+        // Find peak
+        let mut peak_idx = 0;
+        let mut peak_deviation = 0.0;
+        for (i, &pos) in positions.iter().enumerate() {
+            let deviation = (pos - start_pos).abs();
+            if deviation > peak_deviation {
+                peak_deviation = deviation;
+                peak_idx = i;
+            }
+        }
+
+        // Score based on peak position
+        let peak_position_score = {
+            let relative_pos = peak_idx as f32 / n as f32;
+            if relative_pos >= 0.2 && relative_pos <= 0.8 {
+                1.0
+            } else if relative_pos >= 0.1 && relative_pos <= 0.9 {
+                0.7
+            } else {
+                0.4
+            }
+        };
+
+        // Score based on return
+        let return_score = {
+            let end_pos = positions[n - 1];
+            let return_distance = (end_pos - start_pos).abs();
+            if return_distance < 0.20 {
+                1.0
+            } else if return_distance < 0.35 {
+                0.7
+            } else if return_distance < 0.50 {
+                0.5
+            } else {
+                0.3
+            }
+        };
+
+        // Score based on magnitude
+        let magnitude_score = if max_excursion >= 0.55 {
+            1.0
+        } else if max_excursion >= 0.45 {
+            0.9
+        } else if max_excursion >= 0.35 {
+            0.7
+        } else if max_excursion >= 0.25 {
+            0.5
+        } else {
+            0.3
+        };
+
+        (peak_position_score * 0.25 + return_score * 0.35 + magnitude_score * 0.40)
+    }
+
+    fn clear(&mut self) {
+        self.positions.clear();
+        self.timestamps.clear();
+        self.velocities.clear();
     }
 }
 
@@ -1775,7 +2711,6 @@ struct WindowMetrics {
     peak_velocity: f32,
     direction_consistency: f32,
     time_span_ms: f64,
-    tlc_estimate: Option<f64>,
     is_intentional_change: bool,
     is_sustained_movement: bool,
 }
@@ -1787,9 +2722,66 @@ enum DetectionPath {
     MediumDeviation,
     GradualChange,
     LargeDeviation,
-    TLCBased,
-    CumulativeDisplacement,
-    VelocitySpike, // 🆕 NEW: For zigzags with high velocity but low baseline deviation
+    VelocitySpike,
+}
+
+// ============================================================================
+// CONFIDENCE CALCULATOR
+// ============================================================================
+
+struct ConfidenceCalculator;
+
+impl ConfidenceCalculator {
+    fn calculate(
+        max_offset: f32,
+        duration_ms: f64,
+        trajectory_analysis: &OvertakeAnalysis,
+        detection_path: Option<DetectionPath>,
+    ) -> f32 {
+        let offset_confidence = Self::offset_to_confidence(max_offset);
+        let duration_confidence = Self::duration_to_confidence(duration_ms);
+        let trajectory_confidence = trajectory_analysis.shape_score;
+
+        let path_bonus = match detection_path {
+            Some(DetectionPath::BoundaryCrossing) => 0.05,
+            Some(DetectionPath::HighVelocity) => 0.03,
+            _ => 0.0,
+        };
+
+        let base_confidence = offset_confidence * 0.45
+            + duration_confidence * 0.25
+            + trajectory_confidence * 0.20
+            + path_bonus
+            + 0.05;
+
+        base_confidence.max(0.4).min(0.98)
+    }
+
+    fn offset_to_confidence(max_offset: f32) -> f32 {
+        if max_offset >= 0.60 {
+            0.95
+        } else if max_offset >= 0.50 {
+            0.85
+        } else if max_offset >= 0.40 {
+            0.75
+        } else if max_offset >= 0.30 {
+            0.60
+        } else {
+            0.45
+        }
+    }
+
+    fn duration_to_confidence(duration_ms: f64) -> f32 {
+        if duration_ms >= 2000.0 && duration_ms <= 6000.0 {
+            0.90
+        } else if duration_ms >= 1000.0 && duration_ms <= 8000.0 {
+            0.75
+        } else if duration_ms >= 500.0 && duration_ms <= 10000.0 {
+            0.55
+        } else {
+            0.35
+        }
+    }
 }
 
 // ============================================================================
@@ -1810,6 +2802,7 @@ pub struct LaneChangeStateMachine {
     change_start_time: Option<f64>,
     change_detection_path: Option<DetectionPath>,
     max_offset_in_change: f32,
+    initial_position_frozen: Option<f32>,
 
     cooldown_remaining: u32,
     total_frames_processed: u64,
@@ -1833,6 +2826,7 @@ pub struct LaneChangeStateMachine {
 
     curve_detector: CurveDetector,
     velocity_tracker: LateralVelocityTracker,
+    trajectory_analyzer: TrajectoryAnalyzer,
 
     is_in_curve: bool,
     curve_compensation_factor: f32,
@@ -1855,12 +2849,13 @@ impl LaneChangeStateMachine {
             change_start_time: None,
             change_detection_path: None,
             max_offset_in_change: 0.0,
+            initial_position_frozen: None,
             cooldown_remaining: 0,
             total_frames_processed: 0,
             post_lane_change_grace: 0,
             position_filter: SimpleKalmanFilter::new(),
             adaptive_baseline: AdaptiveBaseline::new(),
-            offset_history: Vec::with_capacity(60),
+            offset_history: Vec::with_capacity(90),
             velocity_history: VecDeque::with_capacity(30),
             offset_samples: VecDeque::with_capacity(150),
             direction_samples: VecDeque::with_capacity(30),
@@ -1872,6 +2867,7 @@ impl LaneChangeStateMachine {
             peak_direction: Direction::Unknown,
             curve_detector: CurveDetector::new(),
             velocity_tracker: LateralVelocityTracker::new(),
+            trajectory_analyzer: TrajectoryAnalyzer::new(),
             is_in_curve: false,
             curve_compensation_factor: 1.0,
             pending_change_direction: Direction::Unknown,
@@ -1885,11 +2881,7 @@ impl LaneChangeStateMachine {
 
     pub fn update_curve_detector(&mut self, lanes: &[crate::types::Lane]) -> bool {
         self.is_in_curve = self.curve_detector.is_in_curve(lanes);
-        self.curve_compensation_factor = if self.is_in_curve {
-            CURVE_COMPENSATION_FACTOR
-        } else {
-            1.0
-        };
+        self.curve_compensation_factor = CURVE_COMPENSATION_FACTOR;
         self.is_in_curve
     }
 
@@ -1919,48 +2911,8 @@ impl LaneChangeStateMachine {
             self.post_lane_change_grace -= 1;
         }
 
-        // Timeout handling
-        if self.state == LaneChangeState::Drifting {
-            if let Some(start_time) = self.change_start_time {
-                let elapsed = timestamp_ms - start_time;
-
-                if elapsed > MAX_DRIFTING_MS {
-                    if self.max_offset_in_change >= self.config.crossing_threshold {
-                        info!(
-                            "⏰ Long DRIFTING ({:.0}ms) with good offset ({:.1}%) - auto-completing",
-                            elapsed,
-                            self.max_offset_in_change * 100.0
-                        );
-                        return self.force_complete(frame_id, timestamp_ms);
-                    }
-                }
-
-                if elapsed > self.config.max_duration_ms {
-                    if self.max_offset_in_change >= self.config.crossing_threshold {
-                        info!("⏰ Timeout but good offset - completing");
-                        return self.force_complete(frame_id, timestamp_ms);
-                    }
-                    warn!(
-                        "⏰ Timeout after {:.0}ms with max={:.1}%",
-                        elapsed,
-                        self.max_offset_in_change * 100.0
-                    );
-                    self.adaptive_baseline.unfreeze();
-                    self.reset_lane_change();
-                    self.cooldown_remaining = 30;
-                    return None;
-                }
-            }
-        }
-
-        if self.state == LaneChangeState::Crossing {
-            if let Some(start_time) = self.change_start_time {
-                let elapsed = timestamp_ms - start_time;
-                if elapsed > self.config.max_duration_ms {
-                    info!("⏰ Timeout in CROSSING - completing anyway");
-                    return self.force_complete(frame_id, timestamp_ms);
-                }
-            }
+        if let Some(event) = self.handle_timeouts(frame_id, timestamp_ms) {
+            return Some(event);
         }
 
         if !vehicle_state.is_valid() {
@@ -1975,15 +2927,7 @@ impl LaneChangeStateMachine {
             .velocity_tracker
             .get_velocity(vehicle_state.lateral_offset, timestamp_ms);
 
-        self.velocity_history.push_back(lateral_velocity);
-        if self.velocity_history.len() > 30 {
-            self.velocity_history.pop_front();
-        }
-
-        self.offset_history.push(normalized_offset);
-        if self.offset_history.len() > 60 {
-            self.offset_history.remove(0);
-        }
+        self.update_histories(normalized_offset, lateral_velocity);
 
         if self.post_lane_change_grace > 0 {
             self.adaptive_baseline.update(normalized_offset);
@@ -1993,12 +2937,6 @@ impl LaneChangeStateMachine {
         self.adaptive_baseline.update(normalized_offset);
 
         if !self.adaptive_baseline.is_valid {
-            if self.adaptive_baseline.sample_count % 30 == 0 {
-                debug!(
-                    "Baseline forming: {:.1}%",
-                    self.adaptive_baseline.value * 100.0
-                );
-            }
             return None;
         }
 
@@ -2016,7 +2954,116 @@ impl LaneChangeStateMachine {
         let deviation = signed_deviation.abs();
         let current_direction = Direction::from_offset(signed_deviation);
 
-        // Track max offset during pending and active phases
+        self.trajectory_analyzer
+            .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
+        self.track_max_offset(deviation);
+        self.update_samples(
+            normalized_offset,
+            deviation,
+            timestamp_ms,
+            lateral_velocity,
+            current_direction,
+        );
+
+        let window_metrics = self.calculate_window_metrics(timestamp_ms, lane_width);
+
+        let target_state = self.determine_target_state(
+            deviation,
+            crossing_type,
+            lateral_velocity,
+            current_direction,
+            &window_metrics,
+        );
+
+        debug!(
+            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, state={:?}→{:?}",
+            frame_id,
+            normalized_offset * 100.0,
+            baseline * 100.0,
+            if self.adaptive_baseline.is_frozen {
+                "🧊"
+            } else {
+                ""
+            },
+            deviation * 100.0,
+            self.max_offset_in_change * 100.0,
+            self.state,
+            target_state
+        );
+
+        self.check_transition(
+            target_state,
+            current_direction,
+            frame_id,
+            timestamp_ms,
+            deviation,
+            normalized_offset,
+        )
+    }
+
+    fn handle_timeouts(&mut self, frame_id: u64, timestamp_ms: f64) -> Option<LaneChangeEvent> {
+        if self.state == LaneChangeState::Drifting {
+            if let Some(start_time) = self.change_start_time {
+                let elapsed = timestamp_ms - start_time;
+
+                if elapsed > MAX_DRIFTING_MS {
+                    if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+                        info!(
+                            "⏰ Long DRIFTING ({:.0}ms) with offset ({:.1}%) - auto-completing",
+                            elapsed,
+                            self.max_offset_in_change * 100.0
+                        );
+                        return self.force_complete(frame_id, timestamp_ms);
+                    } else {
+                        warn!("⏰ Timeout with low offset - cancelling");
+                        self.adaptive_baseline.unfreeze();
+                        self.reset_lane_change();
+                        self.cooldown_remaining = 30;
+                        return None;
+                    }
+                }
+
+                if elapsed > self.config.max_duration_ms {
+                    if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+                        return self.force_complete(frame_id, timestamp_ms);
+                    }
+                    warn!(
+                        "⏰ Timeout after {:.0}ms with max={:.1}%",
+                        elapsed,
+                        self.max_offset_in_change * 100.0
+                    );
+                    self.adaptive_baseline.unfreeze();
+                    self.reset_lane_change();
+                    self.cooldown_remaining = 30;
+                }
+            }
+        }
+
+        if self.state == LaneChangeState::Crossing {
+            if let Some(start_time) = self.change_start_time {
+                let elapsed = timestamp_ms - start_time;
+                if elapsed > self.config.max_duration_ms {
+                    return self.force_complete(frame_id, timestamp_ms);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn update_histories(&mut self, normalized_offset: f32, lateral_velocity: f32) {
+        self.velocity_history.push_back(lateral_velocity);
+        if self.velocity_history.len() > 30 {
+            self.velocity_history.pop_front();
+        }
+
+        self.offset_history.push(normalized_offset);
+        if self.offset_history.len() > 90 {
+            self.offset_history.remove(0);
+        }
+    }
+
+    fn track_max_offset(&mut self, deviation: f32) {
         if self.pending_state == Some(LaneChangeState::Drifting)
             || self.state == LaneChangeState::Drifting
             || self.state == LaneChangeState::Crossing
@@ -2028,7 +3075,16 @@ impl LaneChangeStateMachine {
                 self.pending_max_offset = deviation;
             }
         }
+    }
 
+    fn update_samples(
+        &mut self,
+        normalized_offset: f32,
+        deviation: f32,
+        timestamp_ms: f64,
+        lateral_velocity: f32,
+        current_direction: Direction,
+    ) {
         self.recent_deviations.push(deviation);
         if self.recent_deviations.len() > 30 {
             self.recent_deviations.remove(0);
@@ -2063,60 +3119,44 @@ impl LaneChangeStateMachine {
         if lateral_velocity.abs() > self.peak_velocity_in_window {
             self.peak_velocity_in_window = lateral_velocity.abs();
         }
-
-        let window_metrics = self.calculate_window_metrics(timestamp_ms, lane_width);
-
-        let target_state = self.determine_target_state(
-            deviation,
-            crossing_type,
-            lateral_velocity,
-            current_direction,
-            &window_metrics,
-        );
-
-        // 🆕 Debug logging for zigzag investigation (around 202s = frame ~6060)
-        if frame_id >= 6000 && frame_id <= 6150 {
-            info!(
-                "🔍 F{}: pos={:.1}%, base={:.1}%, dev={:.1}%, vel={:.1}px/s, swing={:.1}%",
-                frame_id,
-                normalized_offset * 100.0,
-                baseline * 100.0,
-                deviation * 100.0,
-                lateral_velocity,
-                self.get_recent_position_change() * 100.0
-            );
-        }
-
-        debug!(
-            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, state={:?}→{:?}",
-            frame_id,
-            normalized_offset * 100.0,
-            baseline * 100.0,
-            if self.adaptive_baseline.is_frozen {
-                "🧊"
-            } else {
-                ""
-            },
-            deviation * 100.0,
-            self.max_offset_in_change * 100.0,
-            self.state,
-            target_state
-        );
-
-        self.check_transition(
-            target_state,
-            current_direction,
-            frame_id,
-            timestamp_ms,
-            deviation,
-        )
     }
 
     fn force_complete(&mut self, frame_id: u64, timestamp_ms: f64) -> Option<LaneChangeEvent> {
         let start_frame = self.change_start_frame.unwrap_or(frame_id);
         let start_time = self.change_start_time.unwrap_or(timestamp_ms);
         let duration_ms = Some(timestamp_ms - start_time);
-        let confidence = self.calculate_confidence(duration_ms);
+        let duration = duration_ms.unwrap_or(0.0);
+
+        let final_position = self.offset_history.last().copied().unwrap_or(0.0);
+        let net_displacement = self
+            .initial_position_frozen
+            .map(|initial| (final_position - initial).abs())
+            .unwrap_or(0.0);
+
+        let trajectory_analysis = self.trajectory_analyzer.analyze_overtake_pattern(
+            self.initial_position_frozen.unwrap_or(0.0),
+            final_position,
+            self.max_offset_in_change,
+        );
+
+        if !self.validate_lane_change(duration, net_displacement, &trajectory_analysis) {
+            warn!(
+                "⏰ Force complete rejected: max={:.1}%, dur={:.0}ms",
+                self.max_offset_in_change * 100.0,
+                duration
+            );
+            self.adaptive_baseline.unfreeze();
+            self.reset_lane_change();
+            self.cooldown_remaining = 60;
+            return None;
+        }
+
+        let confidence = ConfidenceCalculator::calculate(
+            self.max_offset_in_change,
+            duration,
+            &trajectory_analysis,
+            self.change_detection_path,
+        );
 
         let mut event = LaneChangeEvent::new(
             start_time,
@@ -2129,28 +3169,163 @@ impl LaneChangeStateMachine {
         event.source_id = self.source_id.clone();
 
         info!(
-            "✅ FORCE CONFIRMED: {} at {:.2}s, dur={:.0}ms, max={:.1}%, path={:?}",
+            "✅ FORCE CONFIRMED: {} at {:.2}s, dur={:.0}ms, max={:.1}%, conf={:.2}",
             event.direction_name(),
             start_time / 1000.0,
-            duration_ms.unwrap_or(0.0),
+            duration,
             self.max_offset_in_change * 100.0,
-            self.change_detection_path
+            confidence
         );
 
-        self.adaptive_baseline.reset();
-        self.position_filter.reset();
-        self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
-        self.offset_samples.clear();
-        self.cooldown_remaining = self.config.cooldown_frames;
-
-        info!("🔄 Baseline reset - will adapt to new position");
-        self.reset_lane_change();
-
+        self.finalize_lane_change();
         Some(event)
     }
 
-    /// 🆕 Get the total position change over recent frames (ignoring baseline)
-    /// Used for detecting zigzags where baseline has adapted
+    /// BALANCED validation - offset compensates for duration
+    fn validate_lane_change(
+        &self,
+        duration: f64,
+        net_displacement: f32,
+        trajectory_analysis: &OvertakeAnalysis,
+    ) -> bool {
+        // ================================================================
+        // RULE 0: ABSOLUTE MINIMUM DURATION (safety net)
+        // No lane change can be less than 800ms regardless of offset
+        // ================================================================
+        const ABSOLUTE_MIN_DURATION: f64 = 800.0;
+
+        if duration < ABSOLUTE_MIN_DURATION {
+            warn!(
+                "❌ Rejected: duration {:.0}ms < {:.0}ms absolute minimum",
+                duration, ABSOLUTE_MIN_DURATION
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 1: Baseline sanity check
+        // ================================================================
+        if !self.adaptive_baseline.is_sane()
+            && self.max_offset_in_change < VERY_HIGH_OFFSET_THRESHOLD
+        {
+            warn!(
+                "❌ Rejected: baseline at {:.1}% and offset only {:.1}%",
+                self.adaptive_baseline.frozen_value * 100.0,
+                self.max_offset_in_change * 100.0
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 2: Minimum offset required
+        // ================================================================
+        if self.max_offset_in_change < LOW_OFFSET_THRESHOLD {
+            warn!(
+                "❌ Rejected: max offset {:.1}% < {:.1}% minimum",
+                self.max_offset_in_change * 100.0,
+                LOW_OFFSET_THRESHOLD * 100.0
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 3: Very high offset (>=55%) - need minimum duration only
+        // ================================================================
+        if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
+            info!(
+                "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
+                self.max_offset_in_change * 100.0,
+                duration
+            );
+            return true;
+        }
+
+        // ================================================================
+        // RULE 4: High offset (>=45%) - need reasonable duration
+        // ================================================================
+        if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
+            if duration >= MIN_DURATION_HIGH {
+                info!(
+                    "✅ Valid: high offset {:.1}% with dur={:.0}ms",
+                    self.max_offset_in_change * 100.0,
+                    duration
+                );
+                return true;
+            }
+            // High offset but short duration - need good trajectory
+            if trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.6 {
+                info!(
+                "✅ Valid: high offset {:.1}%, short dur but excellent trajectory (score={:.2})",
+                self.max_offset_in_change * 100.0,
+                trajectory_analysis.shape_score
+            );
+                return true;
+            }
+            warn!(
+                "❌ Rejected: high offset {:.1}% but dur={:.0}ms < {:.0}ms and traj_score={:.2}",
+                self.max_offset_in_change * 100.0,
+                duration,
+                MIN_DURATION_HIGH,
+                trajectory_analysis.shape_score
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 5: Medium offset (>=35%) - need duration AND (trajectory OR displacement)
+        // ================================================================
+        if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+            let has_duration = duration >= MIN_DURATION_MEDIUM;
+            let has_trajectory =
+                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.5;
+            let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
+
+            // Must have duration, plus at least one other condition
+            if has_duration && (has_trajectory || has_displacement) {
+                info!(
+                    "✅ Valid: medium offset {:.1}%, dur=✓ + traj={} disp={}",
+                    self.max_offset_in_change * 100.0,
+                    if has_trajectory { "✓" } else { "✗" },
+                    if has_displacement { "✓" } else { "✗" }
+                );
+                return true;
+            }
+
+            warn!(
+                "❌ Rejected: medium offset {:.1}%, dur={} (need ✓) + traj={} disp={}",
+                self.max_offset_in_change * 100.0,
+                if has_duration { "✓" } else { "✗" },
+                if has_trajectory { "✓" } else { "✗" },
+                if has_displacement { "✓" } else { "✗" }
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 6: Lower offset (25-35%) - need ALL conditions
+        // ================================================================
+        let has_duration = duration >= MIN_DURATION_LOW;
+        let has_trajectory = trajectory_analysis.is_valid_overtake;
+        let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
+
+        if has_duration && has_trajectory && has_displacement {
+            info!(
+                "✅ Valid: lower offset {:.1}%, all conditions met",
+                self.max_offset_in_change * 100.0
+            );
+            return true;
+        }
+
+        warn!(
+            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need ALL)",
+            self.max_offset_in_change * 100.0,
+            if has_duration { "✓" } else { "✗" },
+            if has_trajectory { "✓" } else { "✗" },
+            if has_displacement { "✓" } else { "✗" }
+        );
+        false
+    }
+
     fn get_recent_position_change(&self) -> f32 {
         if self.offset_history.len() < 10 {
             return 0.0;
@@ -2160,12 +3335,10 @@ impl LaneChangeStateMachine {
         let first = recent[0];
         let last = recent[recent.len() - 1];
 
-        // Also check max swing (for zigzags that return to center)
         let max = recent.iter().fold(f32::MIN, |a, &b| a.max(b));
         let min = recent.iter().fold(f32::MAX, |a, &b| a.min(b));
         let swing = max - min;
 
-        // Return the larger of: end-to-end change or total swing
         (last - first).abs().max(swing)
     }
 
@@ -2212,14 +3385,6 @@ impl LaneChangeStateMachine {
             metrics.direction_consistency = consistent as f32 / self.direction_samples.len() as f32;
         }
 
-        if metrics.avg_velocity.abs() > 5.0 {
-            let distance_to_boundary = (0.5 - last.deviation.abs()) * lane_width;
-            if distance_to_boundary > 0.0 {
-                metrics.tlc_estimate =
-                    Some((distance_to_boundary / metrics.avg_velocity.abs()) as f64);
-            }
-        }
-
         metrics.is_sustained_movement = metrics.direction_consistency
             >= DIRECTION_CONSISTENCY_THRESHOLD
             && metrics.time_span_ms >= 1000.0;
@@ -2238,14 +3403,19 @@ impl LaneChangeStateMachine {
         current_direction: Direction,
         metrics: &WindowMetrics,
     ) -> LaneChangeState {
-        let drift_threshold = self.config.drift_threshold * self.curve_compensation_factor;
-        let crossing_threshold = self.config.crossing_threshold * self.curve_compensation_factor;
+        let drift_threshold = self.config.drift_threshold;
+        let crossing_threshold = self.config.crossing_threshold;
 
-        let vel_fast = MIN_VELOCITY_FAST * self.curve_compensation_factor;
-        let vel_medium = MIN_VELOCITY_MEDIUM * self.curve_compensation_factor;
+        let vel_fast = MIN_VELOCITY_FAST;
+        let vel_medium = MIN_VELOCITY_MEDIUM;
 
         match self.state {
             LaneChangeState::Centered => {
+                // Skip if baseline is way off (likely already in another lane)
+                if !self.adaptive_baseline.is_sane() {
+                    return LaneChangeState::Centered;
+                }
+
                 // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
                     if self.is_deviation_sustained(drift_threshold * 0.9) {
@@ -2271,33 +3441,20 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // 🆕 PATH 8: VELOCITY SPIKE (for zigzags where baseline has adapted)
-                // High velocity movement should trigger even if baseline deviation is low
-                if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD {
+                // PATH 3: VELOCITY SPIKE
+                if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD && deviation >= drift_threshold
+                {
                     if self.is_velocity_sustained(vel_fast) {
                         let position_change = self.get_recent_position_change();
                         if position_change >= POSITION_CHANGE_THRESHOLD {
                             self.change_detection_path = Some(DetectionPath::VelocitySpike);
                             info!(
-                                "🚨 [VELOCITY-SPIKE] vel={:.1}px/s, pos_change={:.1}%, dev={:.1}%",
+                                "🚨 [VELOCITY-SPIKE] vel={:.1}px/s, pos_change={:.1}%",
                                 lateral_velocity,
-                                position_change * 100.0,
-                                deviation * 100.0
+                                position_change * 100.0
                             );
                             return LaneChangeState::Drifting;
                         }
-                    }
-                }
-
-                // PATH 3: TLC-BASED
-                if let Some(tlc) = metrics.tlc_estimate {
-                    if tlc < TLC_WARNING_THRESHOLD
-                        && deviation >= drift_threshold
-                        && metrics.is_sustained_movement
-                    {
-                        self.change_detection_path = Some(DetectionPath::TLCBased);
-                        info!("🚨 [TLC] TLC={:.2}s, dev={:.1}%", tlc, deviation * 100.0);
-                        return LaneChangeState::Drifting;
                     }
                 }
 
@@ -2336,54 +3493,36 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 7: CUMULATIVE
-                if metrics.max_deviation >= DEVIATION_SIGNIFICANT
-                    && metrics.direction_consistency >= DIRECTION_CONSISTENCY_THRESHOLD
-                    && metrics.time_span_ms >= 2500.0
-                    && !self.is_in_curve
-                {
-                    self.change_detection_path = Some(DetectionPath::CumulativeDisplacement);
-                    info!(
-                        "🚨 [CUMULATIVE] max={:.1}%, span={:.1}s",
-                        metrics.max_deviation * 100.0,
-                        metrics.time_span_ms / 1000.0
-                    );
-                    return LaneChangeState::Drifting;
-                }
-
                 LaneChangeState::Centered
             }
 
             LaneChangeState::Drifting => {
-                // Check for crossing threshold
                 if deviation >= crossing_threshold {
                     return LaneChangeState::Crossing;
                 }
 
-                // Also check max_offset
                 if self.max_offset_in_change >= crossing_threshold {
                     return LaneChangeState::Crossing;
                 }
 
-                // Check if we should complete based on sustained high deviation
-                if self.frames_in_state > 30 && self.max_offset_in_change >= drift_threshold + 0.08
+                if self.frames_in_state > 45 && self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD
                 {
                     if self.is_deviation_stable() {
                         info!(
-                            "✅ DRIFTING complete: stabilized with max={:.1}%",
+                            "✅ DRIFTING stabilized with max={:.1}%",
                             self.max_offset_in_change * 100.0
                         );
                         return LaneChangeState::Completed;
                     }
                 }
 
-                // Cancellation check - only if max offset is very low
-                let cancel_threshold = drift_threshold * 0.5;
-                if deviation < cancel_threshold && self.max_offset_in_change < drift_threshold {
+                let cancel_threshold = drift_threshold * HYSTERESIS_EXIT;
+                if deviation < cancel_threshold && self.max_offset_in_change < LOW_OFFSET_THRESHOLD
+                {
                     warn!(
-                        "❌ Cancelled: max={:.1}% < drift={:.1}%",
+                        "❌ Cancelled: max={:.1}% < {:.1}%",
                         self.max_offset_in_change * 100.0,
-                        drift_threshold * 100.0
+                        LOW_OFFSET_THRESHOLD * 100.0
                     );
                     return LaneChangeState::Centered;
                 }
@@ -2400,26 +3539,20 @@ impl LaneChangeStateMachine {
                 }
                 self.last_deviation = deviation;
 
-                if self.is_deviation_stable() && deviation < 0.35 {
-                    info!("✅ Completing: stabilized at {:.1}%", deviation * 100.0);
+                if self.is_deviation_stable() && deviation < 0.40 {
                     return LaneChangeState::Completed;
                 }
 
-                let return_threshold = self.config.drift_threshold * HYSTERESIS_EXIT;
+                let return_threshold = drift_threshold * HYSTERESIS_EXIT;
                 if deviation < return_threshold {
-                    info!("✅ Completing: returned to center");
                     return LaneChangeState::Completed;
                 }
 
-                if self.stable_deviation_frames >= 30 && deviation < 0.45 {
-                    info!(
-                        "✅ Completing: stable for {} frames",
-                        self.stable_deviation_frames
-                    );
+                if self.stable_deviation_frames >= 25 && deviation < 0.50 {
                     return LaneChangeState::Completed;
                 }
 
-                if self.max_offset_in_change >= self.config.crossing_threshold
+                if self.max_offset_in_change >= crossing_threshold
                     && current_direction != self.change_direction
                     && current_direction != Direction::Unknown
                 {
@@ -2430,8 +3563,7 @@ impl LaneChangeStateMachine {
                         .take(10)
                         .filter(|&&d| d != self.change_direction && d != Direction::Unknown)
                         .count();
-                    if reversal_count >= 7 {
-                        info!("✅ Completing: direction reversed");
+                    if reversal_count >= 6 {
                         return LaneChangeState::Completed;
                     }
                 }
@@ -2454,7 +3586,7 @@ impl LaneChangeStateMachine {
             .take(6)
             .filter(|o| (*o - baseline).abs() >= threshold)
             .count()
-            >= 5
+            >= 4
     }
 
     fn is_deviation_sustained_long(&self, threshold: f32) -> bool {
@@ -2468,7 +3600,7 @@ impl LaneChangeStateMachine {
             .take(15)
             .filter(|o| (*o - baseline).abs() >= threshold)
             .count()
-            >= 12
+            >= 10
     }
 
     fn is_velocity_sustained(&self, threshold: f32) -> bool {
@@ -2481,24 +3613,24 @@ impl LaneChangeStateMachine {
             .take(5)
             .filter(|v| v.abs() >= threshold)
             .count()
-            >= 4
+            >= 3
     }
 
     fn is_deviation_stable(&self) -> bool {
-        if self.recent_deviations.len() < 15 {
+        if self.recent_deviations.len() < 12 {
             return false;
         }
-        let recent = &self.recent_deviations[self.recent_deviations.len() - 15..];
+        let recent = &self.recent_deviations[self.recent_deviations.len() - 12..];
         let max = recent.iter().fold(f32::MIN, |a, &b| a.max(b));
         let min = recent.iter().fold(f32::MAX, |a, &b| a.min(b));
-        if max - min > 0.08 {
+        if max - min > 0.12 {
             return false;
         }
         recent
             .windows(2)
-            .filter(|w| (w[1] - w[0]).abs() > 0.03)
+            .filter(|w| (w[1] - w[0]).abs() > 0.04)
             .count()
-            <= 2
+            <= 4
     }
 
     fn reset_lane_change(&mut self) {
@@ -2511,6 +3643,7 @@ impl LaneChangeStateMachine {
         self.change_start_time = None;
         self.change_detection_path = None;
         self.max_offset_in_change = 0.0;
+        self.initial_position_frozen = None;
         self.stable_deviation_frames = 0;
         self.last_deviation = 0.0;
         self.recent_deviations.clear();
@@ -2519,6 +3652,17 @@ impl LaneChangeStateMachine {
         self.peak_direction = Direction::Unknown;
         self.pending_change_direction = Direction::Unknown;
         self.pending_max_offset = 0.0;
+        self.trajectory_analyzer.clear();
+    }
+
+    fn finalize_lane_change(&mut self) {
+        self.adaptive_baseline.reset();
+        self.position_filter.reset();
+        self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
+        self.offset_samples.clear();
+        self.cooldown_remaining = self.config.cooldown_frames;
+        info!("🔄 Baseline reset - will adapt to new position");
+        self.reset_lane_change();
     }
 
     fn check_transition(
@@ -2528,6 +3672,7 @@ impl LaneChangeStateMachine {
         frame_id: u64,
         timestamp_ms: f64,
         current_deviation: f32,
+        normalized_offset: f32,
     ) -> Option<LaneChangeEvent> {
         if target_state == self.state {
             self.pending_state = None;
@@ -2536,16 +3681,16 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Freeze baseline immediately when we first detect potential lane change
         if target_state == LaneChangeState::Drifting && self.state == LaneChangeState::Centered {
             if self.pending_state != Some(LaneChangeState::Drifting) {
                 self.adaptive_baseline.freeze();
+                self.initial_position_frozen = Some(normalized_offset);
                 self.pending_change_direction = direction;
                 self.pending_max_offset = current_deviation;
                 info!(
-                    "🧊 Early freeze: baseline at {:.1}%, initial dev={:.1}%",
+                    "🧊 Baseline frozen at {:.1}%, initial position: {:.1}%",
                     self.adaptive_baseline.effective_value() * 100.0,
-                    current_deviation * 100.0
+                    normalized_offset * 100.0
                 );
             }
         }
@@ -2557,13 +3702,13 @@ impl LaneChangeStateMachine {
             self.pending_frames = 1;
         }
 
-        // Unfreeze if we're NOT going to transition after all
         if target_state != LaneChangeState::Drifting
             && self.adaptive_baseline.is_frozen
             && self.state == LaneChangeState::Centered
             && self.pending_frames < self.config.min_frames_confirm
         {
             self.adaptive_baseline.unfreeze();
+            self.initial_position_frozen = None;
             self.pending_max_offset = 0.0;
         }
 
@@ -2571,7 +3716,13 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        self.execute_transition(target_state, direction, frame_id, timestamp_ms)
+        self.execute_transition(
+            target_state,
+            direction,
+            frame_id,
+            timestamp_ms,
+            normalized_offset,
+        )
     }
 
     fn execute_transition(
@@ -2580,6 +3731,7 @@ impl LaneChangeStateMachine {
         direction: Direction,
         frame_id: u64,
         timestamp_ms: f64,
+        final_position: f32,
     ) -> Option<LaneChangeEvent> {
         let from_state = self.state;
 
@@ -2605,10 +3757,11 @@ impl LaneChangeStateMachine {
 
             if !self.adaptive_baseline.is_frozen {
                 self.adaptive_baseline.freeze();
+                self.initial_position_frozen = Some(final_position);
             }
 
             info!(
-                "🚗 Lane change started: {} at {:.2}s via {:?} (max so far: {:.1}%)",
+                "🚗 Lane change started: {} at {:.2}s via {:?} (max: {:.1}%)",
                 self.change_direction.as_str(),
                 timestamp_ms / 1000.0,
                 self.change_detection_path,
@@ -2636,36 +3789,43 @@ impl LaneChangeStateMachine {
         self.pending_frames = 0;
 
         if target_state == LaneChangeState::Completed {
-            if let Some(dur) = duration_ms {
-                if dur < self.config.min_duration_ms
-                    && self.max_offset_in_change < DEVIATION_SIGNIFICANT
-                {
-                    warn!("❌ Rejected: short + low dev");
-                    self.adaptive_baseline.unfreeze();
-                    self.reset_lane_change();
-                    self.cooldown_remaining = 60;
-                    return None;
-                }
-            }
+            let duration = duration_ms.unwrap_or(0.0);
 
-            let min_offset_for_valid = self.config.drift_threshold + 0.05;
-            if self.max_offset_in_change < min_offset_for_valid {
-                warn!(
-                    "❌ Rejected: max={:.1}% < {:.1}%",
-                    self.max_offset_in_change * 100.0,
-                    min_offset_for_valid * 100.0
-                );
+            let net_displacement = if let Some(initial_pos) = self.initial_position_frozen {
+                (final_position - initial_pos).abs()
+            } else {
+                0.0
+            };
+
+            let trajectory_analysis = self.trajectory_analyzer.analyze_overtake_pattern(
+                self.initial_position_frozen.unwrap_or(0.0),
+                final_position,
+                self.max_offset_in_change,
+            );
+
+            debug!(
+                "📊 Trajectory: excursion={}, returned={}, shape={:.2}",
+                trajectory_analysis.excursion_sufficient,
+                trajectory_analysis.returned_to_start,
+                trajectory_analysis.shape_score
+            );
+
+            if !self.validate_lane_change(duration, net_displacement, &trajectory_analysis) {
                 self.adaptive_baseline.unfreeze();
                 self.reset_lane_change();
                 self.cooldown_remaining = 60;
                 return None;
             }
 
-            self.cooldown_remaining = self.config.cooldown_frames;
+            let confidence = ConfidenceCalculator::calculate(
+                self.max_offset_in_change,
+                duration,
+                &trajectory_analysis,
+                self.change_detection_path,
+            );
 
             let start_frame = self.change_start_frame.unwrap_or(frame_id);
             let start_time = self.change_start_time.unwrap_or(timestamp_ms);
-            let confidence = self.calculate_confidence(duration_ms);
 
             let mut event = LaneChangeEvent::new(
                 start_time,
@@ -2677,59 +3837,44 @@ impl LaneChangeStateMachine {
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
 
+            event.metadata.insert(
+                "max_offset_normalized".to_string(),
+                serde_json::json!(self.max_offset_in_change),
+            );
+            if let Some(initial) = self.initial_position_frozen {
+                event
+                    .metadata
+                    .insert("initial_position".to_string(), serde_json::json!(initial));
+                event.metadata.insert(
+                    "final_position".to_string(),
+                    serde_json::json!(final_position),
+                );
+                event.metadata.insert(
+                    "net_displacement".to_string(),
+                    serde_json::json!(net_displacement),
+                );
+            }
+            if let Some(path) = self.change_detection_path {
+                event.metadata.insert(
+                    "detection_path".to_string(),
+                    serde_json::json!(format!("{:?}", path)),
+                );
+            }
+
             info!(
-                "✅ CONFIRMED: {} at {:.2}s, dur={:.0}ms, max={:.1}%, path={:?}",
+                "✅ CONFIRMED: {} at {:.2}s, dur={:.0}ms, max={:.1}%, conf={:.2}",
                 event.direction_name(),
                 start_time / 1000.0,
-                duration_ms.unwrap_or(0.0),
+                duration,
                 self.max_offset_in_change * 100.0,
-                self.change_detection_path
+                confidence
             );
 
-            self.adaptive_baseline.reset();
-            self.position_filter.reset();
-            self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
-            self.offset_samples.clear();
-
-            info!("🔄 Baseline reset - will adapt to new position");
-            self.reset_lane_change();
-
+            self.finalize_lane_change();
             return Some(event);
         }
 
         None
-    }
-
-    fn calculate_confidence(&self, duration_ms: Option<f64>) -> f32 {
-        let mut confidence: f32 = 0.5;
-        if self.max_offset_in_change > 0.60 {
-            confidence += 0.25;
-        } else if self.max_offset_in_change > 0.50 {
-            confidence += 0.20;
-        } else if self.max_offset_in_change > 0.40 {
-            confidence += 0.15;
-        } else {
-            confidence += 0.05;
-        }
-
-        if let Some(dur) = duration_ms {
-            if dur > 1000.0 && dur < 6000.0 {
-                confidence += 0.15;
-            } else if dur > 500.0 && dur < 10000.0 {
-                confidence += 0.10;
-            } else {
-                confidence += 0.05;
-            }
-        }
-
-        if let Some(path) = &self.change_detection_path {
-            match path {
-                DetectionPath::BoundaryCrossing | DetectionPath::TLCBased => confidence += 0.05,
-                DetectionPath::HighVelocity | DetectionPath::VelocitySpike => confidence += 0.03,
-                _ => {}
-            }
-        }
-        confidence.min(0.95)
     }
 
     pub fn reset(&mut self) {
@@ -2746,6 +3891,7 @@ impl LaneChangeStateMachine {
         self.velocity_tracker.reset();
         self.offset_samples.clear();
         self.direction_samples.clear();
+        self.trajectory_analyzer.clear();
         self.is_in_curve = false;
         self.curve_compensation_factor = 1.0;
     }

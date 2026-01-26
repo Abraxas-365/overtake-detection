@@ -228,6 +228,7 @@ async fn process_video(
                 // Check if lane change completed
                 if let Some(mut event) = analyzer.analyze(
                     &analysis_lanes,
+                    &frame.data, // ← ADD RAW FRAME DATA
                     frame.width as u32,
                     frame.height as u32,
                     frame_count,
@@ -353,22 +354,22 @@ async fn process_video(
                 previous_state = current_state;
 
                 if frame_count % 50 == 0 {
-                    if let Some(vs) = analyzer.last_vehicle_state() {
-                        if vs.is_valid() {
-                            let normalized = vs.normalized_offset().unwrap_or(0.0);
-                            let width = vs.lane_width.unwrap_or(0.0);
-                            if normalized.abs() > 0.1 {
-                                info!(
-                                "Frame {}: State={} | Offset: {:.1}px ({:.1}%) | Width: {:.0}px",
-                                frame_count,
-                                analyzer.current_state(),
-                                vs.lateral_offset,
-                                normalized * 100.0,
-                                width
-                            );
-                            }
-                        }
-                    }
+                    let stuck_indicator = if analyzer.is_stuck() {
+                        "⚠️  STUCK"
+                    } else {
+                        ""
+                    };
+                    info!(
+        "Progress: {:.1}% ({}/{}) | State: {} {} | Lane changes: {} | Buffered: {} | Pre-buffered: {}",
+        reader.progress(),
+        reader.current_frame,
+        reader.total_frames,
+        analyzer.current_state(),
+        stuck_indicator,  // ← ADD THIS
+        lane_changes.len(),
+        frame_buffer.frame_count(),
+        frame_buffer.pre_buffer_count()
+    );
                 }
 
                 if analyzer

@@ -28,7 +28,7 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-opencv = { version = "0.91", features = ["rgb"] }
+opencv = { version = "0.91", features = ["rgb","clang-runtime"] }
 
 # File system
 walkdir = "2.4"
