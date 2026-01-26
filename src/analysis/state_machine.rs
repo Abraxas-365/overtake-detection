@@ -1,6 +1,6 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v3.3 - STRICT FALSE POSITIVE PREVENTION
+// LANE CHANGE DETECTION v3.4 - BALANCED VALIDATION
 //
 
 use super::boundary_detector::CrossingType;
@@ -11,12 +11,12 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 // ============================================================================
-// VELOCITY THRESHOLDS (pixels/second)
+// VELOCITY THRESHOLDS
 // ============================================================================
 const MIN_VELOCITY_FAST: f32 = 120.0;
 const MIN_VELOCITY_MEDIUM: f32 = 60.0;
 const MIN_VELOCITY_SLOW: f32 = 20.0;
-const VELOCITY_SPIKE_THRESHOLD: f32 = 200.0; // Increased from 180
+const VELOCITY_SPIKE_THRESHOLD: f32 = 200.0;
 
 // ============================================================================
 // ANALYSIS WINDOWS
@@ -25,12 +25,12 @@ const ANALYSIS_WINDOW_MS: f64 = 4000.0;
 const TRAJECTORY_WINDOW_SIZE: usize = 90;
 
 // ============================================================================
-// DEVIATION THRESHOLDS - STRICTER
+// DEVIATION THRESHOLDS
 // ============================================================================
-const DEVIATION_DRIFT_START: f32 = 0.22; // 22% - increased from 18%
+const DEVIATION_DRIFT_START: f32 = 0.22;
 const DEVIATION_CROSSING: f32 = 0.30;
-const DEVIATION_LANE_CENTER: f32 = 0.55; // 55% - increased from 45%
-const DEVIATION_SIGNIFICANT: f32 = 0.45; // 45% - increased from 35%
+const DEVIATION_LANE_CENTER: f32 = 0.55;
+const DEVIATION_SIGNIFICANT: f32 = 0.45;
 
 // ============================================================================
 // STATE MACHINE BEHAVIOR
@@ -55,31 +55,37 @@ const EWMA_MIN_SAMPLES: u32 = 30;
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 const BASELINE_MAX_DRIFT: f32 = 0.25;
-const BASELINE_SANITY_CHECK: f32 = 0.30; // Baseline shouldn't exceed 30% from center
+const BASELINE_SANITY_CHECK: f32 = 0.35; // Increased to allow more baseline variation
 
 // ============================================================================
-// CURVE DETECTION - CONSERVATIVE
+// CURVE DETECTION
 // ============================================================================
 const CURVE_COMPENSATION_FACTOR: f32 = 1.0;
 const CURVE_CURVATURE_THRESHOLD: f32 = 0.015;
 
 // ============================================================================
-// VALIDATION THRESHOLDS - STRICT TO PREVENT FALSE POSITIVES
+// VALIDATION THRESHOLDS - BALANCED
 // ============================================================================
-const HIGH_OFFSET_THRESHOLD: f32 = 0.60; // 60% = auto-valid (increased from 50%)
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.50; // 50% needs duration (increased from 35%)
-const LOW_OFFSET_THRESHOLD: f32 = 0.40; // 40% minimum (increased from 20%)
-const MIN_NET_DISPLACEMENT: f32 = 0.20;
-const MIN_DURATION_FOR_VALIDATION: f64 = 2500.0;
-const MIN_DURATION_STRICT: f64 = 3000.0; // Stricter duration for lower offsets
+const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55; // 55% = very confident, minimal checks
+const HIGH_OFFSET_THRESHOLD: f32 = 0.45; // 45% = confident, need some duration
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35; // 35% = need duration + trajectory
+const LOW_OFFSET_THRESHOLD: f32 = 0.25; // 25% = strict validation
+
+// Duration thresholds - RELAXED
+const MIN_DURATION_VERY_HIGH: f64 = 800.0; // 0.8s for very high offset
+const MIN_DURATION_HIGH: f64 = 1200.0; // 1.2s for high offset
+const MIN_DURATION_MEDIUM: f64 = 2000.0; // 2.0s for medium offset
+const MIN_DURATION_LOW: f64 = 3000.0; // 3.0s for low offset
+
+const MIN_NET_DISPLACEMENT: f32 = 0.15;
 
 // ============================================================================
-// TRAJECTORY ANALYSIS
+// TRAJECTORY ANALYSIS - MORE PERMISSIVE
 // ============================================================================
-const RETURN_TO_CENTER_THRESHOLD: f32 = 0.30;
-const MIN_EXCURSION_FOR_OVERTAKE: f32 = 0.40; // Increased from 30%
-const TRAJECTORY_SMOOTHNESS_THRESHOLD: f32 = 0.20;
-const MIN_TRAJECTORY_POINTS: usize = 10;
+const RETURN_TO_CENTER_THRESHOLD: f32 = 0.35;
+const MIN_EXCURSION_FOR_OVERTAKE: f32 = 0.30;
+const TRAJECTORY_SMOOTHNESS_THRESHOLD: f32 = 0.25;
+const MIN_TRAJECTORY_POINTS: usize = 8;
 
 const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
@@ -187,7 +193,6 @@ impl AdaptiveBaseline {
         }
     }
 
-    /// Check if baseline is reasonable (not too far from center)
     fn is_sane(&self) -> bool {
         self.value.abs() < BASELINE_SANITY_CHECK
     }
@@ -278,7 +283,7 @@ impl AdaptiveBaseline {
 }
 
 // ============================================================================
-// TRAJECTORY ANALYZER
+// TRAJECTORY ANALYZER - MORE PERMISSIVE
 // ============================================================================
 
 #[derive(Clone)]
@@ -328,11 +333,11 @@ impl TrajectoryAnalyzer {
     ) -> OvertakeAnalysis {
         let mut analysis = OvertakeAnalysis::default();
 
+        // Be permissive if not enough data - assume valid
         if self.positions.len() < MIN_TRAJECTORY_POINTS {
-            // Not enough data - be STRICT (not permissive)
             analysis.excursion_sufficient = max_excursion >= MIN_EXCURSION_FOR_OVERTAKE;
-            analysis.shape_score = 0.3; // Low score if no data
-            analysis.is_valid_overtake = false;
+            analysis.shape_score = 0.6;
+            analysis.is_valid_overtake = analysis.excursion_sufficient;
             return analysis;
         }
 
@@ -345,19 +350,19 @@ impl TrajectoryAnalyzer {
         analysis.is_smooth = analysis.smoothness < TRAJECTORY_SMOOTHNESS_THRESHOLD;
 
         analysis.has_reversal = self.detect_direction_reversal();
-        analysis.shape_score = self.calculate_shape_score(start_pos);
+        analysis.shape_score = self.calculate_shape_score(start_pos, max_excursion);
 
-        // Strict: valid only if excursion is sufficient AND either returned or has reversal
+        // More permissive: valid if excursion OR good shape OR has reversal
         analysis.is_valid_overtake = analysis.excursion_sufficient
-            && (analysis.returned_to_start || analysis.has_reversal)
-            && analysis.shape_score >= 0.5;
+            || analysis.shape_score >= 0.5
+            || (analysis.has_reversal && max_excursion >= 0.25);
 
         analysis
     }
 
     fn calculate_smoothness(&self) -> f32 {
         if self.positions.len() < 3 {
-            return 1.0; // High value = not smooth = stricter
+            return 0.0; // Assume smooth if no data
         }
 
         let positions: Vec<f32> = self.positions.iter().copied().collect();
@@ -373,13 +378,13 @@ impl TrajectoryAnalyzer {
         if count > 0 {
             jitter_sum / count as f32
         } else {
-            1.0
+            0.0
         }
     }
 
     fn detect_direction_reversal(&self) -> bool {
-        if self.velocities.len() < 15 {
-            return false; // Strict: require enough data
+        if self.velocities.len() < 8 {
+            return true; // Assume reversal if not enough data
         }
 
         let velocities: Vec<f32> = self.velocities.iter().copied().collect();
@@ -387,8 +392,7 @@ impl TrajectoryAnalyzer {
         let mut last_sign: Option<bool> = None;
 
         for v in &velocities {
-            if v.abs() > 20.0 {
-                // Increased threshold
+            if v.abs() > 15.0 {
                 let current_sign = *v > 0.0;
                 if let Some(last) = last_sign {
                     if current_sign != last {
@@ -399,18 +403,18 @@ impl TrajectoryAnalyzer {
             }
         }
 
-        // Must have exactly 1-2 reversals for a proper overtake
-        sign_changes >= 1 && sign_changes <= 3
+        sign_changes >= 1
     }
 
-    fn calculate_shape_score(&self, start_pos: f32) -> f32 {
+    fn calculate_shape_score(&self, start_pos: f32, max_excursion: f32) -> f32 {
         if self.positions.len() < MIN_TRAJECTORY_POINTS {
-            return 0.3;
+            return 0.6; // Default acceptable score
         }
 
         let positions: Vec<f32> = self.positions.iter().copied().collect();
         let n = positions.len();
 
+        // Find peak
         let mut peak_idx = 0;
         let mut peak_deviation = 0.0;
         for (i, &pos) in positions.iter().enumerate() {
@@ -421,45 +425,47 @@ impl TrajectoryAnalyzer {
             }
         }
 
-        // Score 1: Peak position (should be in middle)
+        // Score based on peak position
         let peak_position_score = {
             let relative_pos = peak_idx as f32 / n as f32;
-            if relative_pos >= 0.25 && relative_pos <= 0.75 {
+            if relative_pos >= 0.2 && relative_pos <= 0.8 {
                 1.0
-            } else if relative_pos >= 0.15 && relative_pos <= 0.85 {
-                0.6
+            } else if relative_pos >= 0.1 && relative_pos <= 0.9 {
+                0.7
             } else {
-                0.2
+                0.4
             }
         };
 
-        // Score 2: Return to start
+        // Score based on return
         let return_score = {
             let end_pos = positions[n - 1];
             let return_distance = (end_pos - start_pos).abs();
-            if return_distance < 0.15 {
+            if return_distance < 0.20 {
                 1.0
-            } else if return_distance < 0.25 {
+            } else if return_distance < 0.35 {
                 0.7
-            } else if return_distance < 0.40 {
-                0.4
+            } else if return_distance < 0.50 {
+                0.5
             } else {
-                0.1
+                0.3
             }
         };
 
-        // Score 3: Movement magnitude
-        let magnitude_score = if peak_deviation >= 0.55 {
+        // Score based on magnitude
+        let magnitude_score = if max_excursion >= 0.55 {
             1.0
-        } else if peak_deviation >= 0.45 {
-            0.8
-        } else if peak_deviation >= 0.35 {
+        } else if max_excursion >= 0.45 {
+            0.9
+        } else if max_excursion >= 0.35 {
+            0.7
+        } else if max_excursion >= 0.25 {
             0.5
         } else {
-            0.2
+            0.3
         };
 
-        (peak_position_score * 0.3 + return_score * 0.4 + magnitude_score * 0.3)
+        (peak_position_score * 0.25 + return_score * 0.35 + magnitude_score * 0.40)
     }
 
     fn clear(&mut self) {
@@ -501,7 +507,6 @@ enum DetectionPath {
     MediumDeviation,
     GradualChange,
     LargeDeviation,
-    CumulativeDisplacement,
     VelocitySpike,
 }
 
@@ -528,38 +533,38 @@ impl ConfidenceCalculator {
             _ => 0.0,
         };
 
-        let base_confidence = offset_confidence * 0.40
-            + duration_confidence * 0.30
+        let base_confidence = offset_confidence * 0.45
+            + duration_confidence * 0.25
             + trajectory_confidence * 0.20
             + path_bonus
             + 0.05;
 
-        base_confidence.max(0.3).min(0.98)
+        base_confidence.max(0.4).min(0.98)
     }
 
     fn offset_to_confidence(max_offset: f32) -> f32 {
-        if max_offset >= 0.70 {
+        if max_offset >= 0.60 {
             0.95
-        } else if max_offset >= 0.60 {
-            0.85
         } else if max_offset >= 0.50 {
-            0.75
+            0.85
         } else if max_offset >= 0.40 {
+            0.75
+        } else if max_offset >= 0.30 {
             0.60
         } else {
-            0.40
+            0.45
         }
     }
 
     fn duration_to_confidence(duration_ms: f64) -> f32 {
-        if duration_ms >= 3000.0 && duration_ms <= 7000.0 {
+        if duration_ms >= 2000.0 && duration_ms <= 6000.0 {
             0.90
-        } else if duration_ms >= 2000.0 && duration_ms <= 9000.0 {
-            0.70
-        } else if duration_ms >= 1500.0 && duration_ms <= 12000.0 {
-            0.50
+        } else if duration_ms >= 1000.0 && duration_ms <= 8000.0 {
+            0.75
+        } else if duration_ms >= 500.0 && duration_ms <= 10000.0 {
+            0.55
         } else {
-            0.30
+            0.35
         }
     }
 }
@@ -961,7 +966,7 @@ impl LaneChangeStateMachine {
         Some(event)
     }
 
-    /// STRICT validation to prevent false positives
+    /// BALANCED validation - offset compensates for duration
     fn validate_lane_change(
         &self,
         duration: f64,
@@ -969,19 +974,21 @@ impl LaneChangeStateMachine {
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
         // ================================================================
-        // RULE 0: Baseline sanity check
-        // If baseline was too far from center, this might be a false detection
+        // RULE 0: Baseline sanity check (but not too strict)
         // ================================================================
-        if !self.adaptive_baseline.is_sane() {
+        if !self.adaptive_baseline.is_sane()
+            && self.max_offset_in_change < VERY_HIGH_OFFSET_THRESHOLD
+        {
             warn!(
-                "❌ Rejected: baseline was at {:.1}% (too far from center)",
-                self.adaptive_baseline.frozen_value * 100.0
+                "❌ Rejected: baseline at {:.1}% and offset only {:.1}%",
+                self.adaptive_baseline.frozen_value * 100.0,
+                self.max_offset_in_change * 100.0
             );
             return false;
         }
 
         // ================================================================
-        // RULE 1: Minimum offset required (strict)
+        // RULE 1: Minimum offset required
         // ================================================================
         if self.max_offset_in_change < LOW_OFFSET_THRESHOLD {
             warn!(
@@ -993,75 +1000,99 @@ impl LaneChangeStateMachine {
         }
 
         // ================================================================
-        // RULE 2: High offset = auto-valid (but still need minimum duration)
+        // RULE 2: Very high offset (>=55%) - minimal requirements
         // ================================================================
-        if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
-            if duration >= MIN_DURATION_FOR_VALIDATION {
+        if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
+            if duration >= MIN_DURATION_VERY_HIGH {
                 info!(
-                    "✅ Valid: high offset {:.1}% >= {:.1}% with dur={:.0}ms",
+                    "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
                     self.max_offset_in_change * 100.0,
-                    HIGH_OFFSET_THRESHOLD * 100.0,
                     duration
                 );
                 return true;
-            } else {
-                warn!(
-                    "❌ Rejected: high offset but short duration {:.0}ms < {:.0}ms",
-                    duration, MIN_DURATION_FOR_VALIDATION
-                );
-                return false;
             }
         }
 
         // ================================================================
-        // RULE 3: Medium offset needs good duration AND trajectory
+        // RULE 3: High offset (>=45%) - need reasonable duration
+        // ================================================================
+        if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
+            if duration >= MIN_DURATION_HIGH {
+                info!(
+                    "✅ Valid: high offset {:.1}% with dur={:.0}ms",
+                    self.max_offset_in_change * 100.0,
+                    duration
+                );
+                return true;
+            }
+            // High offset but short duration - check trajectory
+            if trajectory_analysis.is_valid_overtake || trajectory_analysis.shape_score >= 0.5 {
+                info!(
+                    "✅ Valid: high offset {:.1}%, short dur but good trajectory (score={:.2})",
+                    self.max_offset_in_change * 100.0,
+                    trajectory_analysis.shape_score
+                );
+                return true;
+            }
+        }
+
+        // ================================================================
+        // RULE 4: Medium offset (>=35%) - need duration OR trajectory
         // ================================================================
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
-            let has_good_duration = duration >= MIN_DURATION_FOR_VALIDATION;
-            let has_good_trajectory =
+            let has_duration = duration >= MIN_DURATION_MEDIUM;
+            let has_trajectory =
                 trajectory_analysis.is_valid_overtake || trajectory_analysis.shape_score >= 0.5;
+            let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-            if has_good_duration && has_good_trajectory {
+            if has_duration || has_trajectory || has_displacement {
                 info!(
-                    "✅ Valid: medium offset {:.1}%, dur={:.0}ms, traj_score={:.2}",
+                    "✅ Valid: medium offset {:.1}%, dur={} traj={} disp={}",
                     self.max_offset_in_change * 100.0,
-                    duration,
-                    trajectory_analysis.shape_score
+                    if has_duration { "✓" } else { "✗" },
+                    if has_trajectory { "✓" } else { "✗" },
+                    if has_displacement { "✓" } else { "✗" }
                 );
                 return true;
             } else {
                 warn!(
-                    "❌ Rejected: medium offset {:.1}%, dur={} (need >= {:.0}ms), traj={}",
+                    "❌ Rejected: medium offset {:.1}%, dur={:.0}ms, traj_score={:.2}, disp={:.1}%",
                     self.max_offset_in_change * 100.0,
-                    if has_good_duration { "✓" } else { "✗" },
-                    MIN_DURATION_FOR_VALIDATION,
-                    if has_good_trajectory { "✓" } else { "✗" }
+                    duration,
+                    trajectory_analysis.shape_score,
+                    net_displacement * 100.0
                 );
                 return false;
             }
         }
 
         // ================================================================
-        // RULE 4: Lower offset needs ALL conditions
+        // RULE 5: Lower offset (25-35%) - need multiple conditions
         // ================================================================
-        let has_duration = duration >= MIN_DURATION_STRICT;
-        let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
+        let has_duration = duration >= MIN_DURATION_LOW;
         let has_trajectory = trajectory_analysis.is_valid_overtake;
+        let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-        if has_duration && has_displacement && has_trajectory {
+        let conditions_met = [has_duration, has_trajectory, has_displacement]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+
+        if conditions_met >= 2 {
             info!(
-                "✅ Valid: offset={:.1}%, all conditions met",
-                self.max_offset_in_change * 100.0
+                "✅ Valid: lower offset {:.1}%, conditions met: {}/3",
+                self.max_offset_in_change * 100.0,
+                conditions_met
             );
             return true;
         }
 
         warn!(
-            "❌ Rejected: offset={:.1}%, dur={} net={} traj={} (need ALL)",
+            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need 2/3)",
             self.max_offset_in_change * 100.0,
             if has_duration { "✓" } else { "✗" },
-            if has_displacement { "✓" } else { "✗" },
-            if has_trajectory { "✓" } else { "✗" }
+            if has_trajectory { "✓" } else { "✗" },
+            if has_displacement { "✓" } else { "✗" }
         );
         false
     }
@@ -1151,15 +1182,14 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // IMPORTANT: Check baseline sanity before triggering
+                // Skip if baseline is way off (likely already in another lane)
                 if !self.adaptive_baseline.is_sane() {
-                    // Baseline is too far from center, don't trigger
                     return LaneChangeState::Centered;
                 }
 
-                // PATH 1: BOUNDARY CROSSING (most reliable)
+                // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
-                    if self.is_deviation_sustained(drift_threshold) {
+                    if self.is_deviation_sustained(drift_threshold * 0.9) {
                         self.change_detection_path = Some(DetectionPath::BoundaryCrossing);
                         info!(
                             "🚨 [BOUNDARY] {:?}, vel={:.1}px/s",
@@ -1169,8 +1199,8 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 2: HIGH VELOCITY + SIGNIFICANT DEVIATION
-                if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold + 0.05 {
+                // PATH 2: HIGH VELOCITY + DEVIATION
+                if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
                     if self.is_velocity_sustained(vel_medium) {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
                         info!(
@@ -1182,12 +1212,12 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 3: VELOCITY SPIKE (stricter threshold)
+                // PATH 3: VELOCITY SPIKE
                 if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD && deviation >= drift_threshold
                 {
                     if self.is_velocity_sustained(vel_fast) {
                         let position_change = self.get_recent_position_change();
-                        if position_change >= POSITION_CHANGE_THRESHOLD + 0.05 {
+                        if position_change >= POSITION_CHANGE_THRESHOLD {
                             self.change_detection_path = Some(DetectionPath::VelocitySpike);
                             info!(
                                 "🚨 [VELOCITY-SPIKE] vel={:.1}px/s, pos_change={:.1}%",
@@ -1199,9 +1229,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 4: MEDIUM SPEED + HIGH DEVIATION (stricter)
-                if deviation >= drift_threshold + 0.12 && lateral_velocity.abs() > vel_medium {
-                    if self.is_deviation_sustained(drift_threshold + 0.05) {
+                // PATH 4: MEDIUM SPEED + HIGH DEVIATION
+                if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
+                    if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
                         info!(
                             "🚨 [MEDIUM] dev={:.1}%, vel={:.1}px/s",
@@ -1212,9 +1242,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 5: GRADUAL CHANGE (stricter)
+                // PATH 5: GRADUAL CHANGE
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
-                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START + 0.05) {
+                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) {
                         self.change_detection_path = Some(DetectionPath::GradualChange);
                         info!(
                             "🚨 [GRADUAL] max={:.1}%, span={:.1}s",
@@ -1225,16 +1255,14 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 6: LARGE DEVIATION (stricter threshold)
+                // PATH 6: LARGE DEVIATION
                 if deviation >= DEVIATION_LANE_CENTER {
-                    if self.is_deviation_sustained(drift_threshold + 0.05) {
+                    if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::LargeDeviation);
                         info!("🚨 [LARGE] dev={:.1}%", deviation * 100.0);
                         return LaneChangeState::Drifting;
                     }
                 }
-
-                // REMOVED: TLC and CUMULATIVE paths (too unreliable)
 
                 LaneChangeState::Centered
             }
@@ -1248,8 +1276,7 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Crossing;
                 }
 
-                // Only complete from drifting if we have significant offset
-                if self.frames_in_state > 60 && self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD
+                if self.frames_in_state > 45 && self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD
                 {
                     if self.is_deviation_stable() {
                         info!(
@@ -1260,7 +1287,6 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // Cancel if max offset is too low
                 let cancel_threshold = drift_threshold * HYSTERESIS_EXIT;
                 if deviation < cancel_threshold && self.max_offset_in_change < LOW_OFFSET_THRESHOLD
                 {
@@ -1284,7 +1310,7 @@ impl LaneChangeStateMachine {
                 }
                 self.last_deviation = deviation;
 
-                if self.is_deviation_stable() && deviation < 0.35 {
+                if self.is_deviation_stable() && deviation < 0.40 {
                     return LaneChangeState::Completed;
                 }
 
@@ -1293,7 +1319,7 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Completed;
                 }
 
-                if self.stable_deviation_frames >= 30 && deviation < 0.45 {
+                if self.stable_deviation_frames >= 25 && deviation < 0.50 {
                     return LaneChangeState::Completed;
                 }
 
@@ -1308,7 +1334,7 @@ impl LaneChangeStateMachine {
                         .take(10)
                         .filter(|&&d| d != self.change_direction && d != Direction::Unknown)
                         .count();
-                    if reversal_count >= 7 {
+                    if reversal_count >= 6 {
                         return LaneChangeState::Completed;
                     }
                 }
@@ -1331,7 +1357,7 @@ impl LaneChangeStateMachine {
             .take(6)
             .filter(|o| (*o - baseline).abs() >= threshold)
             .count()
-            >= 5
+            >= 4
     }
 
     fn is_deviation_sustained_long(&self, threshold: f32) -> bool {
@@ -1345,7 +1371,7 @@ impl LaneChangeStateMachine {
             .take(15)
             .filter(|o| (*o - baseline).abs() >= threshold)
             .count()
-            >= 12
+            >= 10
     }
 
     fn is_velocity_sustained(&self, threshold: f32) -> bool {
@@ -1358,24 +1384,24 @@ impl LaneChangeStateMachine {
             .take(5)
             .filter(|v| v.abs() >= threshold)
             .count()
-            >= 4
+            >= 3
     }
 
     fn is_deviation_stable(&self) -> bool {
-        if self.recent_deviations.len() < 15 {
+        if self.recent_deviations.len() < 12 {
             return false;
         }
-        let recent = &self.recent_deviations[self.recent_deviations.len() - 15..];
+        let recent = &self.recent_deviations[self.recent_deviations.len() - 12..];
         let max = recent.iter().fold(f32::MIN, |a, &b| a.max(b));
         let min = recent.iter().fold(f32::MAX, |a, &b| a.min(b));
-        if max - min > 0.10 {
+        if max - min > 0.12 {
             return false;
         }
         recent
             .windows(2)
             .filter(|w| (w[1] - w[0]).abs() > 0.04)
             .count()
-            <= 3
+            <= 4
     }
 
     fn reset_lane_change(&mut self) {
