@@ -73,9 +73,9 @@ const LOW_OFFSET_THRESHOLD: f32 = 0.25; // 25% = strict validation
 
 // Duration thresholds - RELAXED
 const MIN_DURATION_VERY_HIGH: f64 = 800.0; // 0.8s for very high offset
-const MIN_DURATION_HIGH: f64 = 1200.0; // 1.2s for high offset
-const MIN_DURATION_MEDIUM: f64 = 2000.0; // 2.0s for medium offset
-const MIN_DURATION_LOW: f64 = 3000.0; // 3.0s for low offset
+const MIN_DURATION_HIGH: f64 = 1000.0; // 1.2s for high offset
+const MIN_DURATION_MEDIUM: f64 = 1500.0; // 2.0s for medium offset
+const MIN_DURATION_LOW: f64 = 2500.0; // 3.0s for low offset
 
 const MIN_NET_DISPLACEMENT: f32 = 0.15;
 
@@ -974,7 +974,21 @@ impl LaneChangeStateMachine {
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
         // ================================================================
-        // RULE 0: Baseline sanity check (but not too strict)
+        // RULE 0: ABSOLUTE MINIMUM DURATION (safety net)
+        // No lane change can be less than 800ms regardless of offset
+        // ================================================================
+        const ABSOLUTE_MIN_DURATION: f64 = 800.0;
+
+        if duration < ABSOLUTE_MIN_DURATION {
+            warn!(
+                "❌ Rejected: duration {:.0}ms < {:.0}ms absolute minimum",
+                duration, ABSOLUTE_MIN_DURATION
+            );
+            return false;
+        }
+
+        // ================================================================
+        // RULE 1: Baseline sanity check
         // ================================================================
         if !self.adaptive_baseline.is_sane()
             && self.max_offset_in_change < VERY_HIGH_OFFSET_THRESHOLD
@@ -988,7 +1002,7 @@ impl LaneChangeStateMachine {
         }
 
         // ================================================================
-        // RULE 1: Minimum offset required
+        // RULE 2: Minimum offset required
         // ================================================================
         if self.max_offset_in_change < LOW_OFFSET_THRESHOLD {
             warn!(
@@ -1000,21 +1014,19 @@ impl LaneChangeStateMachine {
         }
 
         // ================================================================
-        // RULE 2: Very high offset (>=55%) - minimal requirements
+        // RULE 3: Very high offset (>=55%) - need minimum duration only
         // ================================================================
         if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
-            if duration >= MIN_DURATION_VERY_HIGH {
-                info!(
-                    "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
-                    self.max_offset_in_change * 100.0,
-                    duration
-                );
-                return true;
-            }
+            info!(
+                "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
+                self.max_offset_in_change * 100.0,
+                duration
+            );
+            return true;
         }
 
         // ================================================================
-        // RULE 3: High offset (>=45%) - need reasonable duration
+        // RULE 4: High offset (>=45%) - need reasonable duration
         // ================================================================
         if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
             if duration >= MIN_DURATION_HIGH {
@@ -1025,70 +1037,72 @@ impl LaneChangeStateMachine {
                 );
                 return true;
             }
-            // High offset but short duration - check trajectory
-            if trajectory_analysis.is_valid_overtake || trajectory_analysis.shape_score >= 0.5 {
+            // High offset but short duration - need good trajectory
+            if trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.6 {
                 info!(
-                    "✅ Valid: high offset {:.1}%, short dur but good trajectory (score={:.2})",
-                    self.max_offset_in_change * 100.0,
-                    trajectory_analysis.shape_score
-                );
+                "✅ Valid: high offset {:.1}%, short dur but excellent trajectory (score={:.2})",
+                self.max_offset_in_change * 100.0,
+                trajectory_analysis.shape_score
+            );
                 return true;
             }
+            warn!(
+                "❌ Rejected: high offset {:.1}% but dur={:.0}ms < {:.0}ms and traj_score={:.2}",
+                self.max_offset_in_change * 100.0,
+                duration,
+                MIN_DURATION_HIGH,
+                trajectory_analysis.shape_score
+            );
+            return false;
         }
 
         // ================================================================
-        // RULE 4: Medium offset (>=35%) - need duration OR trajectory
+        // RULE 5: Medium offset (>=35%) - need duration AND (trajectory OR displacement)
         // ================================================================
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
             let has_duration = duration >= MIN_DURATION_MEDIUM;
             let has_trajectory =
-                trajectory_analysis.is_valid_overtake || trajectory_analysis.shape_score >= 0.5;
+                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.5;
             let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-            if has_duration || has_trajectory || has_displacement {
+            // Must have duration, plus at least one other condition
+            if has_duration && (has_trajectory || has_displacement) {
                 info!(
-                    "✅ Valid: medium offset {:.1}%, dur={} traj={} disp={}",
+                    "✅ Valid: medium offset {:.1}%, dur=✓ + traj={} disp={}",
                     self.max_offset_in_change * 100.0,
-                    if has_duration { "✓" } else { "✗" },
                     if has_trajectory { "✓" } else { "✗" },
                     if has_displacement { "✓" } else { "✗" }
                 );
                 return true;
-            } else {
-                warn!(
-                    "❌ Rejected: medium offset {:.1}%, dur={:.0}ms, traj_score={:.2}, disp={:.1}%",
-                    self.max_offset_in_change * 100.0,
-                    duration,
-                    trajectory_analysis.shape_score,
-                    net_displacement * 100.0
-                );
-                return false;
             }
+
+            warn!(
+                "❌ Rejected: medium offset {:.1}%, dur={} (need ✓) + traj={} disp={}",
+                self.max_offset_in_change * 100.0,
+                if has_duration { "✓" } else { "✗" },
+                if has_trajectory { "✓" } else { "✗" },
+                if has_displacement { "✓" } else { "✗" }
+            );
+            return false;
         }
 
         // ================================================================
-        // RULE 5: Lower offset (25-35%) - need multiple conditions
+        // RULE 6: Lower offset (25-35%) - need ALL conditions
         // ================================================================
         let has_duration = duration >= MIN_DURATION_LOW;
         let has_trajectory = trajectory_analysis.is_valid_overtake;
         let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-        let conditions_met = [has_duration, has_trajectory, has_displacement]
-            .iter()
-            .filter(|&&x| x)
-            .count();
-
-        if conditions_met >= 2 {
+        if has_duration && has_trajectory && has_displacement {
             info!(
-                "✅ Valid: lower offset {:.1}%, conditions met: {}/3",
-                self.max_offset_in_change * 100.0,
-                conditions_met
+                "✅ Valid: lower offset {:.1}%, all conditions met",
+                self.max_offset_in_change * 100.0
             );
             return true;
         }
 
         warn!(
-            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need 2/3)",
+            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need ALL)",
             self.max_offset_in_change * 100.0,
             if has_duration { "✓" } else { "✗" },
             if has_trajectory { "✓" } else { "✗" },
