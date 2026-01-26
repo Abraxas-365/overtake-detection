@@ -1,11 +1,11 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v2.6 - STRICTER VALIDATION
+// LANE CHANGE DETECTION v2.7 - STRICTER DURATION VALIDATION
 //
 // Validation Logic (at completion):
-// - Very high max offset (>=55%): Always valid (definitely crossed lane)
-// - High max offset (45-55%): Valid only if duration >= 2.5s
-// - Medium max offset (35-45%): Valid only if duration >= 2.5s AND net >= 25%
+// - Very high max offset (>=65%): Always valid (definitely crossed lane)
+// - High max offset (55-65%): Valid only if duration >= 3.0s
+// - Medium max offset (35-55%): Valid only if duration >= 3.0s AND net >= 25%
 // - Low max offset (<35%): Always rejected
 //
 
@@ -56,12 +56,11 @@ const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 // ============================================================================
 // VALIDATION THRESHOLDS - STRICTER TO REDUCE FALSE POSITIVES
 // ============================================================================
-//
-const HIGH_OFFSET_THRESHOLD: f32 = 0.65; // 65% = definitivamente cruzó
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.55; // 55% = probablemente cruzó
-const LOW_OFFSET_THRESHOLD: f32 = 0.35; // Below this = likely just drift
-const MIN_NET_DISPLACEMENT: f32 = 0.25; // For medium offset validation
-const MIN_DURATION_FOR_VALIDATION: f64 = 2500.0; // 2.5 seconds minimum for non-obvious cases
+const HIGH_OFFSET_THRESHOLD: f32 = 0.65; // 65% = definitely crossed lane (auto-valid)
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.55; // 55-65% = need duration >= 3s
+const LOW_OFFSET_THRESHOLD: f32 = 0.35; // 35-55% = need duration AND net displacement
+const MIN_NET_DISPLACEMENT: f32 = 0.25; // 25% net displacement required for medium offset
+const MIN_DURATION_FOR_VALIDATION: f64 = 3000.0; // 3.0 seconds minimum (was 2.5s)
 
 // ============================================================================
 // KALMAN FILTER
@@ -633,7 +632,7 @@ impl LaneChangeStateMachine {
     /// Validates if this is a real lane change based on offset and duration
     /// Returns true if valid, false if should be rejected
     fn validate_lane_change(&self, duration: f64, net_displacement: f32) -> bool {
-        // CASE 1: Very high offset (>=55%) = definitely crossed to opposite lane
+        // CASE 1: Very high offset (>=65%) = definitely crossed to opposite lane
         // Auto-accept regardless of duration
         if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
             info!(
@@ -644,8 +643,8 @@ impl LaneChangeStateMachine {
             return true;
         }
 
-        // CASE 2: High offset (45-55%) = probably crossed lane
-        // Require minimum duration to confirm
+        // CASE 2: High offset (55-65%) = probably crossed lane
+        // Require minimum duration of 3 seconds to confirm
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
             if duration >= MIN_DURATION_FOR_VALIDATION {
                 info!(
@@ -658,7 +657,7 @@ impl LaneChangeStateMachine {
                 return true;
             } else {
                 warn!(
-                    "❌ Rejected: max={:.1}% but dur={:.0}ms < {:.0}ms (too short for this offset)",
+                    "❌ Rejected: max={:.1}% but dur={:.0}ms < {:.0}ms (too short)",
                     self.max_offset_in_change * 100.0,
                     duration,
                     MIN_DURATION_FOR_VALIDATION
@@ -667,8 +666,8 @@ impl LaneChangeStateMachine {
             }
         }
 
-        // CASE 3: Medium offset (35-45%) = might be lane change or just drift
-        // Require BOTH duration AND net displacement
+        // CASE 3: Medium offset (35-55%) = might be lane change or just drift
+        // Require BOTH duration >= 3s AND net displacement >= 25%
         if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
             if duration >= MIN_DURATION_FOR_VALIDATION && net_displacement >= MIN_NET_DISPLACEMENT {
                 info!(
@@ -1288,9 +1287,9 @@ impl LaneChangeStateMachine {
 
         // Good duration = higher confidence
         if let Some(dur) = duration_ms {
-            if dur >= 2500.0 && dur < 8000.0 {
+            if dur >= 3000.0 && dur < 8000.0 {
                 confidence += 0.15;
-            } else if dur >= 1500.0 && dur < 10000.0 {
+            } else if dur >= 2000.0 && dur < 10000.0 {
                 confidence += 0.10;
             } else {
                 confidence += 0.05;
