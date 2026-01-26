@@ -290,12 +290,18 @@ impl FallbackLaneChangeDetector {
         width: usize,
         height: usize,
     ) -> Result<Mat, opencv::Error> {
-        // Create Mat from slice - opencv-rust 0.91.x API
-        let rgb_mat = Mat::new_size_with_data(
-            core::Size::new(width as i32, height as i32),
-            core::CV_8UC3,
-            frame_rgb, // Just pass the slice directly!
-        )?;
+        use std::ffi::c_void;
+
+        // Create Mat from RGB data using unsafe constructor
+        let rgb_mat = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                height as i32,
+                width as i32,
+                core::CV_8UC3, // 8-bit, 3 channels (RGB)
+                frame_rgb.as_ptr() as *mut c_void,
+                core::Mat_AUTO_STEP,
+            )?
+        };
 
         // Convert to grayscale
         let mut gray_mat = Mat::default();
@@ -303,7 +309,6 @@ impl FallbackLaneChangeDetector {
 
         Ok(gray_mat)
     }
-
     /// Extract average horizontal flow component from road region
     fn extract_horizontal_flow(&self, flow: &Mat, start_y: i32, end_y: i32) -> f32 {
         let mut total_horizontal_flow = 0.0f32;
