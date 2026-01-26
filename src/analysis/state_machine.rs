@@ -2,7 +2,7 @@
 //
 // LANE CHANGE DETECTION v2.5 - OVERTAKE & FALSE POSITIVE HANDLING
 //
-// Validation Logic:
+// Validation Logic (at completion):
 // - High max offset (>=45%): Always valid (crossed to opposite lane)
 // - Medium max offset (35-45%): Valid if net displacement >=20% OR duration >=2s
 // - Low max offset (<35%): Valid only if net displacement >=25%
@@ -52,15 +52,12 @@ const MAX_DRIFTING_MS: f64 = 8000.0;
 const VELOCITY_SPIKE_THRESHOLD: f32 = 180.0;
 const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
-// VALIDATION THRESHOLDS
-const HIGH_OFFSET_THRESHOLD: f32 = 0.45; // Definitely crossed lane
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35; // Probably crossed lane
-const MIN_NET_DISPLACEMENT: f32 = 0.25; // For low offset cases
-const MIN_NET_DISPLACEMENT_MEDIUM: f32 = 0.20; // For medium offset cases
-const MIN_DURATION_FOR_MEDIUM: f64 = 2000.0; // 2 seconds
-
-// Baseline stability
-const MIN_STABLE_FRAMES_BEFORE_FREEZE: u32 = 15;
+// VALIDATION THRESHOLDS (used at completion)
+const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
+const MIN_NET_DISPLACEMENT: f32 = 0.25;
+const MIN_NET_DISPLACEMENT_MEDIUM: f32 = 0.20;
+const MIN_DURATION_FOR_MEDIUM: f64 = 2000.0;
 
 // ============================================================================
 // KALMAN FILTER
@@ -137,10 +134,6 @@ impl AdaptiveBaseline {
             is_frozen: false,
             frozen_value: 0.0,
         }
-    }
-
-    fn is_stable_enough(&self) -> bool {
-        self.stable_frames >= MIN_STABLE_FRAMES_BEFORE_FREEZE && self.is_valid
     }
 
     fn freeze(&mut self) {
@@ -288,7 +281,6 @@ pub struct LaneChangeStateMachine {
     change_detection_path: Option<DetectionPath>,
     max_offset_in_change: f32,
 
-    // Track initial position when baseline freezes
     initial_position_frozen: Option<f32>,
 
     cooldown_remaining: u32,
@@ -553,7 +545,6 @@ impl LaneChangeStateMachine {
             lateral_velocity,
             current_direction,
             &window_metrics,
-            normalized_offset,
         );
 
         debug!(
@@ -703,7 +694,6 @@ impl LaneChangeStateMachine {
         lateral_velocity: f32,
         current_direction: Direction,
         metrics: &WindowMetrics,
-        _normalized_offset: f32,
     ) -> LaneChangeState {
         let drift_threshold = self.config.drift_threshold * self.curve_compensation_factor;
         let crossing_threshold = self.config.crossing_threshold * self.curve_compensation_factor;
@@ -713,12 +703,9 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // Check if baseline is stable enough before allowing transitions
-                let can_freeze = self.adaptive_baseline.is_stable_enough();
-
                 // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
-                    if self.is_deviation_sustained(drift_threshold * 0.9) && can_freeze {
+                    if self.is_deviation_sustained(drift_threshold * 0.9) {
                         self.change_detection_path = Some(DetectionPath::BoundaryCrossing);
                         info!(
                             "🚨 [BOUNDARY] {:?}, vel={:.1}px/s",
@@ -730,7 +717,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 2: HIGH VELOCITY + DEVIATION
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
-                    if self.is_velocity_sustained(vel_medium) && can_freeze {
+                    if self.is_velocity_sustained(vel_medium) {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
                         info!(
                             "🚨 [HIGH-VEL] vel={:.1}px/s, dev={:.1}%",
@@ -743,7 +730,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 8: VELOCITY SPIKE
                 if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD {
-                    if self.is_velocity_sustained(vel_fast) && can_freeze {
+                    if self.is_velocity_sustained(vel_fast) {
                         let position_change = self.get_recent_position_change();
                         if position_change >= POSITION_CHANGE_THRESHOLD {
                             self.change_detection_path = Some(DetectionPath::VelocitySpike);
@@ -763,7 +750,6 @@ impl LaneChangeStateMachine {
                     if tlc < TLC_WARNING_THRESHOLD
                         && deviation >= drift_threshold
                         && metrics.is_sustained_movement
-                        && can_freeze
                     {
                         self.change_detection_path = Some(DetectionPath::TLCBased);
                         info!("🚨 [TLC] TLC={:.2}s, dev={:.1}%", tlc, deviation * 100.0);
@@ -773,7 +759,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 4: MEDIUM SPEED + HIGH DEVIATION
                 if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
-                    if self.is_deviation_sustained(drift_threshold) && can_freeze {
+                    if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
                         info!(
                             "🚨 [MEDIUM] dev={:.1}%, vel={:.1}px/s",
@@ -786,7 +772,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 5: GRADUAL CHANGE
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
-                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) && can_freeze {
+                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) {
                         self.change_detection_path = Some(DetectionPath::GradualChange);
                         info!(
                             "🚨 [GRADUAL] max={:.1}%, span={:.1}s",
@@ -799,7 +785,7 @@ impl LaneChangeStateMachine {
 
                 // PATH 6: LARGE DEVIATION
                 if deviation >= DEVIATION_LANE_CENTER {
-                    if self.is_deviation_sustained(drift_threshold) && can_freeze {
+                    if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::LargeDeviation);
                         info!("🚨 [LARGE] dev={:.1}%", deviation * 100.0);
                         return LaneChangeState::Drifting;
@@ -811,7 +797,6 @@ impl LaneChangeStateMachine {
                     && metrics.direction_consistency >= DIRECTION_CONSISTENCY_THRESHOLD
                     && metrics.time_span_ms >= 2500.0
                     && !self.is_in_curve
-                    && can_freeze
                 {
                     self.change_detection_path = Some(DetectionPath::CumulativeDisplacement);
                     info!(
@@ -1126,7 +1111,6 @@ impl LaneChangeStateMachine {
             //
             let is_valid = {
                 // CASE 1: HIGH offset = crossed to opposite lane (overtake)
-                // Always valid, even if vehicle returns to original position
                 if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
                     info!(
                         "✅ Valid overtake: max offset {:.1}% >= {:.1}% (crossed lane)",
@@ -1135,7 +1119,7 @@ impl LaneChangeStateMachine {
                     );
                     true
                 }
-                // CASE 2: MEDIUM offset = might be lane change, check other factors
+                // CASE 2: MEDIUM offset = might be lane change
                 else if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
                     if let Some(initial_pos) = self.initial_position_frozen {
                         let net_displacement = (final_position - initial_pos).abs();
@@ -1159,17 +1143,14 @@ impl LaneChangeStateMachine {
                                 true
                             } else {
                                 warn!(
-                                    "❌ Rejected: medium offset {:.1}% but short dur={:.0}ms < {:.0}ms and low net={:.1}% < {:.1}%",
+                                    "❌ Rejected: medium offset {:.1}% but short dur={:.0}ms and low net={:.1}%",
                                     self.max_offset_in_change * 100.0,
                                     dur,
-                                    MIN_DURATION_FOR_MEDIUM,
-                                    net_displacement * 100.0,
-                                    MIN_NET_DISPLACEMENT_MEDIUM * 100.0
+                                    net_displacement * 100.0
                                 );
                                 false
                             }
                         } else {
-                            // No duration info available, accept based on offset
                             info!(
                                 "✅ Valid: medium offset {:.1}% (no duration info)",
                                 self.max_offset_in_change * 100.0
@@ -1177,7 +1158,6 @@ impl LaneChangeStateMachine {
                             true
                         }
                     } else {
-                        // No initial position tracked, accept based on offset
                         info!(
                             "✅ Valid: medium offset {:.1}% (no initial position)",
                             self.max_offset_in_change * 100.0
@@ -1185,7 +1165,7 @@ impl LaneChangeStateMachine {
                         true
                     }
                 }
-                // CASE 3: LOW offset = likely just drift, require significant net displacement
+                // CASE 3: LOW offset = likely drift, require significant net displacement
                 else {
                     if let Some(initial_pos) = self.initial_position_frozen {
                         let net_displacement = (final_position - initial_pos).abs();
@@ -1200,16 +1180,13 @@ impl LaneChangeStateMachine {
                             true
                         } else {
                             warn!(
-                                "❌ Rejected: low offset {:.1}% < {:.1}% AND low net {:.1}% < {:.1}%",
+                                "❌ Rejected: low offset {:.1}% AND low net {:.1}%",
                                 self.max_offset_in_change * 100.0,
-                                MEDIUM_OFFSET_THRESHOLD * 100.0,
-                                net_displacement * 100.0,
-                                MIN_NET_DISPLACEMENT * 100.0
+                                net_displacement * 100.0
                             );
                             false
                         }
                     } else {
-                        // No initial position, use offset threshold
                         if self.max_offset_in_change >= 0.30 {
                             info!(
                                 "✅ Valid: offset {:.1}% >= 30% (no initial position)",
@@ -1218,7 +1195,7 @@ impl LaneChangeStateMachine {
                             true
                         } else {
                             warn!(
-                                "❌ Rejected: low offset {:.1}% < 30% (no initial position)",
+                                "❌ Rejected: low offset {:.1}% (no initial position)",
                                 self.max_offset_in_change * 100.0
                             );
                             false
@@ -1250,7 +1227,7 @@ impl LaneChangeStateMachine {
             event.duration_ms = duration_ms;
             event.source_id = self.source_id.clone();
 
-            // Add metadata about the validation
+            // Add metadata
             event.metadata.insert(
                 "max_offset_normalized".to_string(),
                 serde_json::json!(self.max_offset_in_change),
@@ -1295,7 +1272,6 @@ impl LaneChangeStateMachine {
     fn calculate_confidence(&self, duration_ms: Option<f64>) -> f32 {
         let mut confidence: f32 = 0.5;
 
-        // Higher max offset = higher confidence
         if self.max_offset_in_change > 0.60 {
             confidence += 0.25;
         } else if self.max_offset_in_change > 0.50 {
@@ -1306,7 +1282,6 @@ impl LaneChangeStateMachine {
             confidence += 0.05;
         }
 
-        // Good duration = higher confidence
         if let Some(dur) = duration_ms {
             if dur > 1000.0 && dur < 6000.0 {
                 confidence += 0.15;
@@ -1317,7 +1292,6 @@ impl LaneChangeStateMachine {
             }
         }
 
-        // Detection path bonus
         if let Some(path) = &self.change_detection_path {
             match path {
                 DetectionPath::BoundaryCrossing | DetectionPath::TLCBased => confidence += 0.05,
