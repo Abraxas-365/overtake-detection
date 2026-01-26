@@ -120,43 +120,23 @@ impl FallbackLaneChangeDetector {
     }
 
     /// Check if primary lane detection position is stuck
+    ///
     pub fn is_position_stuck(&mut self, current_position: f32) -> bool {
         self.last_positions.push_back(current_position);
         if self.last_positions.len() > 60 {
             self.last_positions.pop_front();
         }
 
-        if self.last_positions.len() < 30 {
-            return false;
+        // Store last valid position for jump detection
+        if self.last_positions.len() >= 30 {
+            let recent: Vec<f32> = self.last_positions.iter().rev().take(30).copied().collect();
+            let mean: f32 = recent.iter().sum::<f32>() / recent.len() as f32;
+            self.last_valid_position = Some(mean);
         }
 
-        // Calculate variance of last 30 positions
-        let recent: Vec<f32> = self.last_positions.iter().rev().take(30).copied().collect();
-        let mean: f32 = recent.iter().sum::<f32>() / recent.len() as f32;
-        let variance: f32 =
-            recent.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / recent.len() as f32;
-
-        // Position is stuck if variance is extremely small
-        let is_stuck = variance < POSITION_STUCK_VARIANCE_THRESHOLD;
-
-        if is_stuck {
-            self.stuck_frames += 1;
-            if self.stuck_frames == POSITION_STUCK_MIN_FRAMES {
-                warn!(
-                    "⚠️  Position STUCK detected: variance={:.6}, mean={:.2}%",
-                    variance,
-                    mean * 100.0
-                );
-                self.last_valid_position = Some(mean);
-            }
-        } else {
-            if self.stuck_frames > 0 {
-                self.stuck_frames = 0;
-            }
-        }
-
-        // Activate fallback if stuck for threshold frames
-        self.stuck_frames >= POSITION_STUCK_MIN_FRAMES
+        // DISABLED: Too sensitive, triggers on normal driving
+        // Only return true if you want to manually enable fallback
+        false
     }
 
     /// Calculate lateral movement using dense optical flow
