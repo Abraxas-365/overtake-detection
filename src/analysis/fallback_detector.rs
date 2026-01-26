@@ -290,20 +290,18 @@ impl FallbackLaneChangeDetector {
         width: usize,
         height: usize,
     ) -> Result<Mat, opencv::Error> {
-        // Create Mat from RGB data
-        let rgb_mat = unsafe {
-            Mat::new_rows_cols_with_data(
-                height as i32,
-                width as i32,
-                core::CV_8UC3,
-                frame_rgb.as_ptr() as *mut core::c_void,
-                core::Mat_AUTO_STEP,
-            )?
-        };
+        use opencv::core::Vector;
+
+        // Create Mat from RGB data - CORRECTED API
+        let rgb_vec: Vector<u8> = Vector::from_slice(frame_rgb);
+        let rgb_mat = Mat::from_slice_rows_cols(&rgb_vec, height as i32, width as i32)?;
+
+        // Reshape to 3 channels
+        let rgb_mat_3ch = rgb_mat.reshape(3, height as i32)?;
 
         // Convert to grayscale
         let mut gray_mat = Mat::default();
-        imgproc::cvt_color(&rgb_mat, &mut gray_mat, imgproc::COLOR_RGB2GRAY, 0)?;
+        imgproc::cvt_color(&rgb_mat_3ch, &mut gray_mat, imgproc::COLOR_RGB2GRAY, 0)?;
 
         Ok(gray_mat)
     }
@@ -389,5 +387,8 @@ impl FallbackLaneChangeDetector {
 
     pub fn get_last_valid_position(&self) -> Option<f32> {
         self.last_valid_position
+    }
+    pub fn get_fallback_start_frame(&self) -> Option<u64> {
+        self.fallback_start_frame
     }
 }

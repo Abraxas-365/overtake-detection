@@ -99,13 +99,13 @@ impl LaneChangeAnalyzer {
                 // Create event from fallback
                 let start_frame = self
                     .fallback_detector
-                    .fallback_start_frame
+                    .get_fallback_start_frame()
                     .unwrap_or(frame_id);
                 let event = fallback_detection.to_event(
                     timestamp_ms,
                     start_frame,
                     frame_id,
-                    self.state_machine.source_id.clone(),
+                    self.state_machine.get_source_id().to_string(),
                 );
 
                 self.was_stuck_last_frame = true;
@@ -131,8 +131,9 @@ impl LaneChangeAnalyzer {
                             timestamp_ms,
                             frame_id.saturating_sub(5),
                             frame_id,
-                            self.state_machine.source_id.clone(),
+                            self.state_machine.get_source_id().to_string(),
                         );
+
                         self.was_stuck_last_frame = false;
                         return Some(event);
                     }

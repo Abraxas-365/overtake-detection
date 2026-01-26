@@ -1684,4 +1684,8 @@ impl LaneChangeStateMachine {
     pub fn set_source_id(&mut self, source_id: String) {
         self.source_id = source_id;
     }
+
+    pub fn get_source_id(&self) -> &str {
+        &self.source_id
+    }
 }
