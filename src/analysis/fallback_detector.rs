@@ -290,15 +290,12 @@ impl FallbackLaneChangeDetector {
         width: usize,
         height: usize,
     ) -> Result<Mat, opencv::Error> {
-        // Create a Mat directly from the RGB buffer (unsafe but necessary for performance)
-        let rgb_mat = unsafe {
-            Mat::new_size_with_data(
-                core::Size::new(width as i32, height as i32),
-                core::CV_8UC3,
-                frame_rgb.as_ptr() as *mut std::ffi::c_void,
-                core::Mat_AUTO_STEP,
-            )?
-        };
+        // Create Mat from slice - opencv-rust 0.91.x API
+        let rgb_mat = Mat::new_size_with_data(
+            core::Size::new(width as i32, height as i32),
+            core::CV_8UC3,
+            frame_rgb, // Just pass the slice directly!
+        )?;
 
         // Convert to grayscale
         let mut gray_mat = Mat::default();
