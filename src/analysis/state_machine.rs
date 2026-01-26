@@ -1,11 +1,12 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v2.5 - OVERTAKE & FALSE POSITIVE HANDLING
+// LANE CHANGE DETECTION v2.6 - STRICTER VALIDATION
 //
 // Validation Logic (at completion):
-// - High max offset (>=45%): Always valid (crossed to opposite lane)
-// - Medium max offset (35-45%): Valid if net displacement >=20% OR duration >=2s
-// - Low max offset (<35%): Valid only if net displacement >=25%
+// - Very high max offset (>=55%): Always valid (definitely crossed lane)
+// - High max offset (45-55%): Valid only if duration >= 2.5s
+// - Medium max offset (35-45%): Valid only if duration >= 2.5s AND net >= 25%
+// - Low max offset (<35%): Always rejected
 //
 
 use super::boundary_detector::CrossingType;
@@ -52,12 +53,14 @@ const MAX_DRIFTING_MS: f64 = 8000.0;
 const VELOCITY_SPIKE_THRESHOLD: f32 = 180.0;
 const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
-// VALIDATION THRESHOLDS (used at completion)
-const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
-const MIN_NET_DISPLACEMENT: f32 = 0.25;
-const MIN_NET_DISPLACEMENT_MEDIUM: f32 = 0.20;
-const MIN_DURATION_FOR_MEDIUM: f64 = 2000.0;
+// ============================================================================
+// VALIDATION THRESHOLDS - STRICTER TO REDUCE FALSE POSITIVES
+// ============================================================================
+const HIGH_OFFSET_THRESHOLD: f32 = 0.55; // Was 0.45 - definitely crossed to opposite lane
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.45; // Was 0.35 - probably crossed lane
+const LOW_OFFSET_THRESHOLD: f32 = 0.35; // Below this = likely just drift
+const MIN_NET_DISPLACEMENT: f32 = 0.25; // For medium offset validation
+const MIN_DURATION_FOR_VALIDATION: f64 = 2500.0; // 2.5 seconds minimum for non-obvious cases
 
 // ============================================================================
 // KALMAN FILTER
@@ -577,6 +580,22 @@ impl LaneChangeStateMachine {
         let start_frame = self.change_start_frame.unwrap_or(frame_id);
         let start_time = self.change_start_time.unwrap_or(timestamp_ms);
         let duration_ms = Some(timestamp_ms - start_time);
+
+        // Apply same validation as normal completion
+        let duration = duration_ms.unwrap_or(0.0);
+
+        if !self.validate_lane_change(duration, 0.0) {
+            warn!(
+                "⏰ Force complete rejected: max={:.1}%, dur={:.0}ms",
+                self.max_offset_in_change * 100.0,
+                duration
+            );
+            self.adaptive_baseline.unfreeze();
+            self.reset_lane_change();
+            self.cooldown_remaining = 60;
+            return None;
+        }
+
         let confidence = self.calculate_confidence(duration_ms);
 
         let mut event = LaneChangeEvent::new(
@@ -608,6 +627,78 @@ impl LaneChangeStateMachine {
         self.reset_lane_change();
 
         Some(event)
+    }
+
+    /// Validates if this is a real lane change based on offset and duration
+    /// Returns true if valid, false if should be rejected
+    fn validate_lane_change(&self, duration: f64, net_displacement: f32) -> bool {
+        // CASE 1: Very high offset (>=55%) = definitely crossed to opposite lane
+        // Auto-accept regardless of duration
+        if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
+            info!(
+                "✅ Valid: max offset {:.1}% >= {:.1}% (definitely crossed lane)",
+                self.max_offset_in_change * 100.0,
+                HIGH_OFFSET_THRESHOLD * 100.0
+            );
+            return true;
+        }
+
+        // CASE 2: High offset (45-55%) = probably crossed lane
+        // Require minimum duration to confirm
+        if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+            if duration >= MIN_DURATION_FOR_VALIDATION {
+                info!(
+                    "✅ Valid: max={:.1}% >= {:.1}% AND dur={:.0}ms >= {:.0}ms",
+                    self.max_offset_in_change * 100.0,
+                    MEDIUM_OFFSET_THRESHOLD * 100.0,
+                    duration,
+                    MIN_DURATION_FOR_VALIDATION
+                );
+                return true;
+            } else {
+                warn!(
+                    "❌ Rejected: max={:.1}% but dur={:.0}ms < {:.0}ms (too short for this offset)",
+                    self.max_offset_in_change * 100.0,
+                    duration,
+                    MIN_DURATION_FOR_VALIDATION
+                );
+                return false;
+            }
+        }
+
+        // CASE 3: Medium offset (35-45%) = might be lane change or just drift
+        // Require BOTH duration AND net displacement
+        if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
+            if duration >= MIN_DURATION_FOR_VALIDATION && net_displacement >= MIN_NET_DISPLACEMENT {
+                info!(
+                    "✅ Valid: max={:.1}%, dur={:.0}ms >= {:.0}ms, net={:.1}% >= {:.1}%",
+                    self.max_offset_in_change * 100.0,
+                    duration,
+                    MIN_DURATION_FOR_VALIDATION,
+                    net_displacement * 100.0,
+                    MIN_NET_DISPLACEMENT * 100.0
+                );
+                return true;
+            } else {
+                warn!(
+                    "❌ Rejected: max={:.1}%, dur={:.0}ms, net={:.1}% (need dur >= {:.0}ms AND net >= {:.1}%)",
+                    self.max_offset_in_change * 100.0,
+                    duration,
+                    net_displacement * 100.0,
+                    MIN_DURATION_FOR_VALIDATION,
+                    MIN_NET_DISPLACEMENT * 100.0
+                );
+                return false;
+            }
+        }
+
+        // CASE 4: Low offset (<35%) = almost certainly just drift
+        warn!(
+            "❌ Rejected: low max offset {:.1}% < {:.1}%",
+            self.max_offset_in_change * 100.0,
+            LOW_OFFSET_THRESHOLD * 100.0
+        );
+        false
     }
 
     fn get_recent_position_change(&self) -> f32 {
@@ -1101,110 +1192,19 @@ impl LaneChangeStateMachine {
 
         if target_state == LaneChangeState::Completed {
             // ================================================================
-            // VALIDATION: Determine if this is a real lane change or overtake
+            // VALIDATION: Stricter checks to reduce false positives
             // ================================================================
-            //
-            // Logic:
-            // - HIGH max offset (>=45%): ALWAYS valid (crossed to opposite lane / overtake)
-            // - MEDIUM max offset (35-45%): Valid if net displacement >=20% OR duration >=2s
-            // - LOW max offset (<35%): Valid only if net displacement >=25%
-            //
-            let is_valid = {
-                // CASE 1: HIGH offset = crossed to opposite lane (overtake)
-                if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
-                    info!(
-                        "✅ Valid overtake: max offset {:.1}% >= {:.1}% (crossed lane)",
-                        self.max_offset_in_change * 100.0,
-                        HIGH_OFFSET_THRESHOLD * 100.0
-                    );
-                    true
-                }
-                // CASE 2: MEDIUM offset = might be lane change
-                else if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
-                    if let Some(initial_pos) = self.initial_position_frozen {
-                        let net_displacement = (final_position - initial_pos).abs();
+            let duration = duration_ms.unwrap_or(0.0);
 
-                        if net_displacement >= MIN_NET_DISPLACEMENT_MEDIUM {
-                            info!(
-                                "✅ Valid lane change: max={:.1}%, net={:.1}% >= {:.1}%",
-                                self.max_offset_in_change * 100.0,
-                                net_displacement * 100.0,
-                                MIN_NET_DISPLACEMENT_MEDIUM * 100.0
-                            );
-                            true
-                        } else if let Some(dur) = duration_ms {
-                            if dur >= MIN_DURATION_FOR_MEDIUM {
-                                info!(
-                                    "✅ Valid: sustained maneuver dur={:.0}ms >= {:.0}ms, max={:.1}%",
-                                    dur,
-                                    MIN_DURATION_FOR_MEDIUM,
-                                    self.max_offset_in_change * 100.0
-                                );
-                                true
-                            } else {
-                                warn!(
-                                    "❌ Rejected: medium offset {:.1}% but short dur={:.0}ms and low net={:.1}%",
-                                    self.max_offset_in_change * 100.0,
-                                    dur,
-                                    net_displacement * 100.0
-                                );
-                                false
-                            }
-                        } else {
-                            info!(
-                                "✅ Valid: medium offset {:.1}% (no duration info)",
-                                self.max_offset_in_change * 100.0
-                            );
-                            true
-                        }
-                    } else {
-                        info!(
-                            "✅ Valid: medium offset {:.1}% (no initial position)",
-                            self.max_offset_in_change * 100.0
-                        );
-                        true
-                    }
-                }
-                // CASE 3: LOW offset = likely drift, require significant net displacement
-                else {
-                    if let Some(initial_pos) = self.initial_position_frozen {
-                        let net_displacement = (final_position - initial_pos).abs();
-
-                        if net_displacement >= MIN_NET_DISPLACEMENT {
-                            info!(
-                                "✅ Valid: net displacement {:.1}% >= {:.1}% with max={:.1}%",
-                                net_displacement * 100.0,
-                                MIN_NET_DISPLACEMENT * 100.0,
-                                self.max_offset_in_change * 100.0
-                            );
-                            true
-                        } else {
-                            warn!(
-                                "❌ Rejected: low offset {:.1}% AND low net {:.1}%",
-                                self.max_offset_in_change * 100.0,
-                                net_displacement * 100.0
-                            );
-                            false
-                        }
-                    } else {
-                        if self.max_offset_in_change >= 0.30 {
-                            info!(
-                                "✅ Valid: offset {:.1}% >= 30% (no initial position)",
-                                self.max_offset_in_change * 100.0
-                            );
-                            true
-                        } else {
-                            warn!(
-                                "❌ Rejected: low offset {:.1}% (no initial position)",
-                                self.max_offset_in_change * 100.0
-                            );
-                            false
-                        }
-                    }
-                }
+            // Calculate net displacement
+            let net_displacement = if let Some(initial_pos) = self.initial_position_frozen {
+                (final_position - initial_pos).abs()
+            } else {
+                0.0
             };
 
-            if !is_valid {
+            // Use the centralized validation function
+            if !self.validate_lane_change(duration, net_displacement) {
                 self.adaptive_baseline.unfreeze();
                 self.reset_lane_change();
                 self.cooldown_remaining = 60;
@@ -1242,7 +1242,7 @@ impl LaneChangeStateMachine {
                 );
                 event.metadata.insert(
                     "net_displacement".to_string(),
-                    serde_json::json!((final_position - initial).abs()),
+                    serde_json::json!(net_displacement),
                 );
             }
 
@@ -1272,20 +1272,24 @@ impl LaneChangeStateMachine {
     fn calculate_confidence(&self, duration_ms: Option<f64>) -> f32 {
         let mut confidence: f32 = 0.5;
 
-        if self.max_offset_in_change > 0.60 {
+        // Higher offset = higher confidence
+        if self.max_offset_in_change > 0.70 {
+            confidence += 0.30;
+        } else if self.max_offset_in_change > 0.60 {
             confidence += 0.25;
-        } else if self.max_offset_in_change > 0.50 {
+        } else if self.max_offset_in_change > 0.55 {
             confidence += 0.20;
-        } else if self.max_offset_in_change > 0.40 {
+        } else if self.max_offset_in_change > 0.45 {
             confidence += 0.15;
         } else {
-            confidence += 0.05;
+            confidence += 0.10;
         }
 
+        // Good duration = higher confidence
         if let Some(dur) = duration_ms {
-            if dur > 1000.0 && dur < 6000.0 {
+            if dur >= 2500.0 && dur < 8000.0 {
                 confidence += 0.15;
-            } else if dur > 500.0 && dur < 10000.0 {
+            } else if dur >= 1500.0 && dur < 10000.0 {
                 confidence += 0.10;
             } else {
                 confidence += 0.05;
