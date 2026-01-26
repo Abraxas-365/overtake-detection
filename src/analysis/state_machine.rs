@@ -56,8 +56,9 @@ const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 // ============================================================================
 // VALIDATION THRESHOLDS - STRICTER TO REDUCE FALSE POSITIVES
 // ============================================================================
-const HIGH_OFFSET_THRESHOLD: f32 = 0.55; // Was 0.45 - definitely crossed to opposite lane
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.45; // Was 0.35 - probably crossed lane
+//
+const HIGH_OFFSET_THRESHOLD: f32 = 0.65; // 65% = definitivamente cruzó
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.55; // 55% = probablemente cruzó
 const LOW_OFFSET_THRESHOLD: f32 = 0.35; // Below this = likely just drift
 const MIN_NET_DISPLACEMENT: f32 = 0.25; // For medium offset validation
 const MIN_DURATION_FOR_VALIDATION: f64 = 2500.0; // 2.5 seconds minimum for non-obvious cases
