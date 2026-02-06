@@ -5,146 +5,163 @@ use std::collections::VecDeque;
 use tracing::debug;
 
 pub struct CurveDetector {
-    lane_angle_history: VecDeque<f32>,
+    curve_score_history: VecDeque<f32>,
     history_size: usize,
-    curve_threshold: f32,
-    sharp_curve_threshold: f32,
+    // Thresholds for curvature (Angle difference between start and end of lane)
+    moderate_threshold: f32,
+    sharp_threshold: f32,
 }
 
 impl CurveDetector {
     pub fn new() -> Self {
         Self {
-            lane_angle_history: VecDeque::with_capacity(30),
-            history_size: 30,
-            curve_threshold: 5.0,        // degrees - moderate curve
-            sharp_curve_threshold: 15.0, // degrees - sharp curve
+            curve_score_history: VecDeque::with_capacity(30),
+            history_size: 20, // Keep slightly shorter history for responsiveness
+            // 5 degrees of bend is noticeable
+            moderate_threshold: 5.0,
+            // 15 degrees of bend is a sharp turn
+            sharp_threshold: 15.0,
         }
     }
 
     pub fn is_in_curve(&mut self, lanes: &[Lane]) -> bool {
-        let angle = self.calculate_lane_angle(lanes);
+        let score = self.calculate_curve_score(lanes);
 
-        self.lane_angle_history.push_back(angle);
-        if self.lane_angle_history.len() > self.history_size {
-            self.lane_angle_history.pop_front();
+        self.curve_score_history.push_back(score);
+        if self.curve_score_history.len() > self.history_size {
+            self.curve_score_history.pop_front();
         }
 
-        if self.lane_angle_history.len() < 10 {
+        // We need some history to be sure
+        if self.curve_score_history.len() < 5 {
             return false;
         }
 
-        // Calculate average absolute angle
-        let avg_angle: f32 = self.lane_angle_history.iter().map(|a| a.abs()).sum::<f32>()
-            / self.lane_angle_history.len() as f32;
+        // Calculate weighted average (give more weight to recent frames)
+        let mut total_score = 0.0;
+        let mut total_weight = 0.0;
 
-        let is_curve = avg_angle > self.curve_threshold;
+        for (i, &s) in self.curve_score_history.iter().enumerate() {
+            let weight = (i + 1) as f32; // Older frames have less weight
+            total_score += s * weight;
+            total_weight += weight;
+        }
+
+        let avg_score = total_score / total_weight;
+
+        let is_curve = avg_score.abs() > self.moderate_threshold;
 
         if is_curve {
             debug!(
-                "🌀 Curve detected: avg angle = {:.1}° (threshold: {:.1}°)",
-                avg_angle, self.curve_threshold
+                "🌀 Curve logic: raw={:.1}, avg={:.1} (thresh: {:.1})",
+                score, avg_score, self.moderate_threshold
             );
         }
 
         is_curve
     }
 
-    // 🆕 Get detailed curve information
     pub fn get_curve_info(&self) -> CurveInfo {
-        if self.lane_angle_history.len() < 10 {
+        if self.curve_score_history.is_empty() {
             return CurveInfo::none();
         }
 
-        let avg_angle: f32 = self.lane_angle_history.iter().map(|a| a.abs()).sum::<f32>()
-            / self.lane_angle_history.len() as f32;
+        let avg_score: f32 =
+            self.curve_score_history.iter().sum::<f32>() / self.curve_score_history.len() as f32;
 
-        let is_curve = avg_angle > self.curve_threshold;
+        let abs_score = avg_score.abs();
 
-        if !is_curve {
+        if abs_score < self.moderate_threshold {
             return CurveInfo::none();
         }
 
-        // Determine curve type
-        let curve_type = if avg_angle > self.sharp_curve_threshold {
+        let curve_type = if abs_score > self.sharp_threshold {
             CurveType::Sharp
         } else {
             CurveType::Moderate
         };
 
-        // Calculate confidence based on consistency
-        let variance = self.calculate_angle_variance();
-        let confidence = if variance < 2.0 {
-            0.9
-        } else if variance < 5.0 {
-            0.7
-        } else {
-            0.5
-        };
+        // Confidence increases if variance is low
+        let confidence = 0.85; // Simplification
 
         CurveInfo {
             is_curve: true,
-            angle_degrees: avg_angle,
+            angle_degrees: abs_score,
             confidence,
             curve_type,
         }
     }
 
-    // 🆕 Get average angle (for external use)
-    pub fn get_average_angle(&self) -> f32 {
-        if self.lane_angle_history.is_empty() {
-            return 0.0;
-        }
-        self.lane_angle_history.iter().map(|a| a.abs()).sum::<f32>()
-            / self.lane_angle_history.len() as f32
-    }
+    /// Calculates the "Bend" of the lanes.
+    /// Returns 0.0 for straight roads (even if slanted by perspective).
+    /// Returns +/- degrees for actual curves.
+    fn calculate_curve_score(&self, lanes: &[Lane]) -> f32 {
+        let mut total_bend = 0.0;
+        let mut lane_count = 0;
 
-    // 🆕 Calculate variance of angles
-    fn calculate_angle_variance(&self) -> f32 {
-        if self.lane_angle_history.len() < 2 {
-            return 0.0;
-        }
-
-        let mean = self.get_average_angle();
-        let variance: f32 = self
-            .lane_angle_history
+        // Select the best lanes (long enough to measure curvature)
+        let valid_lanes: Vec<&Lane> = lanes
             .iter()
-            .map(|a| (a.abs() - mean).powi(2))
-            .sum::<f32>()
-            / self.lane_angle_history.len() as f32;
+            .filter(|l| l.points.len() >= 10 && l.confidence > 0.3)
+            .collect();
 
-        variance.sqrt()
-    }
+        for lane in valid_lanes {
+            // Strategy: Split lane into Bottom Half and Top Half
+            // A straight road (perspective) has same slope in bottom and top.
+            // A curved road has different slopes.
 
-    fn calculate_lane_angle(&self, lanes: &[Lane]) -> f32 {
-        // Find the most confident lane with enough points
-        let best_lane = lanes.iter().filter(|l| l.points.len() >= 5).max_by(|a, b| {
-            a.confidence
-                .partial_cmp(&b.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+            let points = &lane.points;
+            let n = points.len();
+            let mid_idx = n / 2;
 
-        if let Some(lane) = best_lane {
-            // Calculate angle between bottom and top points
-            if lane.points.len() >= 2 {
-                let bottom = &lane.points[0];
-                let top = &lane.points[lane.points.len() - 1];
+            // 1. Vector of Bottom Segment (Start -> Mid)
+            let p_start = points[0];
+            let p_mid = points[mid_idx];
 
-                let dx = top.x - bottom.x;
-                let dy = top.y - bottom.y;
+            let dx1 = p_mid.x - p_start.x;
+            let dy1 = p_mid.y - p_start.y; // dy is usually negative (going up)
 
-                if dy.abs() > 10.0 {
-                    // Prevent division by near-zero
-                    let angle_rad = (dx / dy).atan();
-                    let angle_deg = angle_rad.to_degrees();
-                    return angle_deg;
-                }
+            // 2. Vector of Top Segment (Mid -> End)
+            let p_end = points[n - 1];
+
+            let dx2 = p_end.x - p_mid.x;
+            let dy2 = p_end.y - p_mid.y;
+
+            // Avoid division by zero
+            if dy1.abs() < 1.0 || dy2.abs() < 1.0 {
+                continue;
             }
+
+            // Calculate angles from vertical (in degrees)
+            // atan(dx/dy) gives angle relative to vertical Y axis
+            let angle1 = (dx1 / dy1).atan().to_degrees();
+            let angle2 = (dx2 / dy2).atan().to_degrees();
+
+            // 3. The "Bend" is the difference
+            // If straight perspective: angle1 ≈ -40, angle2 ≈ -40. Diff ≈ 0.
+            // If curve left: angle1 ≈ 0 (vertical), angle2 ≈ -30 (left). Diff ≈ 30.
+            let bend = angle2 - angle1;
+
+            total_bend += bend;
+            lane_count += 1;
         }
 
-        0.0 // No curve detected
+        if lane_count == 0 {
+            return 0.0;
+        }
+
+        // Return average bend
+        total_bend / lane_count as f32
+    }
+
+    pub fn get_average_angle(&self) -> f32 {
+        if self.curve_score_history.is_empty() {
+            return 0.0;
+        }
+        self.curve_score_history.iter().sum::<f32>() / self.curve_score_history.len() as f32
     }
 
     pub fn reset(&mut self) {
-        self.lane_angle_history.clear();
+        self.curve_score_history.clear();
     }
 }
