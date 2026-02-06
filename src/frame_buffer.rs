@@ -1,6 +1,6 @@
 // src/frame_buffer.rs
 
-use crate::types::{Frame, LaneChangeEvent};
+use crate::types::{CurveInfo, CurveType, Frame, LaneChangeEvent};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -116,6 +116,16 @@ pub struct DetectionMetadata {
     pub region: String,
     /// Average lane width in pixels during the maneuver
     pub avg_lane_width_px: Option<f32>,
+
+    // 🆕 CURVE DETECTION METADATA
+    /// Whether a curve was detected during the maneuver
+    pub curve_detected: bool,
+    /// Average angle of the curve in degrees (0 if no curve)
+    pub curve_angle_degrees: f32,
+    /// Confidence of curve detection (0.0-1.0)
+    pub curve_confidence: f32,
+    /// Type of curve: "NONE", "MODERATE", "SHARP"
+    pub curve_type: String,
 }
 
 /// Enhanced payload for the legality analysis API
@@ -129,7 +139,7 @@ pub struct LaneChangeLegalityRequest {
     pub duration_ms: Option<f64>,
     pub source_id: String,
     pub frames: Vec<FrameData>,
-    /// NEW: Detection quality metadata
+    /// Detection quality metadata (now includes curve info)
     pub detection_metadata: DetectionMetadata,
 }
 
@@ -141,10 +151,10 @@ pub struct FrameData {
     pub width: usize,
     pub height: usize,
     pub base64_image: String,
-    /// NEW: Lane detection confidence for this frame (if available)
+    /// Lane detection confidence for this frame (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lane_confidence: Option<f32>,
-    /// NEW: Lateral offset as percentage of lane width (if available)
+    /// Lateral offset as percentage of lane width (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset_percentage: Option<f32>,
 }
@@ -236,10 +246,12 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
 }
 
 /// Build the API request payload with enhanced metadata
+/// 🆕 Now includes curve_info parameter
 pub fn build_legality_request(
     event: &LaneChangeEvent,
     captured_frames: &[Frame],
     num_frames_to_send: usize,
+    curve_info: CurveInfo, // 🆕 NEW PARAMETER
 ) -> Result<LaneChangeLegalityRequest, anyhow::Error> {
     let key_frames = extract_key_frames_for_lane_change(captured_frames, num_frames_to_send);
 
@@ -327,6 +339,13 @@ pub fn build_legality_request(
         .and_then(|v| v.as_f64())
         .map(|v| v as f32);
 
+    // 🆕 Convert CurveType enum to string
+    let curve_type_str = match curve_info.curve_type {
+        CurveType::None => "NONE",
+        CurveType::Moderate => "MODERATE",
+        CurveType::Sharp => "SHARP",
+    };
+
     let metadata = DetectionMetadata {
         detection_confidence: event.confidence,
         max_offset_normalized,
@@ -336,6 +355,11 @@ pub fn build_legality_request(
         fps,
         region: "PE".to_string(),
         avg_lane_width_px,
+        // 🆕 CURVE INFORMATION
+        curve_detected: curve_info.is_curve,
+        curve_angle_degrees: curve_info.angle_degrees,
+        curve_confidence: curve_info.confidence,
+        curve_type: curve_type_str.to_string(),
     };
 
     info!(
@@ -344,6 +368,16 @@ pub fn build_legality_request(
         metadata.max_offset_normalized * 100.0,
         metadata.both_lanes_ratio * 100.0
     );
+
+    // 🆕 Log curve info if detected
+    if curve_info.is_curve {
+        info!(
+            "🌀 Curve detected: type={}, angle={:.1}°, confidence={:.0}%",
+            curve_type_str,
+            curve_info.angle_degrees,
+            curve_info.confidence * 100.0
+        );
+    }
 
     Ok(LaneChangeLegalityRequest {
         event_id: event.event_id.clone(),
@@ -400,6 +434,7 @@ pub async fn send_to_legality_api(
 }
 
 /// Print the request payload to console with enhanced metadata
+/// 🆕 Now includes curve information display
 pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     println!("\n============================================================");
     println!("🚗 LANE CHANGE LEGALITY CHECK REQUEST");
@@ -443,6 +478,30 @@ pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     );
     if let Some(width) = request.detection_metadata.avg_lane_width_px {
         println!("  • Avg lane width:   {:.0}px", width);
+    }
+
+    // 🆕 PRINT CURVE INFORMATION
+    if request.detection_metadata.curve_detected {
+        println!("\n🌀 Curve Detection:");
+        println!(
+            "  • Type:             {}",
+            request.detection_metadata.curve_type
+        );
+        println!(
+            "  • Angle:            {:.1}°",
+            request.detection_metadata.curve_angle_degrees
+        );
+        println!(
+            "  • Confidence:       {:.0}%",
+            request.detection_metadata.curve_confidence * 100.0
+        );
+
+        // Warning if overtaking in curve
+        if request.detection_metadata.curve_type != "NONE" {
+            println!("  ⚠️  WARNING: Overtaking in curve is ILLEGAL in Peru (DS 016-2009-MTC)");
+        }
+    } else {
+        println!("\n🌀 Curve Detection: No curve detected (straight road)");
     }
 
     println!("\n🎬 Frames for analysis: {}", request.frames.len());
@@ -503,5 +562,25 @@ mod tests {
 
         assert_eq!(key_frames[0].timestamp_ms, 0.0);
         assert_eq!(key_frames[4].timestamp_ms, 900.0);
+    }
+
+    #[test]
+    fn test_curve_type_conversion() {
+        use crate::types::CurveType;
+
+        let curve_types = vec![
+            (CurveType::None, "NONE"),
+            (CurveType::Moderate, "MODERATE"),
+            (CurveType::Sharp, "SHARP"),
+        ];
+
+        for (curve_type, expected_str) in curve_types {
+            let curve_str = match curve_type {
+                CurveType::None => "NONE",
+                CurveType::Moderate => "MODERATE",
+                CurveType::Sharp => "SHARP",
+            };
+            assert_eq!(curve_str, expected_str);
+        }
     }
 }

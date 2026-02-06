@@ -16,7 +16,7 @@ use frame_buffer::{
 };
 use std::path::Path;
 use tracing::{debug, error, info, warn};
-use types::{DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
+use types::{CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 
 /// Configuration for legality analysis
 struct LegalityAnalysisConfig {
@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
                 );
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
                 info!("  Events sent to API: {}", stats.events_sent_to_api);
+                if stats.curves_detected > 0 {
+                    info!("  🌀 Curves detected: {}", stats.curves_detected);
+                }
             }
             Err(e) => {
                 error!("Failed to process video: {}", e);
@@ -137,6 +140,7 @@ struct ProcessingStats {
     frames_with_position: u64,
     lane_changes_detected: usize,
     events_sent_to_api: usize,
+    curves_detected: usize,
     duration_secs: f64,
     avg_fps: f64,
 }
@@ -157,7 +161,6 @@ async fn process_video(
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
-    // *** USE CONFIG VALUES INSTEAD OF HARDCODED ***
     let lane_change_config = LaneChangeConfig::from_detection_config(&config.detection);
 
     info!(
@@ -176,17 +179,14 @@ async fn process_video(
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
     let mut events_sent_to_api: usize = 0;
+    let mut curves_detected: usize = 0;
 
-    let mut cached_start_frame: Option<Frame> = None;
     let mut previous_state = "CENTERED".to_string();
 
     // Frame buffer for capturing lane change frames
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
 
-    // Confidence threshold from config
     let lane_confidence_threshold = config.detection.min_lane_confidence;
-
-    // En la función process_video, reemplaza todo el loop while:
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
@@ -205,14 +205,7 @@ async fn process_video(
         );
         }
 
-        match process_frame(
-            &frame,
-            inference_engine,
-            config,
-            config.detection.min_lane_confidence,
-        )
-        .await
-        {
+        match process_frame(&frame, inference_engine, config, lane_confidence_threshold).await {
             Ok(detected_lanes) => {
                 let analysis_lanes: Vec<Lane> = detected_lanes
                     .iter()
@@ -220,7 +213,7 @@ async fn process_video(
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // ✅ IMPORTANTE: Agregar al pre-buffer ANTES de analizar (usa previous_state)
+                // Add to pre-buffer BEFORE analyzing (uses previous_state)
                 if previous_state == "CENTERED" {
                     frame_buffer.add_to_pre_buffer(frame.clone());
                 }
@@ -240,6 +233,18 @@ async fn process_video(
                         event.end_frame_id
                     );
 
+                    // 🆕 GET CURVE INFORMATION from analyzer
+                    let curve_info = analyzer.get_curve_info();
+
+                    // 🆕 Log if curve was detected
+                    if curve_info.is_curve {
+                        curves_detected += 1;
+                        warn!(
+                            "⚠️  CURVE DETECTED during lane change: type={:?}, angle={:.1}°",
+                            curve_info.curve_type, curve_info.angle_degrees
+                        );
+                    }
+
                     // Get captured frames (includes pre-buffer)
                     let captured_frames = frame_buffer.stop_capture();
 
@@ -250,10 +255,12 @@ async fn process_video(
 
                     // Build and send legality request
                     if !captured_frames.is_empty() {
+                        // 🆕 PASS curve_info to build_legality_request
                         match build_legality_request(
                             &event,
                             &captured_frames,
                             legality_config.num_frames_to_analyze,
+                            curve_info, // 🆕 NEW PARAMETER
                         ) {
                             Ok(request) => {
                                 if legality_config.print_to_console {
@@ -326,7 +333,7 @@ async fn process_video(
                     lane_changes.push(event);
                 }
 
-                // ✅ Obtener current_state DESPUÉS del análisis
+                // Get current_state AFTER analysis
                 let current_state = analyzer.current_state().to_string();
 
                 // Start capturing when CENTERED -> DRIFTING
@@ -349,7 +356,7 @@ async fn process_video(
                     debug!("❌ Lane change cancelled");
                 }
 
-                // ✅ Actualizar previous_state al final
+                // Update previous_state at the end
                 previous_state = current_state;
 
                 if frame_count % 50 == 0 {
@@ -402,6 +409,9 @@ async fn process_video(
     info!("\n📊 Final Report:");
     info!("  Total Lane Changes: {}", lane_changes.len());
     info!("  Events Sent to API: {}", events_sent_to_api);
+    if curves_detected > 0 {
+        info!("  🌀 Curves Detected: {}", curves_detected);
+    }
     info!("  Processing Speed: {:.1} FPS", avg_fps);
 
     for (i, event) in lane_changes.iter().enumerate() {
@@ -421,6 +431,7 @@ async fn process_video(
         frames_with_position: frames_with_valid_position,
         lane_changes_detected: lane_changes.len(),
         events_sent_to_api,
+        curves_detected,
         duration_secs: duration.as_secs_f64(),
         avg_fps,
     })

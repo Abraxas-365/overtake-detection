@@ -1,15 +1,17 @@
 // src/analysis/lane_analyzer.rs
 
 use crate::analysis::boundary_detector::{CrossingType, LaneBoundaryCrossingDetector};
+use crate::analysis::curve_detector::CurveDetector;
 use crate::analysis::position_estimator::{PositionEstimator, PositionSmoother};
 use crate::analysis::state_machine::LaneChangeStateMachine;
-use crate::types::{Lane, LaneChangeConfig, LaneChangeEvent, VehicleState};
+use crate::types::{CurveInfo, Lane, LaneChangeConfig, LaneChangeEvent, VehicleState};
 
 pub struct LaneChangeAnalyzer {
     position_estimator: PositionEstimator,
     smoother: PositionSmoother,
     state_machine: LaneChangeStateMachine,
     boundary_detector: LaneBoundaryCrossingDetector,
+    curve_detector: CurveDetector, // 🆕 Make public via getter
     config: LaneChangeConfig,
     last_state: Option<VehicleState>,
     frame_count: u64,
@@ -22,12 +24,14 @@ impl LaneChangeAnalyzer {
         let smoother = PositionSmoother::new(config.smoothing_alpha);
         let state_machine = LaneChangeStateMachine::new(config.clone());
         let boundary_detector = LaneBoundaryCrossingDetector::new();
+        let curve_detector = CurveDetector::new();
 
         Self {
             position_estimator,
             smoother,
             state_machine,
             boundary_detector,
+            curve_detector,
             config,
             last_state: None,
             frame_count: 0,
@@ -46,7 +50,10 @@ impl LaneChangeAnalyzer {
         self.frame_count += 1;
 
         // Update curve detector with current lanes
-        let _is_in_curve = self.state_machine.update_curve_detector(lanes);
+        let is_in_curve = self.curve_detector.is_in_curve(lanes);
+
+        // Pass curve info to state machine
+        self.state_machine.update_curve_detector(lanes);
 
         // Get raw position estimate
         let mut raw_state = self
@@ -75,6 +82,17 @@ impl LaneChangeAnalyzer {
         // Update state machine with crossing info
         self.state_machine
             .update(&smoothed_state, frame_id, timestamp_ms, crossing_type)
+    }
+
+    // 🆕 Get curve information for API
+    pub fn get_curve_info(&self) -> CurveInfo {
+        self.curve_detector.get_curve_info()
+    }
+
+    // 🆕 Check if currently in curve
+    pub fn is_in_curve(&self) -> bool {
+        let info = self.get_curve_info();
+        info.is_curve
     }
 
     fn get_lane_boundaries(&self, lanes: &[Lane], frame_height: u32) -> (Option<f32>, Option<f32>) {
@@ -112,6 +130,7 @@ impl LaneChangeAnalyzer {
         self.smoother.reset();
         self.position_estimator.reset();
         self.boundary_detector.reset();
+        self.curve_detector.reset();
         self.last_state = None;
         self.frame_count = 0;
         self.valid_estimates = 0;

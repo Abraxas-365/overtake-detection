@@ -1,5 +1,3 @@
-// src/types.rs
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -339,6 +337,36 @@ pub struct EvidencePaths {
 }
 
 // ============================================================================
+// 🆕 Curve Information
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CurveInfo {
+    pub is_curve: bool,
+    pub angle_degrees: f32,
+    pub confidence: f32,
+    pub curve_type: CurveType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CurveType {
+    None,
+    Moderate, // 5-15 degrees
+    Sharp,    // > 15 degrees
+}
+
+impl CurveInfo {
+    pub fn none() -> Self {
+        Self {
+            is_curve: false,
+            angle_degrees: 0.0,
+            confidence: 0.0,
+            curve_type: CurveType::None,
+        }
+    }
+}
+
+// ============================================================================
 // Lane Change Event
 // ============================================================================
 
@@ -467,4 +495,16 @@ impl LaneChangeConfig {
             require_both_lanes: detection.require_both_lanes,
         }
     }
+}
+
+// ============================================================================
+// 🆕 Vehicle Position (for smoother)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy)]
+pub struct VehiclePosition {
+    pub lane_index: i32,
+    pub lateral_offset: f32,
+    pub confidence: f32,
+    pub timestamp: f64,
 }
