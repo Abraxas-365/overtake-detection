@@ -50,7 +50,8 @@ impl LaneChangeAnalyzer {
         self.frame_count += 1;
 
         // Update curve detector with current lanes
-        let is_in_curve = self.curve_detector.is_in_curve(lanes);
+        // Prefix with underscore to silence warning about unused variable
+        let _is_in_curve = self.curve_detector.is_in_curve(lanes);
 
         // Pass curve info to state machine
         self.state_machine.update_curve_detector(lanes);
@@ -151,9 +152,5 @@ impl LaneChangeAnalyzer {
             0.0
         };
         (self.frame_count, self.valid_estimates, valid_ratio)
-    }
-
-    pub fn get_curve_info(&self) -> CurveInfo {
-        self.curve_detector.get_curve_info()
     }
 }

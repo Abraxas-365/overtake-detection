@@ -1,3 +1,5 @@
+// src/types.rs
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -507,29 +509,4 @@ pub struct VehiclePosition {
     pub lateral_offset: f32,
     pub confidence: f32,
     pub timestamp: f64,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct CurveInfo {
-    pub is_curve: bool,
-    pub angle_degrees: f32,
-    pub confidence: f32,
-    pub curve_type: CurveType,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CurveType {
-    None,
-    Moderate, // 5-15 degrees
-    Sharp,    // > 15 degrees
-}
-
-impl CurveInfo {
-    pub fn none() -> Self {
-        Self {
-            is_curve: false,
-            angle_degrees: 0.0,
-            confidence: 0.0,
-            curve_type: CurveType::None,
-        }
-    }
 }
