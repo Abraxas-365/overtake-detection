@@ -89,37 +89,6 @@ impl CurveDetector {
         is_curve
     }
 
-    pub fn get_curve_info(&self) -> CurveInfo {
-        if self.curve_score_history.is_empty() {
-            return CurveInfo::none();
-        }
-
-        let avg_score: f32 =
-            self.curve_score_history.iter().sum::<f32>() / self.curve_score_history.len() as f32;
-
-        let abs_score = avg_score.abs();
-
-        if abs_score < self.moderate_threshold {
-            return CurveInfo::none();
-        }
-
-        let curve_type = if abs_score > self.sharp_threshold {
-            CurveType::Sharp
-        } else {
-            CurveType::Moderate
-        };
-
-        // Confidence increases if variance is low
-        let confidence = 0.85; // Simplification
-
-        CurveInfo {
-            is_curve: true,
-            angle_degrees: abs_score,
-            confidence,
-            curve_type,
-        }
-    }
-
     /// Calculates the "Bend" of the lanes.
     /// Returns 0.0 for straight roads (even if slanted by perspective).
     /// Returns +/- degrees for actual curves.
