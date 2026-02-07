@@ -11,7 +11,7 @@ pub struct LaneChangeAnalyzer {
     smoother: PositionSmoother,
     state_machine: LaneChangeStateMachine,
     boundary_detector: LaneBoundaryCrossingDetector,
-    curve_detector: CurveDetector, // 🆕 Make public via getter
+    curve_detector: CurveDetector,
     config: LaneChangeConfig,
     last_state: Option<VehicleState>,
     frame_count: u64,
@@ -151,5 +151,9 @@ impl LaneChangeAnalyzer {
             0.0
         };
         (self.frame_count, self.valid_estimates, valid_ratio)
+    }
+
+    pub fn get_curve_info(&self) -> CurveInfo {
+        self.curve_detector.get_curve_info()
     }
 }

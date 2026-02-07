@@ -24,6 +24,34 @@ impl CurveDetector {
         }
     }
 
+    pub fn get_curve_info(&self) -> CurveInfo {
+        if self.curve_score_history.is_empty() {
+            return CurveInfo::none();
+        }
+
+        let avg_score: f32 =
+            self.curve_score_history.iter().sum::<f32>() / self.curve_score_history.len() as f32;
+
+        let abs_score = avg_score.abs();
+
+        if abs_score < self.moderate_threshold {
+            return CurveInfo::none();
+        }
+
+        let curve_type = if abs_score > self.sharp_threshold {
+            CurveType::Sharp
+        } else {
+            CurveType::Moderate
+        };
+
+        CurveInfo {
+            is_curve: true,
+            angle_degrees: abs_score,
+            confidence: 0.85,
+            curve_type,
+        }
+    }
+
     pub fn is_in_curve(&mut self, lanes: &[Lane]) -> bool {
         let score = self.calculate_curve_score(lanes);
 

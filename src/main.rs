@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
                 if stats.curves_detected > 0 {
                     info!("  🌀 Curves detected: {}", stats.curves_detected);
                 }
+                info!("  Processing Speed: {:.1} FPS", stats.avg_fps);
             }
             Err(e) => {
                 error!("Failed to process video: {}", e);
@@ -152,6 +153,7 @@ async fn process_video(
     config: &types::Config,
     legality_config: &LegalityAnalysisConfig,
 ) -> Result<ProcessingStats> {
+    use std::io::Write;
     use std::time::Instant;
 
     let start_time = Instant::now();
@@ -175,7 +177,16 @@ async fn process_video(
     let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
     analyzer.set_source_id(video_path.to_string_lossy().to_string());
 
-    let mut lane_changes: Vec<LaneChangeEvent> = Vec::new();
+    // 🆕 PREPARE OUTPUT FILE (Write immediately instead of buffering in memory)
+    std::fs::create_dir_all(&config.video.output_dir)?;
+    let video_name = video_path.file_stem().unwrap().to_str().unwrap();
+    let jsonl_path =
+        Path::new(&config.video.output_dir).join(format!("{}_lane_changes.jsonl", video_name));
+
+    let mut results_file = std::fs::File::create(&jsonl_path)?;
+    info!("💾 Results will be written to: {}", jsonl_path.display());
+
+    let mut lane_changes_count: usize = 0;
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
     let mut events_sent_to_api: usize = 0;
@@ -199,7 +210,7 @@ async fn process_video(
             reader.current_frame,
             reader.total_frames,
             analyzer.current_state(),
-            lane_changes.len(),
+            lane_changes_count,
             frame_buffer.frame_count(),
             frame_buffer.pre_buffer_count()
         );
@@ -227,10 +238,11 @@ async fn process_video(
                     timestamp_ms,
                 ) {
                     info!(
-                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {})",
+                        "🚀 LANE CHANGE DETECTED: {} at {:.2}s (frame {}) | 🆔 Event ID: {}",
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
-                        event.end_frame_id
+                        event.end_frame_id,
+                        event.event_id // 🆕 LOG THE ID for cross-referencing with Go
                     );
 
                     // 🆕 GET CURVE INFORMATION from analyzer
@@ -255,12 +267,11 @@ async fn process_video(
 
                     // Build and send legality request
                     if !captured_frames.is_empty() {
-                        // 🆕 PASS curve_info to build_legality_request
                         match build_legality_request(
                             &event,
                             &captured_frames,
                             legality_config.num_frames_to_analyze,
-                            curve_info, // 🆕 NEW PARAMETER
+                            curve_info,
                         ) {
                             Ok(request) => {
                                 if legality_config.print_to_console {
@@ -303,7 +314,7 @@ async fn process_video(
                         warn!("No frames captured for lane change event");
                     }
 
-                    // Save evidence images (use first captured frame as start)
+                    // 🆕 SAVE EVIDENCE IMAGES WITH ABSOLUTE PATHS
                     let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
                     let start_filename =
                         format!("{}_event_{}_start.jpg", video_stem, event.event_id);
@@ -317,12 +328,17 @@ async fn process_video(
                         if let Ok(path) =
                             video_processor.save_frame_to_disk(&captured_frames[0], &start_filename)
                         {
-                            start_path_str = path.to_string_lossy().to_string();
+                            // Convert to absolute path for Python/Go interoperability
+                            start_path_str = std::fs::canonicalize(&path)
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| path.to_string_lossy().to_string());
                         }
                     }
 
                     if let Ok(path) = video_processor.save_frame_to_disk(&frame, &end_filename) {
-                        end_path_str = path.to_string_lossy().to_string();
+                        end_path_str = std::fs::canonicalize(&path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| path.to_string_lossy().to_string());
                     }
 
                     event.evidence_images = Some(types::EvidencePaths {
@@ -330,7 +346,21 @@ async fn process_video(
                         end_image_path: end_path_str,
                     });
 
-                    lane_changes.push(event);
+                    // 🆕 SAVE EVENT IMMEDIATELY TO JSONL (Don't wait until end of video)
+                    match serde_json::to_string(&event.to_json()) {
+                        Ok(json_line) => {
+                            if let Err(e) = writeln!(results_file, "{}", json_line) {
+                                error!("❌ Failed to write event to JSONL: {}", e);
+                            } else {
+                                // Flush ensures data is written to disk immediately
+                                let _ = results_file.flush();
+                                info!("💾 Event saved to local JSONL");
+                            }
+                        }
+                        Err(e) => error!("Failed to serialize event: {}", e),
+                    }
+
+                    lane_changes_count += 1;
                 }
 
                 // Get current_state AFTER analysis
@@ -407,29 +437,17 @@ async fn process_video(
     let avg_fps = frame_count as f64 / duration.as_secs_f64();
 
     info!("\n📊 Final Report:");
-    info!("  Total Lane Changes: {}", lane_changes.len());
+    info!("  Total Lane Changes: {}", lane_changes_count);
     info!("  Events Sent to API: {}", events_sent_to_api);
     if curves_detected > 0 {
         info!("  🌀 Curves Detected: {}", curves_detected);
     }
     info!("  Processing Speed: {:.1} FPS", avg_fps);
 
-    for (i, event) in lane_changes.iter().enumerate() {
-        info!(
-            "  {}. {} at {:.2}s (confidence: {:.2})",
-            i + 1,
-            event.direction_name(),
-            event.video_timestamp_ms / 1000.0,
-            event.confidence
-        );
-    }
-
-    save_results(video_path, &lane_changes, config)?;
-
     Ok(ProcessingStats {
         total_frames: frame_count,
         frames_with_position: frames_with_valid_position,
-        lane_changes_detected: lane_changes.len(),
+        lane_changes_detected: lane_changes_count,
         events_sent_to_api,
         curves_detected,
         duration_secs: duration.as_secs_f64(),
@@ -472,26 +490,4 @@ async fn process_frame(
         .collect();
 
     Ok(high_confidence_lanes)
-}
-
-fn save_results(
-    video_path: &Path,
-    lane_changes: &[LaneChangeEvent],
-    config: &types::Config,
-) -> Result<()> {
-    use std::fs::File;
-    use std::io::Write;
-
-    std::fs::create_dir_all(&config.video.output_dir)?;
-    let video_name = video_path.file_stem().unwrap().to_str().unwrap();
-    let jsonl_path =
-        Path::new(&config.video.output_dir).join(format!("{}_lane_changes.jsonl", video_name));
-
-    let mut file = File::create(&jsonl_path)?;
-    for event in lane_changes {
-        let json_line = serde_json::to_string(&event.to_json())?;
-        writeln!(file, "{}", json_line)?;
-    }
-    info!("💾 Saved to: {}", jsonl_path.display());
-    Ok(())
 }
