@@ -494,7 +494,7 @@ impl LaneLegalityDetector {
             CrossingSide::None => return None,
         }?;
 
-        let boundary_x = boundary_x?;
+        let boundary_x = boundary_x;
         let tolerance = frame_width as f32 * 0.12;
         let mut best_match: Option<(f32, &DetectedRoadMarking)> = None;
 
