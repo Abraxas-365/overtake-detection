@@ -102,11 +102,35 @@ impl OvertakeAnalyzer {
                     }],
                 },
             );
+
+            info!(
+                "🆕 New vehicle tracked: ID #{}, type: {}",
+                self.next_id, self.tracked_vehicles[&self.next_id].class_name
+            );
+
             self.next_id += 1;
         }
 
-        self.tracked_vehicles
-            .retain(|_, track| frame_id - track.last_seen_frame < 30);
+        // 🆕 MUCH longer retention: 300 frames = ~10 seconds at 30fps
+        // This allows vehicles to be tracked even after they disappear from view during overtake
+        let removed = self.tracked_vehicles.len();
+        self.tracked_vehicles.retain(|id, track| {
+            let should_keep = frame_id - track.last_seen_frame < 300;
+            if !should_keep {
+                info!(
+                    "🗑️  Removing vehicle ID #{} ({}) - not seen for {} frames",
+                    id,
+                    track.class_name,
+                    frame_id - track.last_seen_frame
+                );
+            }
+            should_keep
+        });
+
+        let removed = removed - self.tracked_vehicles.len();
+        if removed > 0 {
+            info!("🗑️  Removed {} stale vehicle(s)", removed);
+        }
     }
 
     pub fn analyze_overtake(
@@ -129,6 +153,14 @@ impl OvertakeAnalyzer {
         );
 
         for (vehicle_id, track) in &self.tracked_vehicles {
+            info!(
+                "  📋 Vehicle ID #{} ({}): first_seen={}, last_seen={}, positions={}",
+                id,
+                track.class_name,
+                track.first_seen_frame,
+                track.last_seen_frame,
+                track.position_history.len()
+            );
             // Only consider vehicles visible during the maneuver
             if track.last_seen_frame < start_frame || track.first_seen_frame > end_frame {
                 continue;
