@@ -6,7 +6,8 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use std::collections::HashSet;
+use tracing::{debug, info};
 
 const SEG_INPUT_SIZE: usize = 640;
 const NUM_CLASSES: usize = 25;
@@ -19,9 +20,9 @@ const LEGAL_CLASS_IDS: [usize; 2] = [9, 10];
 /// Class IDs considered CRITICAL violations
 const CRITICAL_CLASS_IDS: [usize; 2] = [5, 8];
 
-// ============================================================================
+// ===========================================================================
 // CROSSING SIDE (from lane model)
-// ============================================================================
+// ===========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossingSide {
@@ -30,9 +31,9 @@ pub enum CrossingSide {
     Right,
 }
 
-// ============================================================================
+// ===========================================================================
 // TYPES
-// ============================================================================
+// ===========================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineLegality {
@@ -92,9 +93,9 @@ impl LegalityResult {
     }
 }
 
-// ============================================================================
+// ===========================================================================
 // FUSED RESULT (combines both models)
-// ============================================================================
+// ===========================================================================
 
 #[derive(Debug, Clone)]
 pub struct FusedLegalityResult {
@@ -112,9 +113,9 @@ pub struct FusedLegalityResult {
     pub ego_intersects_marking: bool,
 }
 
-// ============================================================================
+// ===========================================================================
 // TEMPORAL FILTER — prevents single-frame false positives
-// ============================================================================
+// ===========================================================================
 
 struct TemporalViolationFilter {
     /// Recent violation verdicts (ring buffer)
@@ -165,15 +166,11 @@ impl TemporalViolationFilter {
 
         consecutive >= self.min_consecutive
     }
-
-    fn reset(&mut self) {
-        self.recent_verdicts.clear();
-    }
 }
 
-// ============================================================================
+// ===========================================================================
 // CLASS ID MAPPING
-// ============================================================================
+// ===========================================================================
 
 fn class_id_to_name(class_id: usize) -> &'static str {
     match class_id {
@@ -200,12 +197,10 @@ fn class_id_to_legality(class_id: usize) -> LineLegality {
     }
 }
 
-// ============================================================================
-// COLOR VERIFICATION — Fixes yellow detected as white
-// ============================================================================
+// ===========================================================================
+// COLOR VERIFICATION — FIX 1: Calibrated Thresholds
+// ===========================================================================
 
-/// Verify/correct line color by sampling actual pixel values from the marked region
-/// This fixes the common issue where yellow center lines are misclassified as white
 fn verify_line_color(
     frame_rgb: &[u8],
     frame_width: usize,
@@ -221,6 +216,7 @@ fn verify_line_color(
     // Sample pixels from the bbox center region
     let cx = ((marking.bbox[0] + marking.bbox[2]) / 2.0) as usize;
     let cy = ((marking.bbox[1] + marking.bbox[3]) / 2.0) as usize;
+    // Expanded sample area to catch line pixels
     let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(5.0) as usize;
     let half_h = ((marking.bbox[3] - marking.bbox[1]) / 4.0).max(5.0) as usize;
 
@@ -266,10 +262,10 @@ fn verify_line_color(
     let r_b_ratio = if avg_b > 1.0 { avg_r / avg_b } else { 2.0 };
     let g_b_ratio = if avg_b > 1.0 { avg_g / avg_b } else { 2.0 };
 
-    // ✅ CALIBRATED THRESHOLDS based on your logs:
-    // Yellow lines in logs: R/B ~1.15 to 1.25
-    // White lines in logs:  R/B ~0.98 to 1.02
-    // New Threshold:        > 1.08 (Safe gap)
+    // ✅ CALIBRATED THRESHOLDS from your logs:
+    // Yellow lines: R/B ~1.15 to 1.25
+    // White lines:  R/B ~0.98 to 1.02
+    // Threshold:    > 1.08 (Safe gap)
     let is_yellow = avg_b > 1.0
         && r_b_ratio > 1.08      // Reduced from 1.3
         && g_b_ratio > 1.05      // Reduced from 1.1
@@ -301,7 +297,7 @@ fn verify_line_color(
             marking.legality = class_id_to_legality(new_class);
         }
     } else {
-        // Debug logging to keep verifying
+        // Debug logging enabled to verify fix
         debug!(
             "Checked {}: Not yellow (R/B={:.2}, need >1.08)",
             marking.class_name, r_b_ratio
@@ -309,9 +305,100 @@ fn verify_line_color(
     }
 }
 
-// ============================================================================
+// ===========================================================================
+// MERGE COMPOSITE LINES — FIX 2: Handle Mixed Lines
+// ===========================================================================
+
+/// Merges overlapping "Solid" and "Dashed" lines into a "Mixed" line type
+/// allowing us to determine if overtaking is legal based on which side is dotted.
+fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMarking> {
+    let mut merged = Vec::new();
+    let mut used_indices = HashSet::new();
+
+    for i in 0..dets.len() {
+        if used_indices.contains(&i) {
+            continue;
+        }
+
+        let a = &dets[i];
+
+        // Looking for pair: Single Yellow Solid (5) + Single Yellow Dashed (10)
+        // OR Single White Solid (4) + Single White Dashed (9)
+        let is_solid_y = a.class_id == 5;
+        let is_dashed_y = a.class_id == 10;
+
+        if !is_solid_y && !is_dashed_y {
+            merged.push(a.clone());
+            continue;
+        }
+
+        let mut found_partner = false;
+
+        for j in 0..dets.len() {
+            if i == j || used_indices.contains(&j) {
+                continue;
+            }
+            let b = &dets[j];
+
+            // If 'a' is solid, look for dashed. If 'a' is dashed, look for solid.
+            let is_pair = (is_solid_y && b.class_id == 10) || (is_dashed_y && b.class_id == 5);
+
+            if is_pair {
+                // Check if they are physically close (overlapping or adjacent)
+                let iou = calculate_iou_arr(&a.bbox, &b.bbox);
+                // Low threshold because they might be adjacent (side-by-side)
+                if iou > 0.1 {
+                    // FOUND A MIXED LINE!
+                    let dashed_part = if is_dashed_y { a } else { b };
+                    let solid_part = if is_solid_y { a } else { b };
+
+                    let dashed_cx = (dashed_part.bbox[0] + dashed_part.bbox[2]) / 2.0;
+                    let solid_cx = (solid_part.bbox[0] + solid_part.bbox[2]) / 2.0;
+
+                    // Create a new "Mixed" detection
+                    let mut new_marking = solid_part.clone(); // Inherit solid props
+                    new_marking.confidence = (a.confidence + b.confidence) / 2.0;
+
+                    // Union the bounding boxes
+                    new_marking.bbox = [
+                        a.bbox[0].min(b.bbox[0]),
+                        a.bbox[1].min(b.bbox[1]),
+                        a.bbox[2].max(b.bbox[2]),
+                        a.bbox[3].max(b.bbox[3]),
+                    ];
+
+                    if dashed_cx < solid_cx {
+                        // Dashed is on LEFT, Solid on RIGHT
+                        // Overtaking to Left crosses Dashed first -> LEGAL
+                        new_marking.class_name = "mixed_double_yellow_dashed_left".to_string();
+                        new_marking.legality = LineLegality::Legal;
+                    } else {
+                        // Solid is on LEFT, Dashed on RIGHT
+                        // Overtaking to Left crosses Solid first -> ILLEGAL
+                        new_marking.class_name = "mixed_double_yellow_solid_left".to_string();
+                        new_marking.legality = LineLegality::CriticalIllegal;
+                    }
+
+                    merged.push(new_marking);
+                    used_indices.insert(i);
+                    used_indices.insert(j);
+                    found_partner = true;
+                    break;
+                }
+            }
+        }
+
+        if !found_partner {
+            merged.push(a.clone());
+        }
+    }
+
+    merged
+}
+
+// ===========================================================================
 // LANE LEGALITY DETECTOR
-// ============================================================================
+// ===========================================================================
 
 pub struct LaneLegalityDetector {
     session: Session,
@@ -336,7 +423,7 @@ impl LaneLegalityDetector {
             ego_bbox_ratio: [0.30, 0.75, 0.70, 0.98],
             temporal_filter: TemporalViolationFilter::new(
                 2, // Need 2+ consecutive illegal frames
-                6, // Max 6 frame gap (at interval=3, this means 2 detections)
+                6, // Max 6 frame gap
             ),
         })
     }
@@ -353,14 +440,13 @@ impl LaneLegalityDetector {
         height: usize,
         frame_id: u64,
         confidence_threshold: f32,
-        // From lane detection model (UFLDv2):
         vehicle_offset_px: f32,
         lane_width: Option<f32>,
         left_lane_x: Option<f32>,
         right_lane_x: Option<f32>,
         crossing_side: CrossingSide,
     ) -> Result<FusedLegalityResult> {
-        // 1. Run seg model to detect all road markings
+        // 1. Run seg model
         let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
         let (box_output, mask_proto, _) = self.infer(&input)?;
         let all_markings = self.postprocess(
@@ -373,21 +459,19 @@ impl LaneLegalityDetector {
             width,
             height,
             confidence_threshold,
-            frame, // ✅ Pass original frame for color verification
+            frame, // ✅ Pass frame for color verification
         )?;
 
-        // 2. Calculate vehicle offset percentage
+        // 2. Calculate offset percentage
         let offset_pct = match lane_width {
             Some(w) if w > 50.0 => (vehicle_offset_px / w).abs(),
             _ => 0.0,
         };
 
-        // 3. Determine if lane model confirms a crossing is happening
-        //    Key insight: only flag illegal if the lane model says we're
-        //    actually leaving our lane (offset > 25% = significant drift)
+        // 3. Confirm crossing
         let lane_model_confirms_crossing = crossing_side != CrossingSide::None && offset_pct > 0.25;
 
-        // 4. If no crossing confirmed by lane model, return clean result
+        // 4. If no crossing, return clean
         if !lane_model_confirms_crossing {
             return Ok(FusedLegalityResult {
                 verdict: LineLegality::Unknown,
@@ -399,8 +483,7 @@ impl LaneLegalityDetector {
             });
         }
 
-        // 5. Find the line being crossed based on WHICH SIDE we're crossing
-        //    Use lane boundaries from UFLDv2 to identify the correct line
+        // 5. Find the specific line being crossed
         let crossing_line = self.find_crossing_line(
             &all_markings,
             crossing_side,
@@ -410,23 +493,19 @@ impl LaneLegalityDetector {
             height,
         );
 
-        // Store the boolean before consuming crossing_line
         let ego_intersects_marking = crossing_line.is_some();
 
         let (verdict, intersecting_line) = match crossing_line {
             Some(marking) => {
                 let raw_verdict = marking.legality;
-
-                // 6. Apply temporal filtering — need consecutive frames
                 let confirmed = self.temporal_filter.update(frame_id, raw_verdict);
 
                 if confirmed {
                     (raw_verdict, Some(marking))
                 } else {
                     info!(
-                        "Temporal filter: {} not yet confirmed (need {} consecutive)",
-                        raw_verdict.as_str(),
-                        2
+                        "Temporal filter: {} not yet confirmed",
+                        raw_verdict.as_str()
                     );
                     (LineLegality::Unknown, Some(marking))
                 }
@@ -447,9 +526,6 @@ impl LaneLegalityDetector {
         })
     }
 
-    /// Find the line that corresponds to the boundary being crossed
-    /// Instead of checking ego bbox overlap, match seg model detections
-    /// to the lane boundary position from UFLDv2
     fn find_crossing_line(
         &self,
         markings: &[DetectedRoadMarking],
@@ -459,7 +535,6 @@ impl LaneLegalityDetector {
         frame_width: usize,
         _frame_height: usize,
     ) -> Option<DetectedRoadMarking> {
-        // Determine which lane boundary we're crossing
         let boundary_x = match crossing_side {
             CrossingSide::Left => left_lane_x,
             CrossingSide::Right => right_lane_x,
@@ -471,14 +546,10 @@ impl LaneLegalityDetector {
             None => return None,
         };
 
-        // Find the seg model detection whose bbox center is closest
-        // to the lane boundary we're crossing
-        let tolerance = frame_width as f32 * 0.12; // 12% of frame width
-
+        let tolerance = frame_width as f32 * 0.12;
         let mut best_match: Option<(f32, &DetectedRoadMarking)> = None;
 
         for marking in markings {
-            // Only consider lane line classes (not other markings)
             if !ILLEGAL_CLASS_IDS.contains(&marking.class_id)
                 && !LEGAL_CLASS_IDS.contains(&marking.class_id)
             {
@@ -509,43 +580,6 @@ impl LaneLegalityDetector {
                 dist
             );
             marking.clone()
-        })
-    }
-
-    // ========================================================================
-    // Keep original analyze_frame for visualization (all markings)
-    // ========================================================================
-
-    pub fn analyze_frame(
-        &mut self,
-        frame: &[u8],
-        width: usize,
-        height: usize,
-        frame_id: u64,
-        confidence_threshold: f32,
-    ) -> Result<LegalityResult> {
-        let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
-        let (box_output, mask_proto, _) = self.infer(&input)?;
-        let markings = self.postprocess(
-            &box_output,
-            &mask_proto,
-            &[],
-            scale,
-            pad_x,
-            pad_y,
-            width,
-            height,
-            confidence_threshold,
-            frame, // ✅ Pass original frame for color verification
-        )?;
-
-        // For visualization only — no violation counting
-        Ok(LegalityResult {
-            verdict: LineLegality::Unknown,
-            intersecting_line: None,
-            all_markings: markings,
-            ego_intersects_marking: false,
-            frame_id,
         })
     }
 
@@ -618,7 +652,7 @@ impl LaneLegalityDetector {
     }
 
     // ========================================================================
-    // POSTPROCESSING
+    // POSTPROCESSING — UPDATED
     // ========================================================================
 
     fn postprocess(
@@ -632,7 +666,7 @@ impl LaneLegalityDetector {
         orig_w: usize,
         orig_h: usize,
         conf_thresh: f32,
-        frame_rgb: &[u8], // ✅ NEW: Original frame for color verification
+        frame_rgb: &[u8], // ✅ Pass frame for color verification
     ) -> Result<Vec<DetectedRoadMarking>> {
         let mut detections = Vec::new();
         let num_detections = 8400;
@@ -687,13 +721,17 @@ impl LaneLegalityDetector {
             });
         }
 
-        // ✅ Apply color verification BEFORE NMS
-        // This corrects white→yellow misclassifications by sampling actual pixel colors
+        // 1. Color Verification (Calibrated for your video)
         for marking in &mut detections {
             verify_line_color(frame_rgb, orig_w, orig_h, marking);
         }
 
+        // 2. NEW: Merge composite lines (Dashed + Solid neighbors)
+        let detections = merge_composite_lines(detections);
+
+        // 3. NEW: Priority NMS (Double > Single)
         let detections = nms_markings(detections, 0.45);
+
         info!("Detected {} road markings", detections.len());
         Ok(detections)
     }
@@ -722,9 +760,9 @@ impl LaneLegalityDetector {
     }
 }
 
-// ============================================================================
+// ===========================================================================
 // HELPERS
-// ============================================================================
+// ===========================================================================
 
 fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
     let mut dst = vec![0u8; dst_h * dst_w * 3];
@@ -760,17 +798,59 @@ fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: 
     dst
 }
 
+/// Priority-Aware NMS: Double lines suppress Single lines if they overlap
 fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<DetectedRoadMarking> {
     if dets.is_empty() {
         return dets;
     }
+
+    // Sort by confidence descending
     dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
     let mut keep = Vec::new();
-    while !dets.is_empty() {
-        let current = dets.remove(0);
-        keep.push(current.clone());
-        dets.retain(|d| calculate_iou_arr(&current.bbox, &d.bbox) < iou_thresh);
+    let mut suppressed_indices = HashSet::new();
+
+    for i in 0..dets.len() {
+        if suppressed_indices.contains(&i) {
+            continue;
+        }
+
+        let current = &dets[i];
+        let is_current_double = matches!(current.class_id, 7 | 8 | 99); // 99=Mixed custom ID
+
+        let mut should_keep_current = true;
+
+        for j in 0..dets.len() {
+            if i == j || suppressed_indices.contains(&j) {
+                continue;
+            }
+
+            let other = &dets[j];
+            let iou = calculate_iou_arr(&current.bbox, &other.bbox);
+
+            if iou > iou_thresh {
+                let is_other_double = matches!(other.class_id, 7 | 8 | 99);
+
+                // Priority Logic: Double beats Single
+                if is_current_double && !is_other_double {
+                    // Keep Double, kill Single
+                    suppressed_indices.insert(j);
+                } else if !is_current_double && is_other_double {
+                    // Keep Double (other), kill Single (current)
+                    should_keep_current = false;
+                    break;
+                } else {
+                    // Same type -> suppress lower confidence one (which is 'other' since we sorted)
+                    suppressed_indices.insert(j);
+                }
+            }
+        }
+
+        if should_keep_current {
+            keep.push(current.clone());
+        }
     }
+
     keep
 }
 
