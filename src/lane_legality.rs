@@ -212,7 +212,7 @@ fn verify_line_color(
     frame_height: usize,
     marking: &mut DetectedRoadMarking,
 ) {
-    // Only correct white classes that might be yellow (4=solid_single_white, 7=solid_double_white, 9=dashed_single_white)
+    // Only correct white classes that might be yellow
     let is_white_class = matches!(marking.class_id, 4 | 7 | 9);
     if !is_white_class {
         return;
@@ -221,8 +221,8 @@ fn verify_line_color(
     // Sample pixels from the bbox center region
     let cx = ((marking.bbox[0] + marking.bbox[2]) / 2.0) as usize;
     let cy = ((marking.bbox[1] + marking.bbox[3]) / 2.0) as usize;
-    let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(3.0) as usize;
-    let half_h = ((marking.bbox[3] - marking.bbox[1]) / 4.0).max(3.0) as usize;
+    let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(5.0) as usize; // ✅ Larger sample
+    let half_h = ((marking.bbox[3] - marking.bbox[1]) / 4.0).max(5.0) as usize;
 
     let mut total_r: u32 = 0;
     let mut total_g: u32 = 0;
@@ -242,9 +242,10 @@ fn verify_line_color(
                 let g = frame_rgb[idx + 1] as u32;
                 let b = frame_rgb[idx + 2] as u32;
 
-                // Only sample bright pixels (likely the line, not the road)
+                // ✅ RELAXED: Lower brightness threshold for dim yellow lines
                 let brightness = (r + g + b) / 3;
-                if brightness > 100 {
+                if brightness > 60 {
+                    // Was 100 → now 60
                     total_r += r;
                     total_g += g;
                     total_b += b;
@@ -255,21 +256,40 @@ fn verify_line_color(
     }
 
     if count < 5 {
-        return; // Not enough samples
+        debug!(
+            "⚠️  verify_line_color: Not enough samples for {} (only {} pixels above brightness 60)",
+            marking.class_name, count
+        );
+        return;
     }
 
     let avg_r = (total_r / count) as f32;
     let avg_g = (total_g / count) as f32;
     let avg_b = (total_b / count) as f32;
 
-    // Yellow detection heuristic:
-    // Yellow lines have high R, high G, low B
-    // R/B ratio > 1.6 and G/B ratio > 1.3 suggests yellow
-    let is_yellow = avg_b > 10.0 // avoid div-by-zero
-        && (avg_r / avg_b) > 1.6
-        && (avg_g / avg_b) > 1.3
-        && avg_r > 140.0
-        && avg_g > 100.0;
+    // ✅ DEBUG: Always log the sampled colors for white detections
+    debug!(
+        "🔍 Sampled {} pixels for {}: R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2}",
+        count,
+        marking.class_name,
+        avg_r,
+        avg_g,
+        avg_b,
+        if avg_b > 1.0 { avg_r / avg_b } else { 0.0 },
+        if avg_b > 1.0 { avg_g / avg_b } else { 0.0 }
+    );
+
+    // ✅ RELAXED: More permissive yellow detection for faint/worn lines
+    // Yellow has R≈G (both high), B low
+    let r_b_ratio = if avg_b > 5.0 { avg_r / avg_b } else { 0.0 };
+    let g_b_ratio = if avg_b > 5.0 { avg_g / avg_b } else { 0.0 };
+
+    let is_yellow = avg_b > 5.0          // Must have some blue (avoid div-by-zero)
+        && r_b_ratio > 1.3               // Was 1.6 → relaxed to 1.3
+        && g_b_ratio > 1.1               // Was 1.3 → relaxed to 1.1
+        && avg_r > 100.0                 // Was 140 → relaxed to 100
+        && avg_g > 80.0                  // Was 100 → relaxed to 80
+        && (avg_r - avg_b) > 40.0; // ✅ NEW: R must be significantly > B
 
     if is_yellow {
         let old_class = marking.class_id;
@@ -288,13 +308,19 @@ fn verify_line_color(
                 avg_r,
                 avg_g,
                 avg_b,
-                avg_r / avg_b.max(1.0),
-                avg_g / avg_b.max(1.0)
+                r_b_ratio,
+                g_b_ratio
             );
             marking.class_id = new_class;
             marking.class_name = class_id_to_name(new_class).to_string();
             marking.legality = class_id_to_legality(new_class);
         }
+    } else {
+        // ✅ DEBUG: Log why it wasn't detected as yellow
+        debug!(
+            "❌ Not yellow: R/B={:.2} (need >1.3), G/B={:.2} (need >1.1), R={:.0} (need >100), G={:.0} (need >80)",
+            r_b_ratio, g_b_ratio, avg_r, avg_g
+        );
     }
 }
 
