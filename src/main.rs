@@ -430,60 +430,87 @@ async fn process_video(
             }
 
             // 🆕 LANE LEGALITY DETECTION
+            // In the main processing loop, where you currently run legality detection:
+
             if let Some(ref mut detector) = legality_detector {
-                match detector.analyze_frame(
+                // Get lane model state
+                let vehicle_offset = analyzer
+                    .last_vehicle_state()
+                    .map(|vs| vs.lateral_offset)
+                    .unwrap_or(0.0);
+                let lane_width = analyzer.last_vehicle_state().and_then(|vs| vs.lane_width);
+
+                // Determine crossing side from state machine direction
+                let crossing_side = if analyzer.current_state() == "CROSSING"
+                    || analyzer.current_state() == "DRIFTING"
+                {
+                    // Use the sign of the offset to determine side
+                    if vehicle_offset < 0.0 {
+                        lane_legality::CrossingSide::Left
+                    } else {
+                        lane_legality::CrossingSide::Right
+                    }
+                } else {
+                    lane_legality::CrossingSide::None
+                };
+
+                match detector.analyze_frame_fused(
                     &frame.data,
                     frame.width,
                     frame.height,
                     frame_count,
                     config.lane_legality.confidence_threshold,
+                    vehicle_offset,
+                    lane_width,
+                    last_left_lane_x,
+                    last_right_lane_x,
+                    crossing_side,
                 ) {
-                    Ok(legality_result) => {
-                        if legality_result.ego_intersects_marking {
-                            match legality_result.verdict {
+                    Ok(fused_result) => {
+                        // Only count violations when BOTH models agree
+                        if fused_result.crossing_confirmed_by_lane_model
+                            && fused_result.verdict.is_illegal()
+                        {
+                            match fused_result.verdict {
                                 LineLegality::CriticalIllegal => {
                                     critical_violations += 1;
                                     warn!(
-                                        "🚨🚨 CRITICAL ILLEGAL CROSSING: {} at {:.2}s (frame {})",
-                                        legality_result
-                                            .intersecting_line
+                                        "🚨🚨 FUSED CRITICAL: {} at {:.2}s (offset: {:.1}%)",
+                                        fused_result
+                                            .line_type_from_seg_model
                                             .as_ref()
                                             .map(|l| l.class_name.as_str())
                                             .unwrap_or("unknown"),
                                         timestamp_ms / 1000.0,
-                                        frame_count
+                                        fused_result.vehicle_offset_pct * 100.0
                                     );
                                 }
                                 LineLegality::Illegal => {
                                     illegal_crossings += 1;
                                     warn!(
-                                        "🚨 ILLEGAL CROSSING: {} at {:.2}s (frame {})",
-                                        legality_result
-                                            .intersecting_line
+                                        "🚨 FUSED ILLEGAL: {} at {:.2}s (offset: {:.1}%)",
+                                        fused_result
+                                            .line_type_from_seg_model
                                             .as_ref()
                                             .map(|l| l.class_name.as_str())
                                             .unwrap_or("unknown"),
                                         timestamp_ms / 1000.0,
-                                        frame_count
-                                    );
-                                }
-                                LineLegality::Legal => {
-                                    debug!(
-                                        "✅ Legal crossing: {} at {:.2}s",
-                                        legality_result
-                                            .intersecting_line
-                                            .as_ref()
-                                            .map(|l| l.class_name.as_str())
-                                            .unwrap_or("dashed"),
-                                        timestamp_ms / 1000.0
+                                        fused_result.vehicle_offset_pct * 100.0
                                     );
                                 }
                                 _ => {}
                             }
                         }
-                        last_legality_result = Some(legality_result);
+                        // Store for visualization (keep all markings for overlay)
+                        last_legality_result = Some(LegalityResult {
+                            verdict: fused_result.verdict,
+                            intersecting_line: fused_result.line_type_from_seg_model,
+                            all_markings: fused_result.all_markings,
+                            ego_intersects_marking: fused_result.ego_intersects_marking,
+                            frame_id: frame_count,
+                        });
                     }
-                    Err(e) => debug!("Legality detection failed on frame {}: {}", frame_count, e),
+                    Err(e) => debug!("Fused legality failed: {}", e),
                 }
             }
         }
