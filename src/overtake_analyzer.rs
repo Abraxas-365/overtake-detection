@@ -1,187 +1,192 @@
 // src/overtake_analyzer.rs
 
+use crate::vehicle_detection::Detection;
+use std::collections::HashMap;
+use tracing::info;
+
 #[derive(Debug, Clone)]
-pub enum LaneChangeClassification {
-    Overtaking {
-        vehicles_passed: usize,
-        vehicle_types: Vec<String>,
-        is_legal: bool,
-        reason: String,
-    },
-    NormalLaneChange {
-        is_legal: bool,
-        reason: String,
-    },
+pub struct TrackedVehicle {
+    pub id: u32,
+    pub bbox: [f32; 4],
+    pub class_name: String,
+    pub first_seen_frame: u64,
+    pub last_seen_frame: u64,
+    pub position_history: Vec<VehiclePosition>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LaneLineType {
-    DashedWhite,       // Discontinua blanca
-    SolidWhite,        // Continua blanca
-    DashedYellow,      // Discontinua amarilla (center)
-    SolidYellow,       // Continua amarilla (no passing)
-    DoubleSolidYellow, // Doble continua (never cross)
-    Unknown,
+#[derive(Debug, Clone)]
+pub struct VehiclePosition {
+    pub frame_id: u64,
+    pub center_y: f32,
+    pub center_x: f32,
+}
+
+pub struct OvertakeAnalyzer {
+    next_id: u32,
+    tracked_vehicles: HashMap<u32, TrackedVehicle>,
+    iou_threshold: f32,
+    frame_width: f32,
+    frame_height: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct OvertakeEvent {
+    pub vehicle_id: u32,
+    pub class_name: String,
+    pub overtaken_at_frame: u64,
 }
 
 impl OvertakeAnalyzer {
-    /// Classify and analyze legality of the maneuver
-    pub fn classify_maneuver(
+    pub fn new(frame_width: f32, frame_height: f32) -> Self {
+        Self {
+            next_id: 0,
+            tracked_vehicles: HashMap::new(),
+            iou_threshold: 0.3,
+            frame_width,
+            frame_height,
+        }
+    }
+
+    pub fn update(&mut self, detections: Vec<Detection>, frame_id: u64) {
+        let mut matched_track_ids = Vec::new();
+        let mut unmatched_detections = Vec::new();
+
+        for det in detections {
+            let mut best_match: Option<(u32, f32)> = None;
+
+            for (track_id, track) in &self.tracked_vehicles {
+                if track.class_name != det.class_name {
+                    continue;
+                }
+
+                let iou = calculate_iou(&track.bbox, &det.bbox);
+                if iou > self.iou_threshold {
+                    if best_match.is_none() || iou > best_match.unwrap().1 {
+                        best_match = Some((*track_id, iou));
+                    }
+                }
+            }
+
+            if let Some((track_id, _)) = best_match {
+                if let Some(track) = self.tracked_vehicles.get_mut(&track_id) {
+                    track.bbox = det.bbox;
+                    track.last_seen_frame = frame_id;
+                    track.position_history.push(VehiclePosition {
+                        frame_id,
+                        center_x: (det.bbox[0] + det.bbox[2]) / 2.0,
+                        center_y: (det.bbox[1] + det.bbox[3]) / 2.0,
+                    });
+                    matched_track_ids.push(track_id);
+                }
+            } else {
+                unmatched_detections.push(det);
+            }
+        }
+
+        for det in unmatched_detections {
+            let center_x = (det.bbox[0] + det.bbox[2]) / 2.0;
+            let center_y = (det.bbox[1] + det.bbox[3]) / 2.0;
+
+            self.tracked_vehicles.insert(
+                self.next_id,
+                TrackedVehicle {
+                    id: self.next_id,
+                    bbox: det.bbox,
+                    class_name: det.class_name,
+                    first_seen_frame: frame_id,
+                    last_seen_frame: frame_id,
+                    position_history: vec![VehiclePosition {
+                        frame_id,
+                        center_x,
+                        center_y,
+                    }],
+                },
+            );
+            self.next_id += 1;
+        }
+
+        self.tracked_vehicles
+            .retain(|_, track| frame_id - track.last_seen_frame < 30);
+    }
+
+    pub fn analyze_overtake(
         &self,
         start_frame: u64,
         end_frame: u64,
         direction: &str,
-        lane_line_type: LaneLineType,
-        is_in_curve: bool,
-        has_oncoming_traffic: bool,
-    ) -> LaneChangeClassification {
-        // 1. Check if we overtook any vehicles
-        let overtakes = self.analyze_overtake(start_frame, end_frame, direction);
+    ) -> Vec<OvertakeEvent> {
+        let mut overtaken = Vec::new();
+        let ego_y = self.frame_height * 0.75;
 
-        if !overtakes.is_empty() {
-            // This is an OVERTAKING maneuver
-            let (is_legal, reason) = self.evaluate_overtaking_legality(
-                lane_line_type,
-                is_in_curve,
-                has_oncoming_traffic,
-                overtakes.len(),
-            );
-
-            LaneChangeClassification::Overtaking {
-                vehicles_passed: overtakes.len(),
-                vehicle_types: overtakes.iter().map(|o| o.class_name.clone()).collect(),
-                is_legal,
-                reason,
-            }
-        } else {
-            // This is a NORMAL LANE CHANGE (no vehicle ahead)
-            let (is_legal, reason) =
-                self.evaluate_lane_change_legality(lane_line_type, is_in_curve);
-
-            LaneChangeClassification::NormalLaneChange { is_legal, reason }
-        }
-    }
-
-    /// Evaluate legality of OVERTAKING (stricter rules)
-    fn evaluate_overtaking_legality(
-        &self,
-        lane_line: LaneLineType,
-        is_in_curve: bool,
-        has_oncoming: bool,
-        vehicles_count: usize,
-    ) -> (bool, String) {
-        use LaneLineType::*;
-
-        // Rule 1: Overtaking in curves is ILLEGAL (DS 016-2009-MTC Art. 215)
-        if is_in_curve {
-            return (
-                false,
-                "Overtaking in curve - ILLEGAL per Art. 215".to_string(),
-            );
-        }
-
-        // Rule 2: Solid yellow or double yellow = ILLEGAL overtaking
-        match lane_line {
-            SolidYellow => {
-                return (
-                    false,
-                    "Overtaking on solid yellow line - ILLEGAL".to_string(),
-                );
-            }
-            DoubleSolidYellow => {
-                return (
-                    false,
-                    "Overtaking on double solid yellow - ILLEGAL".to_string(),
-                );
-            }
-            _ => {}
-        }
-
-        // Rule 3: Oncoming traffic = ILLEGAL
-        if has_oncoming {
-            return (
-                false,
-                "Overtaking with oncoming traffic - ILLEGAL".to_string(),
-            );
-        }
-
-        // Rule 4: Multiple vehicles at once = ILLEGAL (Peru)
-        if vehicles_count > 1 {
-            return (
-                false,
-                format!("Overtaking {} vehicles at once - ILLEGAL", vehicles_count),
-            );
-        }
-
-        // Rule 5: Check line type
-        match lane_line {
-            DashedWhite | DashedYellow => (true, "Overtaking on dashed line - LEGAL".to_string()),
-            SolidWhite => {
-                // Technically allowed but discouraged
-                (
-                    true,
-                    "Overtaking on solid white - LEGAL but discouraged".to_string(),
-                )
-            }
-            Unknown => (
-                true,
-                "Overtaking - line type unknown, assuming legal".to_string(),
-            ),
-            _ => (false, "Overtaking conditions not met".to_string()),
-        }
-    }
-
-    /// Evaluate legality of NORMAL LANE CHANGE (less strict)
-    fn evaluate_lane_change_legality(
-        &self,
-        lane_line: LaneLineType,
-        is_in_curve: bool,
-    ) -> (bool, String) {
-        use LaneLineType::*;
-
-        // Normal lane changes are generally allowed, even in curves
-        // Exception: Double solid yellow
-        match lane_line {
-            DoubleSolidYellow => (false, "Crossing double solid yellow - ILLEGAL".to_string()),
-            SolidYellow => {
-                // Allowed if repositioning to turn/exit, but flag it
-                (
-                    true,
-                    "Lane change on solid yellow - LEGAL if turning, otherwise risky".to_string(),
-                )
-            }
-            _ => {
-                if is_in_curve {
-                    (
-                        true,
-                        "Lane change in curve - LEGAL (not overtaking)".to_string(),
-                    )
-                } else {
-                    (true, "Normal lane change - LEGAL".to_string())
-                }
-            }
-        }
-    }
-
-    /// Detect if there's oncoming traffic
-    pub fn detect_oncoming_traffic(&self, start_frame: u64, end_frame: u64) -> bool {
-        // Check for vehicles in opposite direction
-        // Vehicles in top-left quadrant moving right-to-left
-        for (_, track) in &self.tracked_vehicles {
+        for (vehicle_id, track) in &self.tracked_vehicles {
             if track.last_seen_frame < start_frame || track.first_seen_frame > end_frame {
                 continue;
             }
 
-            // Check if vehicle is in opposite lane (left side, top of frame)
-            if let Some(start_pos) = track.position_history.first() {
-                let is_opposite_lane = start_pos.center_x < self.frame_width / 3.0;
-                let is_distant = start_pos.center_y < self.frame_height / 3.0;
+            let start_pos = track
+                .position_history
+                .iter()
+                .find(|p| p.frame_id >= start_frame);
 
-                if is_opposite_lane && is_distant {
-                    return true;
+            let end_pos = track
+                .position_history
+                .iter()
+                .rev()
+                .find(|p| p.frame_id <= end_frame);
+
+            if let (Some(start), Some(end)) = (start_pos, end_pos) {
+                let was_in_front = start.center_y < ego_y - 50.0;
+                let is_behind = end.center_y > ego_y - 20.0;
+
+                if was_in_front && is_behind {
+                    let is_in_target_lane = if direction == "LEFT" {
+                        start.center_x < self.frame_width / 2.0
+                    } else {
+                        start.center_x > self.frame_width / 2.0
+                    };
+
+                    if is_in_target_lane {
+                        overtaken.push(OvertakeEvent {
+                            vehicle_id: *vehicle_id,
+                            class_name: track.class_name.clone(),
+                            overtaken_at_frame: end.frame_id,
+                        });
+
+                        info!(
+                            "🚗 Overtook {} (ID #{}) during frames {}-{}",
+                            track.class_name, vehicle_id, start_frame, end_frame
+                        );
+                    }
                 }
             }
         }
-        false
+
+        overtaken
+    }
+
+    pub fn get_active_vehicle_count(&self) -> usize {
+        self.tracked_vehicles.len()
+    }
+
+    pub fn get_total_unique_vehicles(&self) -> u32 {
+        self.next_id
+    }
+}
+
+fn calculate_iou(box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
+    let x1 = box1[0].max(box2[0]);
+    let y1 = box1[1].max(box2[1]);
+    let x2 = box1[2].min(box2[2]);
+    let y2 = box1[3].min(box2[3]);
+
+    let intersection = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+    let area1 = (box1[2] - box1[0]) * (box1[3] - box1[1]);
+    let area2 = (box2[2] - box2[0]) * (box2[3] - box2[1]);
+    let union = area1 + area2 - intersection;
+
+    if union > 0.0 {
+        intersection / union
+    } else {
+        0.0
     }
 }
