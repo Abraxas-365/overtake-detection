@@ -221,7 +221,7 @@ fn verify_line_color(
     // Sample pixels from the bbox center region
     let cx = ((marking.bbox[0] + marking.bbox[2]) / 2.0) as usize;
     let cy = ((marking.bbox[1] + marking.bbox[3]) / 2.0) as usize;
-    let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(5.0) as usize; // ✅ Larger sample
+    let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(5.0) as usize;
     let half_h = ((marking.bbox[3] - marking.bbox[1]) / 4.0).max(5.0) as usize;
 
     let mut total_r: u32 = 0;
@@ -242,10 +242,9 @@ fn verify_line_color(
                 let g = frame_rgb[idx + 1] as u32;
                 let b = frame_rgb[idx + 2] as u32;
 
-                // ✅ RELAXED: Lower brightness threshold for dim yellow lines
+                // Brightness filter: keep > 60 to catch dim lines
                 let brightness = (r + g + b) / 3;
                 if brightness > 60 {
-                    // Was 100 → now 60
                     total_r += r;
                     total_g += g;
                     total_b += b;
@@ -256,10 +255,6 @@ fn verify_line_color(
     }
 
     if count < 5 {
-        info!(
-            "⚠️  verify_line_color: Not enough samples for {} (only {} pixels above brightness 60)",
-            marking.class_name, count
-        );
         return;
     }
 
@@ -267,29 +262,20 @@ fn verify_line_color(
     let avg_g = (total_g / count) as f32;
     let avg_b = (total_b / count) as f32;
 
-    // ✅ DEBUG: Always log the sampled colors for white detections
-    info!(
-        "🔍 Sampled {} pixels for {}: R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2}",
-        count,
-        marking.class_name,
-        avg_r,
-        avg_g,
-        avg_b,
-        if avg_b > 1.0 { avg_r / avg_b } else { 0.0 },
-        if avg_b > 1.0 { avg_g / avg_b } else { 0.0 }
-    );
+    // R/B ratio calculation (safe division)
+    let r_b_ratio = if avg_b > 1.0 { avg_r / avg_b } else { 2.0 };
+    let g_b_ratio = if avg_b > 1.0 { avg_g / avg_b } else { 2.0 };
 
-    // ✅ RELAXED: More permissive yellow detection for faint/worn lines
-    // Yellow has R≈G (both high), B low
-    let r_b_ratio = if avg_b > 5.0 { avg_r / avg_b } else { 0.0 };
-    let g_b_ratio = if avg_b > 5.0 { avg_g / avg_b } else { 0.0 };
-
-    let is_yellow = avg_b > 5.0          // Must have some blue (avoid div-by-zero)
-        && r_b_ratio > 1.3               // Was 1.6 → relaxed to 1.3
-        && g_b_ratio > 1.1               // Was 1.3 → relaxed to 1.1
-        && avg_r > 100.0                 // Was 140 → relaxed to 100
-        && avg_g > 80.0                  // Was 100 → relaxed to 80
-        && (avg_r - avg_b) > 40.0; // ✅ NEW: R must be significantly > B
+    // ✅ CALIBRATED THRESHOLDS based on your logs:
+    // Yellow lines in logs: R/B ~1.15 to 1.25
+    // White lines in logs:  R/B ~0.98 to 1.02
+    // New Threshold:        > 1.08 (Safe gap)
+    let is_yellow = avg_b > 1.0
+        && r_b_ratio > 1.08      // Reduced from 1.3
+        && g_b_ratio > 1.05      // Reduced from 1.1
+        && avg_r > 90.0          // Reduced from 100.0
+        && avg_g > 90.0          // Reduced from 100.0
+        && (avg_r - avg_b) > 15.0; // Reduced difference check
 
     if is_yellow {
         let old_class = marking.class_id;
@@ -302,24 +288,23 @@ fn verify_line_color(
 
         if new_class != old_class {
             info!(
-                "🎨 Color correction: {} → {} (R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2})",
+                "🎨 Color correction: {} → {} (R={:.0}, G={:.0}, B={:.0}, R/B={:.2})",
                 class_id_to_name(old_class),
                 class_id_to_name(new_class),
                 avg_r,
                 avg_g,
                 avg_b,
-                r_b_ratio,
-                g_b_ratio
+                r_b_ratio
             );
             marking.class_id = new_class;
             marking.class_name = class_id_to_name(new_class).to_string();
             marking.legality = class_id_to_legality(new_class);
         }
     } else {
-        // ✅ DEBUG: Log why it wasn't detected as yellow
-        info!(
-            "❌ Not yellow: R/B={:.2} (need >1.3), G/B={:.2} (need >1.1), R={:.0} (need >100), G={:.0} (need >80)",
-            r_b_ratio, g_b_ratio, avg_r, avg_g
+        // Debug logging to keep verifying
+        debug!(
+            "Checked {}: Not yellow (R/B={:.2}, need >1.08)",
+            marking.class_name, r_b_ratio
         );
     }
 }
