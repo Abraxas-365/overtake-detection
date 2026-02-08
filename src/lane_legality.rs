@@ -300,6 +300,9 @@ impl LaneLegalityDetector {
             height,
         );
 
+        // Store the boolean before consuming crossing_line
+        let ego_intersects_marking = crossing_line.is_some();
+
         let (verdict, intersecting_line) = match crossing_line {
             Some(marking) => {
                 let raw_verdict = marking.legality;
@@ -330,7 +333,7 @@ impl LaneLegalityDetector {
             line_type_from_seg_model: intersecting_line,
             vehicle_offset_pct: offset_pct,
             all_markings,
-            ego_intersects_marking: crossing_line.is_some(),
+            ego_intersects_marking, // ✅ Use the stored value
         })
     }
 
