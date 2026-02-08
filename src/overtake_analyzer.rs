@@ -116,13 +116,25 @@ impl OvertakeAnalyzer {
         direction: &str,
     ) -> Vec<OvertakeEvent> {
         let mut overtaken = Vec::new();
-        let ego_y = self.frame_height * 0.75;
+
+        // Ego vehicle is at bottom of frame
+        let ego_y = self.frame_height * 0.70; // 🆕 Changed from 0.75 to 0.70
+
+        info!(
+            "🔍 Analyzing overtake: frames {}-{}, direction: {}, active vehicles: {}",
+            start_frame,
+            end_frame,
+            direction,
+            self.tracked_vehicles.len()
+        );
 
         for (vehicle_id, track) in &self.tracked_vehicles {
+            // Only consider vehicles visible during the maneuver
             if track.last_seen_frame < start_frame || track.first_seen_frame > end_frame {
                 continue;
             }
 
+            // Get position at start and end
             let start_pos = track
                 .position_history
                 .iter()
@@ -135,15 +147,38 @@ impl OvertakeAnalyzer {
                 .find(|p| p.frame_id <= end_frame);
 
             if let (Some(start), Some(end)) = (start_pos, end_pos) {
-                let was_in_front = start.center_y < ego_y - 50.0;
-                let is_behind = end.center_y > ego_y - 20.0;
+                // 🆕 More lenient detection
+                // Vehicle was ahead (higher in frame = smaller Y)
+                let was_in_front = start.center_y < ego_y - 30.0; // 🆕 Changed from 50 to 30
 
-                if was_in_front && is_behind {
+                // Vehicle is now behind/alongside (lower in frame = larger Y)
+                let is_behind = end.center_y > ego_y - 50.0; // 🆕 Changed from -20 to -50
+
+                // 🆕 Also check if vehicle moved DOWN in frame (relative motion)
+                let moved_down = end.center_y > start.center_y + 20.0;
+
+                info!(
+                    "  Vehicle ID #{} ({}): start_y={:.1}, end_y={:.1}, ego_y={:.1}",
+                    vehicle_id, track.class_name, start.center_y, end.center_y, ego_y
+                );
+                info!(
+                    "    was_in_front={}, is_behind={}, moved_down={}",
+                    was_in_front, is_behind, moved_down
+                );
+
+                // 🆕 More flexible detection: either classic logic OR relative motion
+                if (was_in_front && is_behind) || (moved_down && start.center_y < ego_y) {
+                    // Check if vehicle is in the target lane
                     let is_in_target_lane = if direction == "LEFT" {
-                        start.center_x < self.frame_width / 2.0
+                        start.center_x < self.frame_width / 2.0 + 100.0 // 🆕 Added margin
                     } else {
-                        start.center_x > self.frame_width / 2.0
+                        start.center_x > self.frame_width / 2.0 - 100.0 // 🆕 Added margin
                     };
+
+                    info!(
+                        "    is_in_target_lane={}, center_x={:.1}, frame_width={:.1}",
+                        is_in_target_lane, start.center_x, self.frame_width
+                    );
 
                     if is_in_target_lane {
                         overtaken.push(OvertakeEvent {
@@ -153,12 +188,22 @@ impl OvertakeAnalyzer {
                         });
 
                         info!(
-                            "🚗 Overtook {} (ID #{}) during frames {}-{}",
+                            "✅ Overtook {} (ID #{}) during frames {}-{}",
                             track.class_name, vehicle_id, start_frame, end_frame
                         );
+                    } else {
+                        info!("    ❌ Not in target lane");
                     }
+                } else {
+                    info!("    ❌ Didn't meet overtake criteria");
                 }
             }
+        }
+
+        if overtaken.is_empty() {
+            info!("⚠️  No vehicles detected as overtaken");
+        } else {
+            info!("🎯 Total vehicles overtaken: {}", overtaken.len());
         }
 
         overtaken
