@@ -201,10 +201,14 @@ impl OvertakeAnalyzer {
                 // 🆕 More flexible detection: either classic logic OR relative motion
                 if (was_in_front && is_behind) || (moved_down && start.center_y < ego_y) {
                     // Check if vehicle is in the target lane
+                    // 🆕 CORRECTED: When overtaking LEFT, vehicle is on the RIGHT (your original lane)
+                    // When overtaking RIGHT, vehicle is on the LEFT (your original lane)
                     let is_in_target_lane = if direction == "LEFT" {
-                        start.center_x < self.frame_width / 2.0 + 100.0 // 🆕 Added margin
+                        // Overtaking by going left → vehicle is on the right
+                        start.center_x > self.frame_width / 2.0 - 100.0 // ✅ RIGHT side
                     } else {
-                        start.center_x > self.frame_width / 2.0 - 100.0 // 🆕 Added margin
+                        // Overtaking by going right → vehicle is on the left
+                        start.center_x < self.frame_width / 2.0 + 100.0 // ✅ LEFT side
                     };
 
                     info!(
