@@ -256,7 +256,7 @@ fn verify_line_color(
     }
 
     if count < 5 {
-        debug!(
+        info!(
             "⚠️  verify_line_color: Not enough samples for {} (only {} pixels above brightness 60)",
             marking.class_name, count
         );
@@ -268,7 +268,7 @@ fn verify_line_color(
     let avg_b = (total_b / count) as f32;
 
     // ✅ DEBUG: Always log the sampled colors for white detections
-    debug!(
+    info!(
         "🔍 Sampled {} pixels for {}: R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2}",
         count,
         marking.class_name,
@@ -317,7 +317,7 @@ fn verify_line_color(
         }
     } else {
         // ✅ DEBUG: Log why it wasn't detected as yellow
-        debug!(
+        info!(
             "❌ Not yellow: R/B={:.2} (need >1.3), G/B={:.2} (need >1.1), R={:.0} (need >100), G={:.0} (need >80)",
             r_b_ratio, g_b_ratio, avg_r, avg_g
         );
