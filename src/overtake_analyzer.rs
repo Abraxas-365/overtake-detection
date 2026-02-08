@@ -47,6 +47,10 @@ impl OvertakeAnalyzer {
         }
     }
 
+    pub fn get_tracked_vehicles(&self) -> &HashMap<u32, TrackedVehicle> {
+        &self.tracked_vehicles
+    }
+
     pub fn update(&mut self, detections: Vec<Detection>, frame_id: u64) {
         let mut matched_track_ids = Vec::new();
         let mut unmatched_detections = Vec::new();

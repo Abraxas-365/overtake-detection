@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Buffer to capture frames during a lane change event with pre-buffering
 pub struct LaneChangeFrameBuffer {
@@ -117,7 +117,7 @@ pub struct DetectionMetadata {
     /// Average lane width in pixels during the maneuver
     pub avg_lane_width_px: Option<f32>,
 
-    // 🆕 CURVE DETECTION METADATA
+    // CURVE DETECTION METADATA
     /// Whether a curve was detected during the maneuver
     pub curve_detected: bool,
     /// Average angle of the curve in degrees (0 if no curve)
@@ -126,6 +126,16 @@ pub struct DetectionMetadata {
     pub curve_confidence: f32,
     /// Type of curve: "NONE", "MODERATE", "SHARP"
     pub curve_type: String,
+
+    // SHADOW OVERTAKE METADATA
+    /// Whether a shadow overtake was detected (vehicle blocking visibility ahead)
+    pub shadow_overtake_detected: bool,
+    /// Number of distinct vehicles that blocked visibility during the maneuver
+    pub shadow_overtake_count: u32,
+    /// Worst severity level: "NONE", "WARNING", "DANGEROUS", "CRITICAL"
+    pub shadow_worst_severity: String,
+    /// List of blocking vehicles e.g. ["car (ID #3)", "truck (ID #7)"]
+    pub shadow_blocking_vehicles: Vec<String>,
 }
 
 /// Enhanced payload for the legality analysis API
@@ -139,7 +149,7 @@ pub struct LaneChangeLegalityRequest {
     pub duration_ms: Option<f64>,
     pub source_id: String,
     pub frames: Vec<FrameData>,
-    /// Detection quality metadata (now includes curve info)
+    /// Detection quality metadata (includes curve + shadow info)
     pub detection_metadata: DetectionMetadata,
 }
 
@@ -246,12 +256,12 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
 }
 
 /// Build the API request payload with enhanced metadata
-/// 🆕 Now includes curve_info parameter
+/// Includes curve_info and shadow overtake info (extracted from event metadata)
 pub fn build_legality_request(
     event: &LaneChangeEvent,
     captured_frames: &[Frame],
     num_frames_to_send: usize,
-    curve_info: CurveInfo, // 🆕 NEW PARAMETER
+    curve_info: CurveInfo,
 ) -> Result<LaneChangeLegalityRequest, anyhow::Error> {
     let key_frames = extract_key_frames_for_lane_change(captured_frames, num_frames_to_send);
 
@@ -339,13 +349,45 @@ pub fn build_legality_request(
         .and_then(|v| v.as_f64())
         .map(|v| v as f32);
 
-    // 🆕 Convert CurveType enum to string
+    // ── Curve info ───────────────────────────────────────────────────────
     let curve_type_str = match curve_info.curve_type {
         CurveType::None => "NONE",
         CurveType::Moderate => "MODERATE",
         CurveType::Sharp => "SHARP",
     };
 
+    // ── Shadow overtake info (extracted from event metadata) ─────────────
+    let shadow_detected = event
+        .metadata
+        .get("shadow_overtake_detected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let shadow_count = event
+        .metadata
+        .get("shadow_overtake_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let shadow_severity = event
+        .metadata
+        .get("shadow_worst_severity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NONE")
+        .to_string();
+
+    let shadow_vehicles: Vec<String> = event
+        .metadata
+        .get("shadow_blocking_vehicles")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // ── Build metadata struct ────────────────────────────────────────────
     let metadata = DetectionMetadata {
         detection_confidence: event.confidence,
         max_offset_normalized,
@@ -355,11 +397,16 @@ pub fn build_legality_request(
         fps,
         region: "PE".to_string(),
         avg_lane_width_px,
-        // 🆕 CURVE INFORMATION
+        // Curve
         curve_detected: curve_info.is_curve,
         curve_angle_degrees: curve_info.angle_degrees,
         curve_confidence: curve_info.confidence,
         curve_type: curve_type_str.to_string(),
+        // Shadow overtake
+        shadow_overtake_detected: shadow_detected,
+        shadow_overtake_count: shadow_count,
+        shadow_worst_severity: shadow_severity,
+        shadow_blocking_vehicles: shadow_vehicles,
     };
 
     info!(
@@ -369,13 +416,23 @@ pub fn build_legality_request(
         metadata.both_lanes_ratio * 100.0
     );
 
-    // 🆕 Log curve info if detected
+    // Log curve info if detected
     if curve_info.is_curve {
         info!(
             "🌀 Curve detected: type={}, angle={:.1}°, confidence={:.0}%",
             curve_type_str,
             curve_info.angle_degrees,
             curve_info.confidence * 100.0
+        );
+    }
+
+    // Log shadow overtake info if detected
+    if shadow_detected {
+        warn!(
+            "⚫ Shadow overtake included in request: count={}, severity={}, vehicles={:?}",
+            metadata.shadow_overtake_count,
+            metadata.shadow_worst_severity,
+            metadata.shadow_blocking_vehicles
         );
     }
 
@@ -434,7 +491,7 @@ pub async fn send_to_legality_api(
 }
 
 /// Print the request payload to console with enhanced metadata
-/// 🆕 Now includes curve information display
+/// Includes curve information and shadow overtake display
 pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
     println!("\n============================================================");
     println!("🚗 LANE CHANGE LEGALITY CHECK REQUEST");
@@ -480,7 +537,7 @@ pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
         println!("  • Avg lane width:   {:.0}px", width);
     }
 
-    // 🆕 PRINT CURVE INFORMATION
+    // CURVE INFORMATION
     if request.detection_metadata.curve_detected {
         println!("\n🌀 Curve Detection:");
         println!(
@@ -502,6 +559,32 @@ pub fn print_legality_request(request: &LaneChangeLegalityRequest) {
         }
     } else {
         println!("\n🌀 Curve Detection: No curve detected (straight road)");
+    }
+
+    // SHADOW OVERTAKE INFORMATION
+    if request.detection_metadata.shadow_overtake_detected {
+        println!("\n⚫ Shadow Overtake Detection:");
+        println!(
+            "  • Blocking vehicles: {}",
+            request.detection_metadata.shadow_overtake_count
+        );
+        println!(
+            "  • Worst severity:    {}",
+            request.detection_metadata.shadow_worst_severity
+        );
+        for vehicle in &request.detection_metadata.shadow_blocking_vehicles {
+            println!("  • Vehicle:           {}", vehicle);
+        }
+        println!(
+            "  ⚠️  WARNING: Shadow overtake — visibility blocked by vehicle ahead in overtaking lane"
+        );
+        println!("  ⚠️  This is EXTREMELY DANGEROUS and ILLEGAL (DS 016-2009-MTC Art. 90)");
+        println!(
+            "  ⚠️  Driver cannot see oncoming traffic due to {} blocking vehicle(s)",
+            request.detection_metadata.shadow_overtake_count
+        );
+    } else {
+        println!("\n⚫ Shadow Overtake Detection: None (clear forward visibility)");
     }
 
     println!("\n🎬 Frames for analysis: {}", request.frames.len());
@@ -582,5 +665,110 @@ mod tests {
             };
             assert_eq!(curve_str, expected_str);
         }
+    }
+
+    #[test]
+    fn test_shadow_metadata_defaults_when_absent() {
+        // When event has no shadow metadata, defaults should be safe
+        use crate::types::{Direction, LaneChangeEvent};
+
+        let event = LaneChangeEvent::new(1000.0, 10, 50, Direction::Left, 0.8);
+
+        // Simulate what build_legality_request does
+        let shadow_detected = event
+            .metadata
+            .get("shadow_overtake_detected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let shadow_count = event
+            .metadata
+            .get("shadow_overtake_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let shadow_severity = event
+            .metadata
+            .get("shadow_worst_severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("NONE")
+            .to_string();
+
+        let shadow_vehicles: Vec<String> = event
+            .metadata
+            .get("shadow_blocking_vehicles")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(!shadow_detected);
+        assert_eq!(shadow_count, 0);
+        assert_eq!(shadow_severity, "NONE");
+        assert!(shadow_vehicles.is_empty());
+    }
+
+    #[test]
+    fn test_shadow_metadata_present() {
+        use crate::types::{Direction, LaneChangeEvent};
+
+        let mut event = LaneChangeEvent::new(1000.0, 10, 50, Direction::Left, 0.8);
+
+        // Simulate attaching shadow metadata
+        event.metadata.insert(
+            "shadow_overtake_detected".to_string(),
+            serde_json::json!(true),
+        );
+        event
+            .metadata
+            .insert("shadow_overtake_count".to_string(), serde_json::json!(2));
+        event.metadata.insert(
+            "shadow_worst_severity".to_string(),
+            serde_json::json!("CRITICAL"),
+        );
+        event.metadata.insert(
+            "shadow_blocking_vehicles".to_string(),
+            serde_json::json!(["car (ID #3)", "truck (ID #7)"]),
+        );
+
+        let shadow_detected = event
+            .metadata
+            .get("shadow_overtake_detected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let shadow_count = event
+            .metadata
+            .get("shadow_overtake_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let shadow_severity = event
+            .metadata
+            .get("shadow_worst_severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("NONE")
+            .to_string();
+
+        let shadow_vehicles: Vec<String> = event
+            .metadata
+            .get("shadow_blocking_vehicles")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(shadow_detected);
+        assert_eq!(shadow_count, 2);
+        assert_eq!(shadow_severity, "CRITICAL");
+        assert_eq!(shadow_vehicles.len(), 2);
+        assert_eq!(shadow_vehicles[0], "car (ID #3)");
+        assert_eq!(shadow_vehicles[1], "truck (ID #7)");
     }
 }

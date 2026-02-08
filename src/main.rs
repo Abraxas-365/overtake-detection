@@ -5,8 +5,9 @@ mod frame_buffer;
 mod inference;
 mod lane_detection;
 mod overtake_analyzer;
-mod overtake_tracker; // 🆕 Add this
+mod overtake_tracker;
 mod preprocessing;
+mod shadow_overtake; // 🆕
 mod types;
 mod vehicle_detection;
 mod video_processor;
@@ -18,25 +19,20 @@ use frame_buffer::{
     send_to_legality_api, LaneChangeFrameBuffer,
 };
 use overtake_analyzer::OvertakeAnalyzer;
-use overtake_tracker::{OvertakeResult, OvertakeTracker}; // 🆕 Add this
+use overtake_tracker::{OvertakeResult, OvertakeTracker};
+use shadow_overtake::{ShadowOvertakeDetector, ShadowOvertakeEvent}; // 🆕
 use std::path::Path;
 use tracing::{debug, error, info, warn};
-use types::{CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
+use types::{CurveInfo, DetectedLane, Direction, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 use vehicle_detection::YoloDetector;
 
 /// Configuration for legality analysis
 struct LegalityAnalysisConfig {
-    /// Number of frames to extract and send for analysis
     num_frames_to_analyze: usize,
-    /// Maximum frames to buffer during lane change
     max_buffer_frames: usize,
-    /// Whether to save the request payload to a file
     save_to_file: bool,
-    /// Whether to print the request to console
     print_to_console: bool,
-    /// Whether to send to the API
     send_to_api: bool,
-    /// API URL for legality analysis
     api_url: String,
 }
 
@@ -64,7 +60,6 @@ async fn main() -> Result<()> {
     let config = types::Config::load("config.yaml")?;
     info!("✓ Configuration loaded");
 
-    // Log key detection parameters
     info!(
         "Detection thresholds: drift={:.2}, crossing={:.2}, confirm_frames={}",
         config.detection.drift_threshold,
@@ -76,7 +71,6 @@ async fn main() -> Result<()> {
     info!("✓ Inference engine ready");
 
     let video_processor = video_processor::VideoProcessor::new(config.clone());
-
     let video_files = video_processor.find_video_files()?;
 
     if video_files.is_empty() {
@@ -86,7 +80,6 @@ async fn main() -> Result<()> {
 
     info!("Found {} video file(s) to process", video_files.len());
 
-    // Legality analysis configuration
     let legality_config = LegalityAnalysisConfig {
         num_frames_to_analyze: 5,
         max_buffer_frames: 90,
@@ -124,15 +117,12 @@ async fn main() -> Result<()> {
                 info!(
                     "  Valid position frames: {} ({:.1}%)",
                     stats.frames_with_position,
-                    100.0 * stats.frames_with_position as f64 / stats.total_frames as f64
+                    100.0 * stats.frames_with_position as f64 / stats.total_frames.max(1) as f64
                 );
                 info!("  Lane changes detected: {}", stats.lane_changes_detected);
-
-                // 🆕 Overtake-specific stats
                 info!("  ✅ Complete overtakes: {}", stats.complete_overtakes);
                 info!("  ⚠️  Incomplete overtakes: {}", stats.incomplete_overtakes);
                 info!("  ↔️  Simple lane changes: {}", stats.simple_lane_changes);
-
                 info!("  Events sent to API: {}", stats.events_sent_to_api);
                 if stats.curves_detected > 0 {
                     info!("  🌀 Curves detected: {}", stats.curves_detected);
@@ -158,6 +148,17 @@ async fn main() -> Result<()> {
                     "  🔢 Unique vehicles tracked: {}",
                     stats.unique_vehicles_seen
                 );
+
+                // 🆕 Shadow overtake stats
+                if stats.shadow_overtakes_detected > 0 {
+                    warn!(
+                        "  ⚫ SHADOW OVERTAKES: {} detected!",
+                        stats.shadow_overtakes_detected
+                    );
+                } else {
+                    info!("  ⚫ Shadow overtakes: 0 (clean overtakes)");
+                }
+
                 info!("  Processing Speed: {:.1} FPS", stats.avg_fps);
             }
             Err(e) => {
@@ -173,17 +174,102 @@ struct ProcessingStats {
     total_frames: u64,
     frames_with_position: u64,
     lane_changes_detected: usize,
-    complete_overtakes: usize,   // 🆕 Add this
-    incomplete_overtakes: usize, // 🆕 Add this
-    simple_lane_changes: usize,  // 🆕 Add this
+    complete_overtakes: usize,
+    incomplete_overtakes: usize,
+    simple_lane_changes: usize,
     events_sent_to_api: usize,
     curves_detected: usize,
     total_vehicles_detected: usize,
     total_vehicles_overtaken: usize,
     unique_vehicles_seen: u32,
+    shadow_overtakes_detected: usize, // 🆕
     duration_secs: f64,
     avg_fps: f64,
 }
+
+// ============================================================================
+// HELPER: Extract lane boundaries from detected lanes
+// ============================================================================
+
+fn extract_lane_boundaries(
+    lanes: &[Lane],
+    frame_width: u32,
+    frame_height: u32,
+    reference_y_ratio: f32,
+) -> (Option<f32>, Option<f32>) {
+    let reference_y = frame_height as f32 * reference_y_ratio;
+    let vehicle_x = frame_width as f32 / 2.0;
+
+    let mut left_x: Option<f32> = None;
+    let mut right_x: Option<f32> = None;
+
+    for lane in lanes {
+        if let Some(x) = lane.get_x_at_y(reference_y) {
+            if x < vehicle_x {
+                if left_x.is_none() || x > left_x.unwrap() {
+                    left_x = Some(x);
+                }
+            } else if right_x.is_none() || x < right_x.unwrap() {
+                right_x = Some(x);
+            }
+        }
+    }
+
+    (left_x, right_x)
+}
+
+// ============================================================================
+// HELPER: Attach shadow events to a LaneChangeEvent's metadata
+// ============================================================================
+
+fn attach_shadow_metadata(event: &mut LaneChangeEvent, shadow_events: &[ShadowOvertakeEvent]) {
+    let detected = !shadow_events.is_empty();
+
+    event.metadata.insert(
+        "shadow_overtake_detected".to_string(),
+        serde_json::json!(detected),
+    );
+    event.metadata.insert(
+        "shadow_overtake_count".to_string(),
+        serde_json::json!(shadow_events.len()),
+    );
+
+    if detected {
+        let worst_severity = shadow_events
+            .iter()
+            .map(|e| e.severity)
+            .max_by_key(|s| s.rank())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "NONE".to_string());
+
+        let blocking_vehicles: Vec<String> = shadow_events
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} (ID #{})",
+                    e.blocking_vehicle_class, e.blocking_vehicle_id
+                )
+            })
+            .collect();
+
+        event.metadata.insert(
+            "shadow_worst_severity".to_string(),
+            serde_json::json!(worst_severity),
+        );
+        event.metadata.insert(
+            "shadow_blocking_vehicles".to_string(),
+            serde_json::json!(blocking_vehicles),
+        );
+        event.metadata.insert(
+            "shadow_events".to_string(),
+            serde_json::json!(shadow_events),
+        );
+    }
+}
+
+// ============================================================================
+// VIDEO PROCESSING
+// ============================================================================
 
 async fn process_video(
     video_path: &Path,
@@ -198,7 +284,6 @@ async fn process_video(
     let start_time = Instant::now();
 
     let mut reader = video_processor.open_video(video_path)?;
-
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
@@ -216,66 +301,90 @@ async fn process_video(
     let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
     analyzer.set_source_id(video_path.to_string_lossy().to_string());
 
-    // Initialize YOLO detector
     let mut yolo_detector = YoloDetector::new("models/yolov8n.onnx")?;
     info!("✓ YOLO vehicle detector ready");
 
-    // Initialize overtake analyzer
     let mut overtake_analyzer = OvertakeAnalyzer::new(reader.width as f32, reader.height as f32);
     info!("✓ Overtake analyzer ready");
 
-    // 🆕 Initialize overtake tracker (combines lane changes into overtakes)
     let mut overtake_tracker = OvertakeTracker::new(30.0, reader.fps);
-    info!("✓ Overtake tracker ready (15s timeout)");
+    info!("✓ Overtake tracker ready (30s timeout)");
 
-    // PREPARE OUTPUT FILE
+    // 🆕 Shadow overtake detector
+    let mut shadow_detector =
+        ShadowOvertakeDetector::new(reader.width as f32, reader.height as f32);
+    info!("✓ Shadow overtake detector ready");
+
+    // Output file
     std::fs::create_dir_all(&config.video.output_dir)?;
     let video_name = video_path.file_stem().unwrap().to_str().unwrap();
     let jsonl_path =
         Path::new(&config.video.output_dir).join(format!("{}_overtakes.jsonl", video_name));
-
     let mut results_file = std::fs::File::create(&jsonl_path)?;
     info!("💾 Results will be written to: {}", jsonl_path.display());
 
+    // Counters
     let mut lane_changes_count: usize = 0;
-    let mut complete_overtakes: usize = 0; // 🆕
-    let mut incomplete_overtakes: usize = 0; // 🆕
-    let mut simple_lane_changes: usize = 0; // 🆕
+    let mut complete_overtakes: usize = 0;
+    let mut incomplete_overtakes: usize = 0;
+    let mut simple_lane_changes: usize = 0;
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
     let mut events_sent_to_api: usize = 0;
     let mut curves_detected: usize = 0;
     let mut total_vehicles_detected: usize = 0;
     let mut total_vehicles_overtaken: usize = 0;
+    let mut shadow_overtakes_detected: usize = 0; // 🆕
 
     let mut previous_state = "CENTERED".to_string();
-
-    // Frame buffer for capturing lane change frames
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
-
     let lane_confidence_threshold = config.detection.min_lane_confidence;
+
+    // 🆕 Keep latest lane boundaries for shadow detector
+    let mut last_left_lane_x: Option<f32> = None;
+    let mut last_right_lane_x: Option<f32> = None;
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
-        // Run vehicle detection and tracking every 3 frames
+        // ── YOLO detection every 3 frames ────────────────────────────────
         if frame_count % 3 == 0 {
             match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
                 Ok(detections) => {
-                    let vehicle_count = detections.len();
-                    total_vehicles_detected += vehicle_count;
-
-                    // Update tracking
+                    total_vehicles_detected += detections.len();
                     overtake_analyzer.update(detections, frame_count);
 
-                    // Log every 90 frames
+                    // 🆕 Run shadow detection using latest lane boundaries
+                    if shadow_detector.is_monitoring() {
+                        if let Some(shadow_event) = shadow_detector.update(
+                            overtake_analyzer.get_tracked_vehicles(),
+                            last_left_lane_x,
+                            last_right_lane_x,
+                            frame_count,
+                            timestamp_ms,
+                        ) {
+                            shadow_overtakes_detected += 1;
+                            // Save shadow event immediately
+                            save_shadow_event(&shadow_event, &mut results_file)?;
+                        }
+                    }
+
                     if frame_count % 90 == 0 {
                         let active = overtake_analyzer.get_active_vehicle_count();
                         if active > 0 {
                             info!(
-                                "Frame {}: {} active vehicle(s) tracked",
-                                frame_count, active
+                                "Frame {}: {} active vehicle(s) tracked{}",
+                                frame_count,
+                                active,
+                                if shadow_detector.is_monitoring() {
+                                    format!(
+                                        " | shadow monitoring: {} candidate(s)",
+                                        shadow_detector.active_shadow_count()
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             );
                         }
                     }
@@ -284,7 +393,7 @@ async fn process_video(
             }
         }
 
-        // 🆕 Check for overtake timeout every 30 frames
+        // ── Overtake timeout check every 30 frames ───────────────────────
         if frame_count % 30 == 0 {
             if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count) {
                 match timeout_result {
@@ -299,7 +408,25 @@ async fn process_video(
                         );
                         incomplete_overtakes += 1;
 
-                        // Save incomplete overtake
+                        // 🆕 Stop shadow monitoring on timeout
+                        let shadow_events = shadow_detector.stop_monitoring();
+                        if !shadow_events.is_empty() {
+                            warn!(
+                                "  ⚫ {} shadow overtake(s) during incomplete maneuver",
+                                shadow_events.len()
+                            );
+                        }
+
+                        let mut incomplete_event = start_event.clone();
+                        incomplete_event.metadata.insert(
+                            "maneuver_type".to_string(),
+                            serde_json::json!("incomplete_overtake"),
+                        );
+                        incomplete_event
+                            .metadata
+                            .insert("incomplete_reason".to_string(), serde_json::json!(reason));
+                        attach_shadow_metadata(&mut incomplete_event, &shadow_events);
+
                         save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
                     }
                     _ => {}
@@ -307,19 +434,26 @@ async fn process_video(
             }
         }
 
+        // ── Progress logging ─────────────────────────────────────────────
         if frame_count % 50 == 0 {
             info!(
-                "Progress: {:.1}% ({}/{}) | State: {} | Tracking: {} | Complete: {} | Incomplete: {}",
+                "Progress: {:.1}% ({}/{}) | State: {} | Tracking: {} | Shadow: {} | Complete: {} | Incomplete: {}",
                 reader.progress(),
                 reader.current_frame,
                 reader.total_frames,
                 analyzer.current_state(),
                 if overtake_tracker.is_tracking() { "YES" } else { "NO" },
+                if shadow_detector.is_monitoring() {
+                    format!("YES({})", shadow_detector.active_shadow_count())
+                } else {
+                    "NO".to_string()
+                },
                 complete_overtakes,
                 incomplete_overtakes
             );
         }
 
+        // ── Lane detection + analysis ────────────────────────────────────
         match process_frame(&frame, inference_engine, config, lane_confidence_threshold).await {
             Ok(detected_lanes) => {
                 let analysis_lanes: Vec<Lane> = detected_lanes
@@ -328,12 +462,22 @@ async fn process_video(
                     .map(|(i, dl)| Lane::from_detected(i, dl))
                     .collect();
 
-                // Add to pre-buffer BEFORE analyzing
+                // 🆕 Update lane boundaries for shadow detection
+                let (left_x, right_x) = extract_lane_boundaries(
+                    &analysis_lanes,
+                    frame.width as u32,
+                    frame.height as u32,
+                    0.8, // reference_y_ratio
+                );
+                last_left_lane_x = left_x;
+                last_right_lane_x = right_x;
+
+                // Pre-buffer
                 if previous_state == "CENTERED" {
                     frame_buffer.add_to_pre_buffer(frame.clone());
                 }
 
-                // Check if lane change completed
+                // Lane change analysis
                 if let Some(event) = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
@@ -350,118 +494,143 @@ async fn process_video(
                         event.end_frame_id
                     );
 
-                    // 🆕 Process through overtake tracker
-                    if let Some(overtake_result) =
-                        overtake_tracker.process_lane_change(event.clone(), frame_count)
-                    {
-                        match overtake_result {
-                            OvertakeResult::Complete {
-                                start_event,
-                                end_event,
-                                total_duration_ms,
-                                ..
-                            } => {
+                    // Process through overtake tracker
+                    let tracker_result =
+                        overtake_tracker.process_lane_change(event.clone(), frame_count);
+
+                    match tracker_result {
+                        None => {
+                            // First lane change → overtake just started
+                            // 🆕 Start shadow monitoring
+                            shadow_detector.start_monitoring(event.direction, frame_count);
+                        }
+
+                        Some(OvertakeResult::Complete {
+                            start_event,
+                            end_event,
+                            total_duration_ms,
+                            ..
+                        }) => {
+                            info!(
+                                "✅ COMPLETE OVERTAKE: {:.2}s → {:.2}s (duration: {:.1}s)",
+                                start_event.video_timestamp_ms / 1000.0,
+                                end_event.video_timestamp_ms / 1000.0,
+                                total_duration_ms / 1000.0
+                            );
+
+                            // 🆕 Stop shadow monitoring and collect events
+                            let shadow_events = shadow_detector.stop_monitoring();
+                            if !shadow_events.is_empty() {
+                                warn!(
+                                    "  ⚫ {} SHADOW OVERTAKE(S) during this maneuver!",
+                                    shadow_events.len()
+                                );
+                                shadow_overtakes_detected += shadow_events.len();
+                            }
+
+                            // Analyze vehicles overtaken
+                            let overtakes = overtake_analyzer.analyze_overtake(
+                                start_event.start_frame_id,
+                                end_event.end_frame_id,
+                                start_event.direction_name(),
+                            );
+
+                            if !overtakes.is_empty() {
                                 info!(
-                                    "✅ COMPLETE OVERTAKE: {:.2}s → {:.2}s (duration: {:.1}s)",
-                                    start_event.video_timestamp_ms / 1000.0,
-                                    end_event.video_timestamp_ms / 1000.0,
-                                    total_duration_ms / 1000.0
+                                    "🎯 Overtook {} vehicle(s): {}",
+                                    overtakes.len(),
+                                    overtakes
+                                        .iter()
+                                        .map(|o| format!("{} (ID #{})", o.class_name, o.vehicle_id))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
                                 );
+                                total_vehicles_overtaken += overtakes.len();
+                            } else {
+                                info!("ℹ️  No vehicles were overtaken (repositioning maneuver)");
+                            }
 
-                                // Analyze vehicles overtaken during ENTIRE maneuver
-                                let overtakes = overtake_analyzer.analyze_overtake(
-                                    start_event.start_frame_id,
-                                    end_event.end_frame_id,
-                                    start_event.direction_name(),
+                            // Create combined event
+                            let mut combined_event = create_combined_event(
+                                &start_event,
+                                &end_event,
+                                total_duration_ms,
+                                &overtakes,
+                            );
+
+                            // 🆕 Attach shadow metadata
+                            attach_shadow_metadata(&mut combined_event, &shadow_events);
+
+                            // Curve info
+                            let curve_info = analyzer.get_curve_info();
+                            if curve_info.is_curve {
+                                curves_detected += 1;
+                                warn!(
+                                    "⚠️  Overtake in CURVE: type={:?}, angle={:.1}°",
+                                    curve_info.curve_type, curve_info.angle_degrees
                                 );
+                            }
 
-                                if !overtakes.is_empty() {
-                                    info!(
-                                        "🎯 Overtook {} vehicle(s): {}",
-                                        overtakes.len(),
-                                        overtakes
-                                            .iter()
-                                            .map(|o| format!(
-                                                "{} (ID #{})",
-                                                o.class_name, o.vehicle_id
-                                            ))
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    );
-                                    total_vehicles_overtaken += overtakes.len();
+                            // Get captured frames
+                            let captured_frames = frame_buffer.stop_capture();
+
+                            // Send to API
+                            if !captured_frames.is_empty() {
+                                if let Err(e) = send_overtake_to_api(
+                                    &combined_event,
+                                    &captured_frames,
+                                    curve_info,
+                                    legality_config,
+                                    config,
+                                    video_processor,
+                                )
+                                .await
+                                {
+                                    warn!("Failed to send overtake to API: {}", e);
                                 } else {
-                                    info!(
-                                        "ℹ️  No vehicles were overtaken (repositioning maneuver)"
-                                    );
+                                    events_sent_to_api += 1;
                                 }
-
-                                // Create combined event
-                                let mut combined_event = create_combined_event(
-                                    &start_event,
-                                    &end_event,
-                                    total_duration_ms,
-                                    &overtakes,
-                                );
-
-                                // Get curve info
-                                let curve_info = analyzer.get_curve_info();
-                                if curve_info.is_curve {
-                                    curves_detected += 1;
-                                    warn!(
-                                        "⚠️  Overtake in CURVE: type={:?}, angle={:.1}°",
-                                        curve_info.curve_type, curve_info.angle_degrees
-                                    );
-                                }
-
-                                // Get captured frames
-                                let captured_frames = frame_buffer.stop_capture();
-
-                                // Send to API
-                                if !captured_frames.is_empty() {
-                                    if let Err(e) = send_overtake_to_api(
-                                        &combined_event,
-                                        &captured_frames,
-                                        curve_info,
-                                        legality_config,
-                                        config,
-                                        video_processor,
-                                    )
-                                    .await
-                                    {
-                                        warn!("Failed to send overtake to API: {}", e);
-                                    } else {
-                                        events_sent_to_api += 1;
-                                    }
-                                }
-
-                                // Save to JSONL
-                                save_complete_overtake(&combined_event, &mut results_file)?;
-
-                                complete_overtakes += 1;
                             }
 
-                            OvertakeResult::Incomplete {
-                                start_event,
-                                reason,
-                            } => {
-                                warn!("⚠️  INCOMPLETE OVERTAKE: {}", reason);
-                                incomplete_overtakes += 1;
-                                save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
+                            save_complete_overtake(&combined_event, &mut results_file)?;
+                            complete_overtakes += 1;
+
+                            // 🆕 Start monitoring again for the return lane change
+                            // (the end_event IS a new lane change that could be the start
+                            //  of the next overtake sequence — but the tracker already
+                            //  went back to Idle, so this is handled naturally next time)
+                        }
+
+                        Some(OvertakeResult::Incomplete {
+                            start_event,
+                            reason,
+                        }) => {
+                            warn!("⚠️  INCOMPLETE OVERTAKE: {}", reason);
+                            incomplete_overtakes += 1;
+
+                            // 🆕 Stop shadow monitoring
+                            let shadow_events = shadow_detector.stop_monitoring();
+                            if !shadow_events.is_empty() {
+                                shadow_overtakes_detected += shadow_events.len();
                             }
 
-                            OvertakeResult::SimpleLaneChange { event } => {
-                                info!("↔️  Simple lane change (no return detected yet)");
-                                simple_lane_changes += 1;
-                                // Don't send to API for simple lane changes
-                            }
+                            save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
+
+                            // New overtake started (same direction again) →
+                            // start monitoring for the new one
+                            shadow_detector.start_monitoring(event.direction, frame_count);
+                        }
+
+                        Some(OvertakeResult::SimpleLaneChange { event: _ }) => {
+                            info!("↔️  Simple lane change (no return detected yet)");
+                            simple_lane_changes += 1;
                         }
                     }
                 }
 
-                // Get current_state AFTER analysis
+                // ── State transitions for frame buffer ───────────────────
                 let current_state = analyzer.current_state().to_string();
 
-                // Start capturing when CENTERED -> DRIFTING
                 if previous_state == "CENTERED" && current_state == "DRIFTING" {
                     frame_buffer.start_capture(frame_count);
                     debug!(
@@ -470,20 +639,18 @@ async fn process_video(
                     );
                 }
 
-                // Continue capturing during lane change
                 if frame_buffer.is_capturing() {
                     frame_buffer.add_frame(frame.clone());
                 }
 
-                // Cancel if returned to CENTERED without completing
                 if current_state == "CENTERED" && frame_buffer.is_capturing() {
                     frame_buffer.cancel_capture();
                     debug!("❌ Lane change cancelled");
                 }
 
-                // Update previous_state
                 previous_state = current_state;
 
+                // Periodic offset logging
                 if frame_count % 50 == 0 {
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         if vs.is_valid() {
@@ -510,6 +677,7 @@ async fn process_video(
                     frames_with_valid_position += 1;
                 }
 
+                // Annotated video output
                 if let Some(ref mut w) = writer {
                     if let Ok(annotated) = video_processor::draw_lanes_with_state(
                         &frame.data,
@@ -528,10 +696,20 @@ async fn process_video(
         }
     }
 
+    // ── End of video: clean up any in-progress overtake ──────────────────
+    if shadow_detector.is_monitoring() {
+        let remaining_shadows = shadow_detector.stop_monitoring();
+        if !remaining_shadows.is_empty() {
+            shadow_overtakes_detected += remaining_shadows.len();
+            warn!(
+                "⚫ {} shadow event(s) from unfinished overtake at end of video",
+                remaining_shadows.len()
+            );
+        }
+    }
+
     let duration = start_time.elapsed();
     let avg_fps = frame_count as f64 / duration.as_secs_f64();
-
-    // Get unique vehicles count
     let unique_vehicles = overtake_analyzer.get_total_unique_vehicles();
 
     info!("\n📊 Final Report:");
@@ -546,6 +724,17 @@ async fn process_video(
     info!("  🚙 Vehicle Detections: {}", total_vehicles_detected);
     info!("  🎯 Vehicles Overtaken: {}", total_vehicles_overtaken);
     info!("  🔢 Unique Vehicles: {}", unique_vehicles);
+
+    // 🆕 Shadow summary
+    if shadow_overtakes_detected > 0 {
+        warn!(
+            "  ⚫ SHADOW OVERTAKES: {} — DANGEROUS VISIBILITY CONDITIONS",
+            shadow_overtakes_detected
+        );
+    } else {
+        info!("  ⚫ Shadow Overtakes: 0");
+    }
+
     info!("  Processing Speed: {:.1} FPS", avg_fps);
 
     Ok(ProcessingStats {
@@ -560,12 +749,16 @@ async fn process_video(
         total_vehicles_detected,
         total_vehicles_overtaken,
         unique_vehicles_seen: unique_vehicles,
+        shadow_overtakes_detected,
         duration_secs: duration.as_secs_f64(),
         avg_fps,
     })
 }
 
-// 🆕 Helper function to create combined overtake event
+// ============================================================================
+// HELPERS
+// ============================================================================
+
 fn create_combined_event(
     start_event: &LaneChangeEvent,
     end_event: &LaneChangeEvent,
@@ -574,7 +767,6 @@ fn create_combined_event(
 ) -> LaneChangeEvent {
     let mut combined = start_event.clone();
 
-    // Update metadata
     combined.metadata.insert(
         "maneuver_type".to_string(),
         serde_json::json!("complete_overtake"),
@@ -610,10 +802,8 @@ fn create_combined_event(
     combined
 }
 
-// 🆕 Save complete overtake to JSONL
 fn save_complete_overtake(event: &LaneChangeEvent, file: &mut std::fs::File) -> Result<()> {
     use std::io::Write;
-
     let json_line = serde_json::to_string(&event.to_json())?;
     writeln!(file, "{}", json_line)?;
     file.flush()?;
@@ -621,14 +811,12 @@ fn save_complete_overtake(event: &LaneChangeEvent, file: &mut std::fs::File) -> 
     Ok(())
 }
 
-// 🆕 Save incomplete overtake to JSONL
 fn save_incomplete_overtake(
     start_event: &LaneChangeEvent,
     reason: &str,
     file: &mut std::fs::File,
 ) -> Result<()> {
     use std::io::Write;
-
     let mut event = start_event.clone();
     event.metadata.insert(
         "maneuver_type".to_string(),
@@ -645,14 +833,35 @@ fn save_incomplete_overtake(
     Ok(())
 }
 
-// 🆕 Send overtake to API
+// 🆕 Save shadow overtake event to JSONL
+fn save_shadow_event(shadow: &ShadowOvertakeEvent, file: &mut std::fs::File) -> Result<()> {
+    use std::io::Write;
+
+    let json_value = serde_json::json!({
+        "type": "shadow_overtake",
+        "blocking_vehicle_id": shadow.blocking_vehicle_id,
+        "blocking_vehicle_class": shadow.blocking_vehicle_class,
+        "detected_at_frame": shadow.detected_at_frame,
+        "detected_at_timestamp_ms": shadow.detected_at_timestamp_ms,
+        "frames_blocked": shadow.frames_blocked,
+        "severity": shadow.severity.as_str(),
+        "closest_distance_ratio": shadow.closest_distance_ratio,
+    });
+
+    let json_line = serde_json::to_string(&json_value)?;
+    writeln!(file, "{}", json_line)?;
+    file.flush()?;
+    warn!("💾 Shadow overtake event saved to JSONL");
+    Ok(())
+}
+
 async fn send_overtake_to_api(
     event: &LaneChangeEvent,
     captured_frames: &[Frame],
     curve_info: CurveInfo,
     legality_config: &LegalityAnalysisConfig,
     config: &types::Config,
-    video_processor: &video_processor::VideoProcessor,
+    _video_processor: &video_processor::VideoProcessor,
 ) -> Result<()> {
     if captured_frames.is_empty() {
         return Ok(());
