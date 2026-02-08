@@ -1,4 +1,5 @@
 // src/video_processor.rs
+use crate::lane_legality::LegalityResult; // 🆕 NEW IMPORT
 use crate::overtake_analyzer::{OvertakeEvent, TrackedVehicle};
 use crate::shadow_overtake::{ShadowOvertakeDetector, ShadowSeverity};
 use crate::types::CurveInfo;
@@ -157,7 +158,8 @@ impl VideoReader {
         (self.current_frame as f32 / self.total_frames as f32) * 100.0
     }
 }
-/// Ultra-rich visualization with complete telemetry overlay
+
+/// Ultra-rich visualization with complete telemetry overlay + LEGALITY
 pub fn draw_lanes_with_state_enhanced(
     frame: &[u8],
     width: i32,
@@ -174,6 +176,7 @@ pub fn draw_lanes_with_state_enhanced(
     vehicles_overtaken_this_maneuver: &[OvertakeEvent],
     curve_info: Option<CurveInfo>,
     lateral_velocity: f32,
+    legality_result: Option<&LegalityResult>, // 🆕 NEW PARAMETER
 ) -> Result<Mat> {
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
@@ -385,6 +388,96 @@ pub fn draw_lanes_with_state_enhanced(
             imgproc::LINE_8,
             false,
         )?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 4.5 🆕 LEGALITY BANNER (Overrides normal banner if illegal)
+    // ══════════════════════════════════════════════════════════════════════
+    if let Some(legality) = legality_result {
+        if legality.ego_intersects_marking && legality.verdict.is_illegal() {
+            let legality_banner_y = if banner_active { 60 } else { 0 };
+            let banner_h = 50;
+
+            let color = match legality.verdict {
+                crate::lane_legality::LineLegality::CriticalIllegal => {
+                    core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+                } // Bright red
+                crate::lane_legality::LineLegality::Illegal => {
+                    core::Scalar::new(0.0, 50.0, 200.0, 0.0)
+                } // Dark red
+                _ => core::Scalar::new(0.0, 200.0, 255.0, 0.0), // Yellow
+            };
+
+            imgproc::rectangle(
+                &mut output,
+                core::Rect::new(0, legality_banner_y, width, banner_h),
+                color,
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+
+            let line_name = legality
+                .intersecting_line
+                .as_ref()
+                .map(|l| l.class_name.as_str())
+                .unwrap_or("SOLID LINE");
+
+            let text = format!(
+                "⚠ ILLEGAL CROSSING: {} — VIOLATION DS 016-2009-MTC",
+                line_name.to_uppercase()
+            );
+
+            draw_text_with_shadow(
+                &mut output,
+                &text,
+                20,
+                legality_banner_y + 35,
+                0.8,
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+                2,
+            )?;
+
+            banner_active = true; // Mark banner as active for panel positioning
+        }
+
+        // 🆕 Draw detected road markings with color-coded bboxes
+        for marking in &legality.all_markings {
+            use crate::lane_legality::LineLegality;
+
+            let box_color = match marking.legality {
+                LineLegality::CriticalIllegal => core::Scalar::new(0.0, 0.0, 255.0, 0.0), // RED
+                LineLegality::Illegal => core::Scalar::new(0.0, 100.0, 255.0, 0.0), // ORANGE-RED
+                LineLegality::Legal => core::Scalar::new(0.0, 255.0, 0.0, 0.0),     // GREEN
+                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),                   // GRAY
+            };
+
+            let pt1 = core::Point::new(marking.bbox[0] as i32, marking.bbox[1] as i32);
+            let pt2 = core::Point::new(marking.bbox[2] as i32, marking.bbox[3] as i32);
+            imgproc::rectangle(
+                &mut output,
+                core::Rect::from_points(pt1, pt2),
+                box_color,
+                2,
+                imgproc::LINE_8,
+                0,
+            )?;
+
+            let label = format!(
+                "{} ({:.0}%)",
+                marking.class_name,
+                marking.confidence * 100.0
+            );
+            draw_text_with_shadow(
+                &mut output,
+                &label,
+                marking.bbox[0] as i32,
+                marking.bbox[1] as i32 - 5,
+                0.4,
+                box_color,
+                1,
+            )?;
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -729,8 +822,8 @@ pub fn draw_lanes_with_state_enhanced(
     // ══════════════════════════════════════════════════════════════════════
     // 7. LEGEND (Bottom Right)
     // ══════════════════════════════════════════════════════════════════════
-    let legend_y = height - 120;
-    draw_panel_background(&mut output, width - 250, legend_y - 10, 240, 110)?;
+    let legend_y = height - 140; // 🆕 Extended to fit legality colors
+    draw_panel_background(&mut output, width - 250, legend_y - 10, 240, 130)?;
 
     draw_text_with_shadow(
         &mut output,
@@ -763,6 +856,18 @@ pub fn draw_lanes_with_state_enhanced(
             "Your vehicle",
             core::Scalar::new(0.0, 255.0, 255.0, 0.0),
         ),
+        (
+            // 🆕 NEW
+            "🟢 Green line:",
+            "LEGAL crossing",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            // 🆕 NEW
+            "🔴 Red line:",
+            "ILLEGAL crossing",
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        ),
     ];
 
     for (i, (label, desc, color)) in legend_items.iter().enumerate() {
@@ -770,8 +875,8 @@ pub fn draw_lanes_with_state_enhanced(
             &mut output,
             &format!("{} {}", label, desc),
             width - 235,
-            legend_y + 20 + (i as i32 * 20),
-            0.4,
+            legend_y + 20 + (i as i32 * 18),
+            0.38,
             *color,
             1,
         )?;
@@ -797,7 +902,6 @@ fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32)
     )?;
 
     // Blend with original (70% overlay, 30% original)
-    // Fix: Use a temp variable instead of borrowing img twice
     let mut result = Mat::default();
     core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, &mut result, -1)?;
 

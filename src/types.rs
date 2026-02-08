@@ -14,6 +14,31 @@ pub struct Config {
     pub detection: DetectionConfig,
     pub video: VideoConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub lane_legality: LaneLegalityConfig, // 🆕
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneLegalityConfig {
+    pub enabled: bool,
+    pub model_path: String,
+    pub confidence_threshold: f32,
+    /// Run every N frames (3 = every 3rd frame)
+    pub inference_interval: u64,
+    /// Ego vehicle bounding box ratios [x1, y1, x2, y2]
+    pub ego_bbox_ratio: [f32; 4],
+}
+
+impl Default for LaneLegalityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_path: "models/lane_legality.onnx".to_string(),
+            confidence_threshold: 0.25,
+            inference_interval: 3,
+            ego_bbox_ratio: [0.30, 0.75, 0.70, 0.98],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

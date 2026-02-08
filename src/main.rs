@@ -4,6 +4,7 @@ mod analysis;
 mod frame_buffer;
 mod inference;
 mod lane_detection;
+mod lane_legality; // 🆕 NEW MODULE
 mod overtake_analyzer;
 mod overtake_tracker;
 mod preprocessing;
@@ -18,6 +19,7 @@ use frame_buffer::{
     build_legality_request, print_legality_request, save_legality_request_to_file,
     send_to_legality_api, LaneChangeFrameBuffer,
 };
+use lane_legality::{LaneLegalityDetector, LegalityResult, LineLegality}; // 🆕 NEW IMPORTS
 use overtake_analyzer::OvertakeAnalyzer;
 use overtake_tracker::{OvertakeResult, OvertakeTracker};
 use shadow_overtake::{ShadowOvertakeDetector, ShadowOvertakeEvent};
@@ -124,6 +126,7 @@ async fn main() -> Result<()> {
                 info!("  ⚠️  Incomplete overtakes: {}", stats.incomplete_overtakes);
                 info!("  ↔️  Simple lane changes: {}", stats.simple_lane_changes);
                 info!("  Events sent to API: {}", stats.events_sent_to_api);
+
                 if stats.curves_detected > 0 {
                     info!("  🌀 Curves detected: {}", stats.curves_detected);
                 }
@@ -157,6 +160,25 @@ async fn main() -> Result<()> {
                     info!("  ⚫ Shadow overtakes: 0 (clean overtakes)");
                 }
 
+                // 🆕 LEGALITY STATS
+                if stats.illegal_crossings > 0 || stats.critical_violations > 0 {
+                    warn!("  🚦 LANE LINE VIOLATIONS:");
+                    if stats.critical_violations > 0 {
+                        warn!(
+                            "     🚨 CRITICAL: {} (double yellow/solid yellow)",
+                            stats.critical_violations
+                        );
+                    }
+                    if stats.illegal_crossings > 0 {
+                        warn!(
+                            "     ⚠️  ILLEGAL: {} (solid white/red/double white)",
+                            stats.illegal_crossings
+                        );
+                    }
+                } else {
+                    info!("  🚦 Lane line violations: 0");
+                }
+
                 info!("  Processing Speed: {:.1} FPS", stats.avg_fps);
             }
             Err(e) => {
@@ -181,6 +203,8 @@ struct ProcessingStats {
     total_vehicles_overtaken: usize,
     unique_vehicles_seen: u32,
     shadow_overtakes_detected: usize,
+    illegal_crossings: usize,   // 🆕
+    critical_violations: usize, // 🆕
     duration_secs: f64,
     avg_fps: f64,
 }
@@ -290,6 +314,28 @@ async fn process_video(
     let mut yolo_detector = YoloDetector::new("models/yolov8n.onnx")?;
     info!("✓ YOLO vehicle detector ready");
 
+    // 🆕 LANE LEGALITY DETECTOR
+    let mut legality_detector = if config.lane_legality.enabled {
+        match LaneLegalityDetector::new(&config.lane_legality.model_path) {
+            Ok(mut detector) => {
+                let ego_bbox = config.lane_legality.ego_bbox_ratio;
+                detector.set_ego_bbox_ratio(ego_bbox[0], ego_bbox[1], ego_bbox[2], ego_bbox[3]);
+                info!("✓ Lane legality detector ready");
+                Some(detector)
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️  Lane legality detector failed to load: {}. Continuing without it.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        info!("⚪ Lane legality detection disabled in config");
+        None
+    };
+
     let mut overtake_analyzer = OvertakeAnalyzer::new(reader.width as f32, reader.height as f32);
     info!("✓ Overtake analyzer ready");
 
@@ -300,7 +346,6 @@ async fn process_video(
         ShadowOvertakeDetector::new(reader.width as f32, reader.height as f32);
     info!("✓ Shadow overtake detector ready");
 
-    // 🆕 Velocity tracker for lateral movement
     let mut velocity_tracker = crate::analysis::velocity_tracker::LateralVelocityTracker::new();
     info!("✓ Velocity tracker ready");
 
@@ -323,6 +368,11 @@ async fn process_video(
     let mut total_vehicles_overtaken: usize = 0;
     let mut shadow_overtakes_detected: usize = 0;
 
+    // 🆕 LEGALITY TRACKING
+    let mut illegal_crossings: usize = 0;
+    let mut critical_violations: usize = 0;
+    let mut last_legality_result: Option<LegalityResult> = None;
+
     let mut previous_state = "CENTERED".to_string();
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
     let lane_confidence_threshold = config.detection.min_lane_confidence;
@@ -330,15 +380,15 @@ async fn process_video(
     let mut last_left_lane_x: Option<f32> = None;
     let mut last_right_lane_x: Option<f32> = None;
 
-    // 🆕 Track current overtake vehicles for video display
     let mut current_overtake_vehicles: Vec<overtake_analyzer::OvertakeEvent> = Vec::new();
 
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
-        // ── YOLO detection every 3 frames ────────────────────────────────
-        if frame_count % 3 == 0 {
+        // ── YOLO + LEGALITY detection every 3 frames ─────────────────────
+        if frame_count % config.lane_legality.inference_interval == 0 {
+            // YOLO vehicle detection
             match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
                 Ok(detections) => {
                     total_vehicles_detected += detections.len();
@@ -378,6 +428,64 @@ async fn process_video(
                 }
                 Err(e) => debug!("YOLO detection failed on frame {}: {}", frame_count, e),
             }
+
+            // 🆕 LANE LEGALITY DETECTION
+            if let Some(ref mut detector) = legality_detector {
+                match detector.analyze_frame(
+                    &frame.data,
+                    frame.width,
+                    frame.height,
+                    frame_count,
+                    config.lane_legality.confidence_threshold,
+                ) {
+                    Ok(legality_result) => {
+                        if legality_result.ego_intersects_marking {
+                            match legality_result.verdict {
+                                LineLegality::CriticalIllegal => {
+                                    critical_violations += 1;
+                                    warn!(
+                                        "🚨🚨 CRITICAL ILLEGAL CROSSING: {} at {:.2}s (frame {})",
+                                        legality_result
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.class_name.as_str())
+                                            .unwrap_or("unknown"),
+                                        timestamp_ms / 1000.0,
+                                        frame_count
+                                    );
+                                }
+                                LineLegality::Illegal => {
+                                    illegal_crossings += 1;
+                                    warn!(
+                                        "🚨 ILLEGAL CROSSING: {} at {:.2}s (frame {})",
+                                        legality_result
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.class_name.as_str())
+                                            .unwrap_or("unknown"),
+                                        timestamp_ms / 1000.0,
+                                        frame_count
+                                    );
+                                }
+                                LineLegality::Legal => {
+                                    debug!(
+                                        "✅ Legal crossing: {} at {:.2}s",
+                                        legality_result
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.class_name.as_str())
+                                            .unwrap_or("dashed"),
+                                        timestamp_ms / 1000.0
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        last_legality_result = Some(legality_result);
+                    }
+                    Err(e) => debug!("Legality detection failed on frame {}: {}", frame_count, e),
+                }
+            }
         }
 
         // ── Overtake timeout check every 30 frames ───────────────────────
@@ -403,7 +511,6 @@ async fn process_video(
                             );
                         }
 
-                        // 🆕 Clear current overtake vehicles
                         current_overtake_vehicles.clear();
 
                         let mut incomplete_event = start_event.clone();
@@ -516,7 +623,6 @@ async fn process_video(
                                 start_event.direction_name(),
                             );
 
-                            // 🆕 Update current overtake vehicles for video display
                             current_overtake_vehicles = overtakes.clone();
 
                             if !overtakes.is_empty() {
@@ -542,6 +648,42 @@ async fn process_video(
                             );
 
                             attach_shadow_metadata(&mut combined_event, &shadow_events);
+
+                            // 🆕 ATTACH LEGALITY INFO FROM LANE MARKING DETECTOR
+                            if let Some(ref legality) = last_legality_result {
+                                if legality.ego_intersects_marking {
+                                    let legality_info = types::LegalityInfo {
+                                        is_legal: !legality.verdict.is_illegal(),
+                                        lane_line_type: legality
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.class_name.clone())
+                                            .unwrap_or_else(|| "unknown".to_string()),
+                                        confidence: legality
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.confidence)
+                                            .unwrap_or(0.0),
+                                        analysis_details: Some(format!(
+                                            "On-device YOLOv8-seg detection: {}",
+                                            legality.verdict.as_str()
+                                        )),
+                                    };
+                                    combined_event.legality = Some(legality_info);
+
+                                    combined_event.metadata.insert(
+                                        "line_legality_verdict".to_string(),
+                                        serde_json::json!(legality.verdict.as_str()),
+                                    );
+                                    combined_event.metadata.insert(
+                                        "line_class_id".to_string(),
+                                        serde_json::json!(legality
+                                            .intersecting_line
+                                            .as_ref()
+                                            .map(|l| l.class_id)),
+                                    );
+                                }
+                            }
 
                             let curve_info = analyzer.get_curve_info();
                             if curve_info.is_curve {
@@ -587,7 +729,6 @@ async fn process_video(
                                 shadow_overtakes_detected += shadow_events.len();
                             }
 
-                            // 🆕 Clear current overtake vehicles
                             current_overtake_vehicles.clear();
 
                             save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
@@ -649,7 +790,7 @@ async fn process_video(
                     frames_with_valid_position += 1;
                 }
 
-                // 🆕 RICH ANNOTATED VIDEO OUTPUT
+                // 🆕 RICH ANNOTATED VIDEO OUTPUT WITH LEGALITY
                 if let Some(ref mut w) = writer {
                     let curve_info = analyzer.get_curve_info();
                     let is_overtaking = overtake_tracker.is_tracking();
@@ -681,6 +822,7 @@ async fn process_video(
                         &current_overtake_vehicles,
                         Some(curve_info),
                         lateral_velocity,
+                        last_legality_result.as_ref(), // 🆕 PASS LEGALITY
                     ) {
                         use opencv::videoio::VideoWriterTrait;
                         w.write(&annotated)?;
@@ -729,6 +871,19 @@ async fn process_video(
         info!("  ⚫ Shadow Overtakes: 0");
     }
 
+    // 🆕 LEGALITY REPORT
+    if illegal_crossings > 0 || critical_violations > 0 {
+        warn!("  🚦 LANE LINE VIOLATIONS DETECTED:");
+        if critical_violations > 0 {
+            warn!("     🚨 CRITICAL: {}", critical_violations);
+        }
+        if illegal_crossings > 0 {
+            warn!("     ⚠️  ILLEGAL: {}", illegal_crossings);
+        }
+    } else {
+        info!("  🚦 Lane Line Violations: 0");
+    }
+
     info!("  Processing Speed: {:.1} FPS", avg_fps);
 
     Ok(ProcessingStats {
@@ -744,6 +899,8 @@ async fn process_video(
         total_vehicles_overtaken,
         unique_vehicles_seen: unique_vehicles,
         shadow_overtakes_detected,
+        illegal_crossings,   // 🆕
+        critical_violations, // 🆕
         duration_secs: duration.as_secs_f64(),
         avg_fps,
     })

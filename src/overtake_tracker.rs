@@ -25,6 +25,8 @@ pub enum OvertakeResult {
         end_event: LaneChangeEvent,
         total_duration_ms: f64,
         vehicles_overtaken: Vec<String>,
+        is_legal_crossing: Option<bool>, // 🆕 Lane line legality verdict
+        line_type: Option<String>,       // 🆕 Type of line crossed (e.g., "solid_double_yellow")
     },
     Incomplete {
         start_event: LaneChangeEvent,
@@ -43,6 +45,7 @@ impl OvertakeTracker {
             timeout_frames,
         }
     }
+
     pub fn get_direction(&self) -> Direction {
         match &self.state {
             OvertakeState::InProgress { direction, .. } => *direction,
@@ -75,7 +78,7 @@ impl OvertakeTracker {
             OvertakeState::InProgress {
                 start_event,
                 direction,
-                ..  // 🆕 Ignore start_frame with ..
+                ..
             } => {
                 let is_return = match (direction, event.direction) {
                     (Direction::Left, Direction::Right) => true,
@@ -94,11 +97,23 @@ impl OvertakeTracker {
                         total_duration_ms / 1000.0
                     );
 
+                    // 🆕 Extract legality info from the start event (which was enriched in main.rs)
+                    let (is_legal, line_type) = if let Some(ref legality) = start_event.legality {
+                        (
+                            Some(legality.is_legal),
+                            Some(legality.lane_line_type.clone()),
+                        )
+                    } else {
+                        (None, None)
+                    };
+
                     let result = OvertakeResult::Complete {
                         start_event: start_event.clone(),
                         end_event: event,
                         total_duration_ms,
                         vehicles_overtaken: vec![],
+                        is_legal_crossing: is_legal,
+                        line_type,
                     };
 
                     self.state = OvertakeState::Idle;
@@ -115,7 +130,7 @@ impl OvertakeTracker {
                     };
 
                     self.state = OvertakeState::InProgress {
-                        start_event: event.clone(),  // 🆕 Clone here
+                        start_event: event.clone(),
                         start_frame: current_frame,
                         direction: event.direction,
                     };
