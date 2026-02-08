@@ -155,7 +155,7 @@ impl OvertakeAnalyzer {
         for (vehicle_id, track) in &self.tracked_vehicles {
             info!(
                 "  📋 Vehicle ID #{} ({}): first_seen={}, last_seen={}, positions={}",
-                id,
+                vehicle_id,
                 track.class_name,
                 track.first_seen_frame,
                 track.last_seen_frame,
