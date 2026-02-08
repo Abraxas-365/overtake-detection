@@ -10,7 +10,6 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -203,7 +202,7 @@ impl LaneLegalityDetector {
         let mut worst_legality = LineLegality::Unknown;
 
         for marking in &result.all_markings {
-            if self.check_mask_intersection(&marking, &ego_bbox, width, height) {
+            if self.check_mask_intersection(marking, &ego_bbox, width, height) {
                 result.ego_intersects_marking = true;
 
                 let priority = match marking.legality {
@@ -294,9 +293,6 @@ impl LaneLegalityDetector {
         // YOLOv8-seg outputs:
         // output0: [1, 116, 8400] — 4 bbox + 25 classes + 32 mask coeffs + ...
         // output1: [1, 32, 160, 160] — mask prototypes
-        //
-        // NOTE: Adjust these indices based on your actual model's output names/order.
-        // Use `session.outputs` to inspect.
 
         let output0 = &outputs[0];
         let (_, data0) = output0.try_extract_tensor::<f32>()?;
@@ -306,8 +302,6 @@ impl LaneLegalityDetector {
         let (_, data1) = output1.try_extract_tensor::<f32>()?;
         let mask_proto = data1.to_vec();
 
-        // Mask coefficients are the last 32 values per detection in output0
-        // We pass the full output and extract during postprocessing
         Ok((box_output, mask_proto, Vec::new()))
     }
 
@@ -329,8 +323,6 @@ impl LaneLegalityDetector {
     ) -> Result<Vec<DetectedRoadMarking>> {
         let mut detections = Vec::new();
         let num_detections = 8400;
-        // YOLOv8-seg: [1, (4 + num_classes + 32_mask_coeffs), 8400]
-        let row_size = 4 + NUM_CLASSES + 32;
 
         for i in 0..num_detections {
             let cx = output[i];
@@ -394,6 +386,9 @@ impl LaneLegalityDetector {
             });
         }
 
+        // 🆕 GEOMETRIC CORRECTION: Fix center lines misclassified as white
+        Self::apply_geometric_correction(&mut detections, orig_w);
+
         // NMS
         let detections = nms_markings(detections, 0.45);
 
@@ -401,16 +396,70 @@ impl LaneLegalityDetector {
         Ok(detections)
     }
 
+    // ========================================================================
+    // 🆕 GEOMETRIC CORRECTION FOR CENTER LINES
+    // ========================================================================
+
+    /// Apply geometric position-based correction for center lines.
+    /// In Peru (and most countries), center lines separating opposing traffic
+    /// are YELLOW, while edge lines are WHITE. If a line is detected in the
+    /// center region but classified as white, it's likely a misclassification
+    /// due to lighting conditions (especially at night).
+    fn apply_geometric_correction(detections: &mut [DetectedRoadMarking], frame_width: usize) {
+        let center_threshold = 0.15; // 15% tolerance from center
+        let frame_center = frame_width as f32 / 2.0;
+
+        for marking in detections.iter_mut() {
+            let bbox_center_x = (marking.bbox[0] + marking.bbox[2]) / 2.0;
+            let distance_from_center = (bbox_center_x - frame_center).abs() / frame_width as f32;
+
+            // Line is near the center of the frame (likely a yellow dividing line)
+            if distance_from_center < center_threshold && marking.class_name.contains("white") {
+                let original_class = marking.class_name.clone();
+                let original_legality = marking.legality;
+
+                // Remap white → yellow
+                marking.class_name = marking.class_name.replace("white", "yellow");
+
+                // Update class ID
+                marking.class_id = if marking.class_name.contains("dashed") {
+                    10 // dashed_single_yellow
+                } else {
+                    5 // solid_single_yellow (CRITICAL)
+                };
+
+                // Update legality
+                marking.legality = class_id_to_legality(marking.class_id);
+
+                // Log the correction
+                if marking.legality != original_legality {
+                    warn!(
+                        "🔧 CENTER LINE CORRECTION: {} ({}) → {} ({}) | Distance from center: {:.1}%",
+                        original_class,
+                        original_legality.as_str(),
+                        marking.class_name,
+                        marking.legality.as_str(),
+                        distance_from_center * 100.0
+                    );
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // MASK GENERATION
+    // ========================================================================
+
     /// Generate a binary mask from mask prototypes and coefficients
     fn generate_mask(
         &self,
         mask_proto: &[f32], // [1, 32, 160, 160]
         mask_coeffs: &[f32; 32],
-        pad_x: f32,
-        pad_y: f32,
-        scale: f32,
-        orig_w: usize,
-        orig_h: usize,
+        _pad_x: f32,
+        _pad_y: f32,
+        _scale: f32,
+        _orig_w: usize,
+        _orig_h: usize,
     ) -> Vec<u8> {
         let mh = MASK_SIZE;
         let mw = MASK_SIZE;
@@ -437,6 +486,10 @@ impl LaneLegalityDetector {
         mask
     }
 
+    // ========================================================================
+    // INTERSECTION CHECK
+    // ========================================================================
+
     /// Check if the ego vehicle bbox intersects with a marking's mask
     fn check_mask_intersection(
         &self,
@@ -456,11 +509,9 @@ impl LaneLegalityDetector {
 
         // Count pixels in the ego region that are part of the marking mask
         let mut intersection_pixels = 0;
-        let mut total_ego_pixels = 0;
 
         for y in my1..=my2.min(MASK_SIZE - 1) {
             for x in mx1..=mx2.min(MASK_SIZE - 1) {
-                total_ego_pixels += 1;
                 if marking.mask[y * MASK_SIZE + x] > 0 {
                     intersection_pixels += 1;
                 }
