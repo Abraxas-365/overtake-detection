@@ -320,7 +320,7 @@ pub fn draw_lanes_with_state_enhanced(
             } else {
                 core::Point::new(vehicle_x + 40, vehicle_y)
             };
-            imgproc::arrow_line(
+            imgproc::arrowed_line(
                 &mut output,
                 arrow_start,
                 arrow_end,
