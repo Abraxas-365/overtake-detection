@@ -1,13 +1,4 @@
 // src/lane_legality.rs
-//
-// Road Line Legality Detection via YOLOv8n-seg
-// Fused with UFLDv2 lane detection for accurate crossing detection.
-//
-// Strategy:
-//   - UFLDv2 determines IF the vehicle is crossing (lateral offset + state)
-//   - YOLOv8-seg determines WHAT the vehicle is crossing (line type/color)
-//   - Only flag a violation when BOTH models agree
-//
 
 use anyhow::Result;
 use ort::{
@@ -17,13 +8,9 @@ use ort::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
 const SEG_INPUT_SIZE: usize = 640;
 const NUM_CLASSES: usize = 25;
-const MASK_SIZE: usize = 160; // YOLOv8-seg mask resolution (640/4)
+const MASK_SIZE: usize = 160;
 
 /// Class IDs that make crossing ILLEGAL
 const ILLEGAL_CLASS_IDS: [usize; 5] = [4, 5, 6, 7, 8];
@@ -32,12 +19,16 @@ const LEGAL_CLASS_IDS: [usize; 2] = [9, 10];
 /// Class IDs considered CRITICAL violations
 const CRITICAL_CLASS_IDS: [usize; 2] = [5, 8];
 
-/// Minimum normalized offset (from UFLDv2) to consider a crossing
-const FUSED_CROSSING_OFFSET_THRESHOLD: f32 = 0.38;
-/// Minimum mask intersection pixels (at 160×160) for the seg model
-const FUSED_MIN_MASK_PIXELS: usize = 20;
-/// Search margin in pixels around a lane boundary when matching seg detections
-const BOUNDARY_SEARCH_MARGIN: f32 = 100.0;
+// ============================================================================
+// CROSSING SIDE (from lane model)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossingSide {
+    None,
+    Left,
+    Right,
+}
 
 // ============================================================================
 // TYPES
@@ -68,36 +59,24 @@ impl LineLegality {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrossingSide {
-    Left,
-    Right,
-    None,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedRoadMarking {
     pub class_id: usize,
     pub class_name: String,
     pub confidence: f32,
-    pub bbox: [f32; 4], // [x1, y1, x2, y2] in original coords
+    pub bbox: [f32; 4],
     pub legality: LineLegality,
-    pub mask: Vec<u8>, // MASK_SIZE x MASK_SIZE binary mask
+    pub mask: Vec<u8>,
     pub mask_width: usize,
     pub mask_height: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LegalityResult {
-    /// Overall legality verdict for this frame
     pub verdict: LineLegality,
-    /// The specific line class that the ego vehicle is intersecting (if any)
     pub intersecting_line: Option<DetectedRoadMarking>,
-    /// All detected road markings in the frame
     pub all_markings: Vec<DetectedRoadMarking>,
-    /// Whether the ego vehicle bbox intersects any lane marking mask
     pub ego_intersects_marking: bool,
-    /// Frame ID for tracking
     pub frame_id: u64,
 }
 
@@ -113,20 +92,83 @@ impl LegalityResult {
     }
 }
 
-/// Result from the fused analysis (UFLDv2 + YOLOv8-seg)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ============================================================================
+// FUSED RESULT (combines both models)
+// ============================================================================
+
+#[derive(Debug, Clone)]
 pub struct FusedLegalityResult {
+    /// Final verdict after fusion
     pub verdict: LineLegality,
-    /// UFLDv2 confirmed the vehicle is crossing / near a boundary
+    /// Whether the lane model confirms the vehicle is crossing
     pub crossing_confirmed_by_lane_model: bool,
-    /// The seg-model detection closest to the crossed boundary
+    /// The line type detected by seg model at the crossing boundary
     pub line_type_from_seg_model: Option<DetectedRoadMarking>,
-    /// Normalized lateral offset from UFLDv2 (0.0 = center, 0.5 = on boundary)
+    /// Vehicle offset as percentage of lane width
     pub vehicle_offset_pct: f32,
-    /// Legacy compat
-    pub ego_intersects_marking: bool,
-    pub frame_id: u64,
+    /// All detected markings (for visualization)
     pub all_markings: Vec<DetectedRoadMarking>,
+    /// Whether ego bbox intersects any marking mask
+    pub ego_intersects_marking: bool,
+}
+
+// ============================================================================
+// TEMPORAL FILTER — prevents single-frame false positives
+// ============================================================================
+
+struct TemporalViolationFilter {
+    /// Recent violation verdicts (ring buffer)
+    recent_verdicts: Vec<(u64, LineLegality)>,
+    /// How many consecutive illegal frames needed to confirm
+    min_consecutive: usize,
+    /// Max frame gap to consider "consecutive"
+    max_frame_gap: u64,
+}
+
+impl TemporalViolationFilter {
+    fn new(min_consecutive: usize, max_frame_gap: u64) -> Self {
+        Self {
+            recent_verdicts: Vec::with_capacity(20),
+            min_consecutive,
+            max_frame_gap,
+        }
+    }
+
+    fn update(&mut self, frame_id: u64, verdict: LineLegality) -> bool {
+        self.recent_verdicts.push((frame_id, verdict));
+
+        // Keep only recent entries
+        if self.recent_verdicts.len() > 20 {
+            self.recent_verdicts.remove(0);
+        }
+
+        if !verdict.is_illegal() {
+            return false;
+        }
+
+        // Count consecutive illegal frames (allowing small gaps)
+        let mut consecutive = 0;
+        let mut last_frame: Option<u64> = None;
+
+        for &(fid, v) in self.recent_verdicts.iter().rev() {
+            if !v.is_illegal() {
+                break;
+            }
+            if let Some(prev) = last_frame {
+                if prev - fid > self.max_frame_gap {
+                    break;
+                }
+            }
+            consecutive += 1;
+            last_frame = Some(fid);
+        }
+
+        consecutive >= self.min_consecutive
+    }
+
+    fn reset(&mut self) {
+        self.recent_verdicts.clear();
+    }
 }
 
 // ============================================================================
@@ -164,9 +206,8 @@ fn class_id_to_legality(class_id: usize) -> LineLegality {
 
 pub struct LaneLegalityDetector {
     session: Session,
-    /// Ego vehicle bounding box in normalized coords [x1, y1, x2, y2]
-    /// Used ONLY as fallback when lane model data is not available
     ego_bbox_ratio: [f32; 4],
+    temporal_filter: TemporalViolationFilter,
 }
 
 impl LaneLegalityDetector {
@@ -183,24 +224,19 @@ impl LaneLegalityDetector {
 
         Ok(Self {
             session,
-            ego_bbox_ratio: [0.40, 0.80, 0.60, 0.98],
+            ego_bbox_ratio: [0.30, 0.75, 0.70, 0.98],
+            temporal_filter: TemporalViolationFilter::new(
+                2, // Need 2+ consecutive illegal frames
+                6, // Max 6 frame gap (at interval=3, this means 2 detections)
+            ),
         })
     }
 
-    /// Set custom ego vehicle bounding box ratios (fallback only)
     pub fn set_ego_bbox_ratio(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         self.ego_bbox_ratio = [x1, y1, x2, y2];
     }
 
-    // ========================================================================
-    // FUSED ANALYSIS (preferred — uses both models)
-    // ========================================================================
-
-    /// Run fused detection: YOLOv8-seg line classification + UFLDv2 position.
-    ///
-    /// Only flags a violation when the lane model confirms the vehicle is
-    /// actually near / crossing a boundary AND the seg model identifies that
-    /// boundary as an illegal line type.
+    /// FUSED analysis: combines seg model + lane model for accurate results
     pub fn analyze_frame_fused(
         &mut self,
         frame: &[u8],
@@ -208,17 +244,17 @@ impl LaneLegalityDetector {
         height: usize,
         frame_id: u64,
         confidence_threshold: f32,
-        // ── from UFLDv2 / lane analyzer ──
-        vehicle_lateral_offset: f32,
+        // From lane detection model (UFLDv2):
+        vehicle_offset_px: f32,
         lane_width: Option<f32>,
         left_lane_x: Option<f32>,
         right_lane_x: Option<f32>,
         crossing_side: CrossingSide,
     ) -> Result<FusedLegalityResult> {
-        // 1. Run YOLOv8-seg to get all line classifications
+        // 1. Run seg model to detect all road markings
         let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
         let (box_output, mask_proto, _) = self.infer(&input)?;
-        let markings = self.postprocess(
+        let all_markings = self.postprocess(
             &box_output,
             &mask_proto,
             &[],
@@ -230,75 +266,143 @@ impl LaneLegalityDetector {
             confidence_threshold,
         )?;
 
-        // 2. Calculate normalised offset from UFLDv2
-        let normalized_offset = lane_width
-            .filter(|&w| w > 50.0)
-            .map(|w| (vehicle_lateral_offset / w).abs())
-            .unwrap_or(0.0);
-
-        // 3. Does UFLDv2 say we're near / crossing a boundary?
-        let is_crossing_per_lane_model = normalized_offset > FUSED_CROSSING_OFFSET_THRESHOLD
-            && crossing_side != CrossingSide::None;
-
-        // 4. Find the nearest seg-model detection to the boundary we're crossing
-        let vehicle_x = width as f32 / 2.0;
-        let nearest_line = if is_crossing_per_lane_model {
-            self.find_nearest_line_to_crossing(
-                &markings,
-                vehicle_x,
-                left_lane_x,
-                right_lane_x,
-                crossing_side,
-                width,
-                height,
-            )
-        } else {
-            None
+        // 2. Calculate vehicle offset percentage
+        let offset_pct = match lane_width {
+            Some(w) if w > 50.0 => (vehicle_offset_px / w).abs(),
+            _ => 0.0,
         };
 
-        // 5. FUSED VERDICT — only flag when BOTH models agree
-        let verdict = if is_crossing_per_lane_model {
-            if let Some(ref line) = nearest_line {
-                line.legality
-            } else {
-                // Crossing but can't classify the line → unknown, not illegal
-                LineLegality::Unknown
-            }
-        } else {
-            // Lane model says NOT crossing → never flag
-            LineLegality::Legal
-        };
+        // 3. Determine if lane model confirms a crossing is happening
+        //    Key insight: only flag illegal if the lane model says we're
+        //    actually leaving our lane (offset > 25% = significant drift)
+        let lane_model_confirms_crossing = crossing_side != CrossingSide::None && offset_pct > 0.25;
 
-        debug!(
-            "F{}: fused offset={:.1}% side={:?} crossing={} nearest={} → {}",
-            frame_id,
-            normalized_offset * 100.0,
+        // 4. If no crossing confirmed by lane model, return clean result
+        if !lane_model_confirms_crossing {
+            return Ok(FusedLegalityResult {
+                verdict: LineLegality::Unknown,
+                crossing_confirmed_by_lane_model: false,
+                line_type_from_seg_model: None,
+                vehicle_offset_pct: offset_pct,
+                all_markings,
+                ego_intersects_marking: false,
+            });
+        }
+
+        // 5. Find the line being crossed based on WHICH SIDE we're crossing
+        //    Use lane boundaries from UFLDv2 to identify the correct line
+        let crossing_line = self.find_crossing_line(
+            &all_markings,
             crossing_side,
-            is_crossing_per_lane_model,
-            nearest_line
-                .as_ref()
-                .map(|l| l.class_name.as_str())
-                .unwrap_or("none"),
-            verdict.as_str(),
+            left_lane_x,
+            right_lane_x,
+            width,
+            height,
         );
+
+        let (verdict, intersecting_line) = match crossing_line {
+            Some(marking) => {
+                let raw_verdict = marking.legality;
+
+                // 6. Apply temporal filtering — need consecutive frames
+                let confirmed = self.temporal_filter.update(frame_id, raw_verdict);
+
+                if confirmed {
+                    (raw_verdict, Some(marking))
+                } else {
+                    debug!(
+                        "Temporal filter: {} not yet confirmed (need {} consecutive)",
+                        raw_verdict.as_str(),
+                        2
+                    );
+                    (LineLegality::Unknown, Some(marking))
+                }
+            }
+            None => {
+                self.temporal_filter.update(frame_id, LineLegality::Unknown);
+                (LineLegality::Unknown, None)
+            }
+        };
 
         Ok(FusedLegalityResult {
             verdict,
-            crossing_confirmed_by_lane_model: is_crossing_per_lane_model,
-            line_type_from_seg_model: nearest_line,
-            vehicle_offset_pct: normalized_offset,
-            ego_intersects_marking: is_crossing_per_lane_model,
-            frame_id,
-            all_markings: markings,
+            crossing_confirmed_by_lane_model: true,
+            line_type_from_seg_model: intersecting_line,
+            vehicle_offset_pct: offset_pct,
+            all_markings,
+            ego_intersects_marking: crossing_line.is_some(),
+        })
+    }
+
+    /// Find the line that corresponds to the boundary being crossed
+    /// Instead of checking ego bbox overlap, match seg model detections
+    /// to the lane boundary position from UFLDv2
+    fn find_crossing_line(
+        &self,
+        markings: &[DetectedRoadMarking],
+        crossing_side: CrossingSide,
+        left_lane_x: Option<f32>,
+        right_lane_x: Option<f32>,
+        frame_width: usize,
+        _frame_height: usize,
+    ) -> Option<DetectedRoadMarking> {
+        // Determine which lane boundary we're crossing
+        let boundary_x = match crossing_side {
+            CrossingSide::Left => left_lane_x,
+            CrossingSide::Right => right_lane_x,
+            CrossingSide::None => return None,
+        };
+
+        let boundary_x = match boundary_x {
+            Some(x) => x,
+            None => return None,
+        };
+
+        // Find the seg model detection whose bbox center is closest
+        // to the lane boundary we're crossing
+        let tolerance = frame_width as f32 * 0.12; // 12% of frame width
+
+        let mut best_match: Option<(f32, &DetectedRoadMarking)> = None;
+
+        for marking in markings {
+            // Only consider lane line classes (not other markings)
+            if !ILLEGAL_CLASS_IDS.contains(&marking.class_id)
+                && !LEGAL_CLASS_IDS.contains(&marking.class_id)
+            {
+                continue;
+            }
+
+            let marking_center_x = (marking.bbox[0] + marking.bbox[2]) / 2.0;
+            let distance = (marking_center_x - boundary_x).abs();
+
+            if distance < tolerance {
+                if best_match.is_none() || distance < best_match.unwrap().0 {
+                    best_match = Some((distance, marking));
+                }
+            }
+        }
+
+        best_match.map(|(dist, marking)| {
+            debug!(
+                "Matched seg detection '{}' (conf={:.0}%) to {} boundary at x={:.0} (dist={:.0}px)",
+                marking.class_name,
+                marking.confidence * 100.0,
+                if crossing_side == CrossingSide::Left {
+                    "LEFT"
+                } else {
+                    "RIGHT"
+                },
+                boundary_x,
+                dist
+            );
+            marking.clone()
         })
     }
 
     // ========================================================================
-    // STANDALONE ANALYSIS (legacy fallback — no lane model data)
+    // Keep original analyze_frame for visualization (all markings)
     // ========================================================================
 
-    /// Run standalone detection + legality check on a frame.
-    /// Use `analyze_frame_fused` when lane model data is available.
     pub fn analyze_frame(
         &mut self,
         frame: &[u8],
@@ -309,7 +413,6 @@ impl LaneLegalityDetector {
     ) -> Result<LegalityResult> {
         let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
         let (box_output, mask_proto, _) = self.infer(&input)?;
-
         let markings = self.postprocess(
             &box_output,
             &mask_proto,
@@ -322,91 +425,18 @@ impl LaneLegalityDetector {
             confidence_threshold,
         )?;
 
-        let ego_bbox = [
-            self.ego_bbox_ratio[0] * width as f32,
-            self.ego_bbox_ratio[1] * height as f32,
-            self.ego_bbox_ratio[2] * width as f32,
-            self.ego_bbox_ratio[3] * height as f32,
-        ];
-
-        let mut result = LegalityResult::no_detection(frame_id);
-        result.all_markings = markings;
-
-        let mut worst_legality = LineLegality::Unknown;
-
-        for marking in &result.all_markings {
-            if self.check_mask_intersection(marking, &ego_bbox, width, height) {
-                result.ego_intersects_marking = true;
-
-                let priority = legality_priority(marking.legality);
-                let current_priority = legality_priority(worst_legality);
-
-                if priority > current_priority {
-                    worst_legality = marking.legality;
-                    result.intersecting_line = Some(marking.clone());
-                }
-            }
-        }
-
-        result.verdict = worst_legality;
-        Ok(result)
+        // For visualization only — no violation counting
+        Ok(LegalityResult {
+            verdict: LineLegality::Unknown,
+            intersecting_line: None,
+            all_markings: markings,
+            ego_intersects_marking: false,
+            frame_id,
+        })
     }
 
     // ========================================================================
-    // FIND NEAREST LINE TO CROSSING BOUNDARY
-    // ========================================================================
-
-    /// Given the side the vehicle is crossing toward (from UFLDv2), find
-    /// the seg-model detection whose bbox center is closest to that lane
-    /// boundary.  Returns `None` if no detection is within the search margin.
-    fn find_nearest_line_to_crossing(
-        &self,
-        markings: &[DetectedRoadMarking],
-        vehicle_x: f32,
-        left_lane_x: Option<f32>,
-        right_lane_x: Option<f32>,
-        crossing_side: CrossingSide,
-        _frame_w: usize,
-        _frame_h: usize,
-    ) -> Option<DetectedRoadMarking> {
-        let boundary_x = match crossing_side {
-            CrossingSide::Left => left_lane_x.unwrap_or(vehicle_x * 0.4),
-            CrossingSide::Right => right_lane_x.unwrap_or(vehicle_x * 1.6),
-            CrossingSide::None => return None,
-        };
-
-        let margin = BOUNDARY_SEARCH_MARGIN;
-
-        // Filter markings whose bbox center-x is within ±margin of boundary
-        let mut candidates: Vec<(f32, &DetectedRoadMarking)> = markings
-            .iter()
-            .filter_map(|m| {
-                let bbox_cx = (m.bbox[0] + m.bbox[2]) / 2.0;
-                let dist = (bbox_cx - boundary_x).abs();
-                if dist <= margin {
-                    Some((dist, m))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Sort by distance (nearest first), break ties by confidence
-        candidates.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(
-                    b.1.confidence
-                        .partial_cmp(&a.1.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
-
-        candidates.first().map(|(_, m)| (*m).clone())
-    }
-
-    // ========================================================================
-    // PREPROCESSING (Letterbox to 640×640)
+    // PREPROCESSING
     // ========================================================================
 
     fn preprocess(
@@ -437,7 +467,6 @@ impl LaneLegalityDetector {
             }
         }
 
-        // Normalize to [0, 1] and HWC → CHW
         let mut input = vec![0.0f32; 3 * target * target];
         for c in 0..3 {
             for h in 0..target {
@@ -462,10 +491,6 @@ impl LaneLegalityDetector {
             ort::value::Value::from_array((shape.as_slice(), input.to_vec().into_boxed_slice()))?;
 
         let outputs = self.session.run(ort::inputs!["images" => input_value])?;
-
-        // YOLOv8-seg outputs:
-        // output0: [1, 116, 8400] — 4 bbox + 25 classes + 32 mask coeffs + …
-        // output1: [1, 32, 160, 160] — mask prototypes
 
         let output0 = &outputs[0];
         let (_, data0) = output0.try_extract_tensor::<f32>()?;
@@ -503,7 +528,6 @@ impl LaneLegalityDetector {
             let w = output[num_detections * 2 + i];
             let h = output[num_detections * 3 + i];
 
-            // Find best class among road marking classes
             let mut max_conf = 0.0f32;
             let mut best_class = 0;
 
@@ -519,13 +543,11 @@ impl LaneLegalityDetector {
                 continue;
             }
 
-            // Extract 32 mask coefficients for this detection
             let mut mask_coeffs_det = [0.0f32; 32];
             for mc in 0..32 {
                 mask_coeffs_det[mc] = output[num_detections * (4 + NUM_CLASSES + mc) + i];
             }
 
-            // Reverse letterbox transform
             let x1 = ((cx - w / 2.0) - pad_x) / scale;
             let y1 = ((cy - h / 2.0) - pad_y) / scale;
             let x2 = ((cx + w / 2.0) - pad_x) / scale;
@@ -536,16 +558,7 @@ impl LaneLegalityDetector {
             let x2 = x2.max(0.0).min(orig_w as f32);
             let y2 = y2.max(0.0).min(orig_h as f32);
 
-            // Generate binary mask from mask_proto @ mask_coeffs
-            let mask = self.generate_mask(
-                mask_proto,
-                &mask_coeffs_det,
-                pad_x,
-                pad_y,
-                scale,
-                orig_w,
-                orig_h,
-            );
+            let mask = self.generate_mask(mask_proto, &mask_coeffs_det);
 
             detections.push(DetectedRoadMarking {
                 class_id: best_class,
@@ -559,72 +572,16 @@ impl LaneLegalityDetector {
             });
         }
 
-        // Geometric correction for center lines misclassified as white
-        Self::apply_geometric_correction(&mut detections, orig_w);
+        // NOTE: Removed apply_geometric_correction — it was causing
+        // more harm than good by blindly remapping white→yellow
+        // The fused approach handles this properly
 
-        // NMS
         let detections = nms_markings(detections, 0.45);
-
         debug!("Detected {} road markings", detections.len());
         Ok(detections)
     }
 
-    // ========================================================================
-    // GEOMETRIC CORRECTION FOR CENTER LINES
-    // ========================================================================
-
-    fn apply_geometric_correction(detections: &mut [DetectedRoadMarking], frame_width: usize) {
-        let center_threshold = 0.15;
-        let frame_center = frame_width as f32 / 2.0;
-
-        for marking in detections.iter_mut() {
-            let bbox_center_x = (marking.bbox[0] + marking.bbox[2]) / 2.0;
-            let distance_from_center = (bbox_center_x - frame_center).abs() / frame_width as f32;
-
-            if distance_from_center < center_threshold && marking.class_name.contains("white") {
-                let original_class = marking.class_name.clone();
-                let original_legality = marking.legality;
-
-                marking.class_name = marking.class_name.replace("white", "yellow");
-
-                marking.class_id = if marking.class_name.contains("dashed") {
-                    10 // dashed_single_yellow
-                } else if marking.class_name.contains("double") {
-                    8 // solid_double_yellow (CRITICAL)
-                } else {
-                    5 // solid_single_yellow (CRITICAL)
-                };
-
-                marking.legality = class_id_to_legality(marking.class_id);
-
-                if marking.legality != original_legality {
-                    warn!(
-                        "🔧 CENTER LINE CORRECTION: {} ({}) → {} ({}) | Distance from center: {:.1}%",
-                        original_class,
-                        original_legality.as_str(),
-                        marking.class_name,
-                        marking.legality.as_str(),
-                        distance_from_center * 100.0
-                    );
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // MASK GENERATION
-    // ========================================================================
-
-    fn generate_mask(
-        &self,
-        mask_proto: &[f32], // [1, 32, 160, 160]
-        mask_coeffs: &[f32; 32],
-        _pad_x: f32,
-        _pad_y: f32,
-        _scale: f32,
-        _orig_w: usize,
-        _orig_h: usize,
-    ) -> Vec<u8> {
+    fn generate_mask(&self, mask_proto: &[f32], mask_coeffs: &[f32; 32]) -> Vec<u8> {
         let mh = MASK_SIZE;
         let mw = MASK_SIZE;
         let mut mask = vec![0u8; mh * mw];
@@ -644,57 +601,13 @@ impl LaneLegalityDetector {
                 }
             }
         }
-
         mask
-    }
-
-    // ========================================================================
-    // INTERSECTION CHECK (legacy / fallback)
-    // ========================================================================
-
-    fn check_mask_intersection(
-        &self,
-        marking: &DetectedRoadMarking,
-        ego_bbox: &[f32; 4],
-        frame_w: usize,
-        frame_h: usize,
-    ) -> bool {
-        let scale_x = MASK_SIZE as f32 / frame_w as f32;
-        let scale_y = MASK_SIZE as f32 / frame_h as f32;
-
-        let mx1 = (ego_bbox[0] * scale_x) as usize;
-        let my1 = (ego_bbox[1] * scale_y) as usize;
-        let mx2 = (ego_bbox[2] * scale_x).min(MASK_SIZE as f32 - 1.0) as usize;
-        let my2 = (ego_bbox[3] * scale_y).min(MASK_SIZE as f32 - 1.0) as usize;
-
-        let mut intersection_pixels = 0;
-
-        for y in my1..=my2.min(MASK_SIZE - 1) {
-            for x in mx1..=mx2.min(MASK_SIZE - 1) {
-                if marking.mask[y * MASK_SIZE + x] > 0 {
-                    intersection_pixels += 1;
-                }
-            }
-        }
-
-        // Raised from 5 → FUSED_MIN_MASK_PIXELS to reduce false positives
-        intersection_pixels >= FUSED_MIN_MASK_PIXELS
     }
 }
 
 // ============================================================================
 // HELPERS
 // ============================================================================
-
-fn legality_priority(l: LineLegality) -> u8 {
-    match l {
-        LineLegality::CriticalIllegal => 4,
-        LineLegality::Illegal => 3,
-        LineLegality::Legal => 2,
-        LineLegality::Caution => 1,
-        LineLegality::Unknown => 0,
-    }
-}
 
 fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
     let mut dst = vec![0u8; dst_h * dst_w * 3];
@@ -735,7 +648,6 @@ fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<Dete
         return dets;
     }
     dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
     let mut keep = Vec::new();
     while !dets.is_empty() {
         let current = dets.remove(0);
