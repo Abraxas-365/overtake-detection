@@ -785,7 +785,7 @@ pub fn draw_lanes_with_state_enhanced(
 // ══════════════════════════════════════════════════════════════════════════
 
 fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32) -> Result<()> {
-    // Semi-transparent dark background
+    // Create overlay on a clone to avoid borrow conflict
     let mut overlay = img.clone();
     imgproc::rectangle(
         &mut overlay,
@@ -797,7 +797,12 @@ fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32)
     )?;
 
     // Blend with original (70% overlay, 30% original)
-    core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, img, -1)?;
+    // Fix: Use a temp variable instead of borrowing img twice
+    let mut result = Mat::default();
+    core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, &mut result, -1)?;
+
+    // Copy result back to img
+    result.copy_to(img)?;
 
     // Border
     imgproc::rectangle(

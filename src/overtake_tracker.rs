@@ -43,6 +43,12 @@ impl OvertakeTracker {
             timeout_frames,
         }
     }
+    pub fn get_direction(&self) -> Direction {
+        match &self.state {
+            OvertakeState::InProgress { direction, .. } => *direction,
+            _ => Direction::Unknown,
+        }
+    }
 
     pub fn process_lane_change(
         &mut self,
