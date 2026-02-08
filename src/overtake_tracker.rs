@@ -1,7 +1,6 @@
 // src/overtake_tracker.rs
 
 use crate::types::{Direction, LaneChangeEvent};
-use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,25 +15,24 @@ enum OvertakeState {
 
 pub struct OvertakeTracker {
     state: OvertakeState,
-    timeout_frames: u64, // If no return within this, consider incomplete
+    timeout_frames: u64,
 }
 
 #[derive(Debug, Clone)]
 pub enum OvertakeResult {
-    /// Complete overtaking maneuver (left → right or right → left)
     Complete {
         start_event: LaneChangeEvent,
         end_event: LaneChangeEvent,
         total_duration_ms: f64,
-        vehicles_overtaken: Vec<String>, // Will be filled later
+        vehicles_overtaken: Vec<String>,
     },
-    /// Incomplete overtake (changed lane but didn't return)
     Incomplete {
         start_event: LaneChangeEvent,
         reason: String,
     },
-    /// Not an overtake pattern, just a lane change
-    SimpleLaneChange { event: LaneChangeEvent },
+    SimpleLaneChange {
+        event: LaneChangeEvent,
+    },
 }
 
 impl OvertakeTracker {
@@ -46,7 +44,6 @@ impl OvertakeTracker {
         }
     }
 
-    /// Process a lane change event and determine if it's part of an overtake
     pub fn process_lane_change(
         &mut self,
         event: LaneChangeEvent,
@@ -54,7 +51,6 @@ impl OvertakeTracker {
     ) -> Option<OvertakeResult> {
         match &self.state {
             OvertakeState::Idle => {
-                // Start tracking a potential overtake
                 info!(
                     "🟡 Overtake initiated: {} at {:.2}s",
                     event.direction_name(),
@@ -63,20 +59,18 @@ impl OvertakeTracker {
 
                 self.state = OvertakeState::InProgress {
                     start_event: event.clone(),
-                    start_frame: event.end_frame_id,
+                    start_frame: current_frame,
                     direction: event.direction,
                 };
 
-                // Don't emit event yet - wait for return
                 None
             }
 
             OvertakeState::InProgress {
                 start_event,
-                start_frame,
                 direction,
+                ..  // 🆕 Ignore start_frame with ..
             } => {
-                // Check if this is the return lane change
                 let is_return = match (direction, event.direction) {
                     (Direction::Left, Direction::Right) => true,
                     (Direction::Right, Direction::Left) => true,
@@ -84,7 +78,6 @@ impl OvertakeTracker {
                 };
 
                 if is_return {
-                    // Complete overtake!
                     let total_duration_ms =
                         event.video_timestamp_ms - start_event.video_timestamp_ms;
 
@@ -99,29 +92,24 @@ impl OvertakeTracker {
                         start_event: start_event.clone(),
                         end_event: event,
                         total_duration_ms,
-                        vehicles_overtaken: vec![], // Will be filled by overtake_analyzer
+                        vehicles_overtaken: vec![],
                     };
 
-                    // Reset state
                     self.state = OvertakeState::Idle;
-
                     Some(result)
                 } else {
-                    // Same direction again? This is unusual - might be weaving
                     warn!(
                         "⚠️  Multiple {} lane changes without returning",
                         event.direction_name()
                     );
 
-                    // Treat previous as incomplete, start tracking new one
                     let incomplete = OvertakeResult::Incomplete {
                         start_event: start_event.clone(),
                         reason: "Driver didn't return to original lane".to_string(),
                     };
 
-                    // Start tracking this new lane change
                     self.state = OvertakeState::InProgress {
-                        start_event: event,
+                        start_event: event.clone(),  // 🆕 Clone here
                         start_frame: current_frame,
                         direction: event.direction,
                     };
@@ -132,7 +120,6 @@ impl OvertakeTracker {
         }
     }
 
-    /// Check for timeout (incomplete overtake)
     pub fn check_timeout(&mut self, current_frame: u64) -> Option<OvertakeResult> {
         if let OvertakeState::InProgress {
             start_event,

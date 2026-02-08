@@ -332,14 +332,14 @@ impl std::fmt::Display for Direction {
 // Evidence Paths
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
 pub struct EvidencePaths {
     pub start_image_path: String,
     pub end_image_path: String,
 }
 
 // ============================================================================
-// 🆕 Curve Information
+// Curve Information
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -372,7 +372,7 @@ impl CurveInfo {
 // Lane Change Event
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
 pub struct LaneChangeEvent {
     pub event_id: String,
     pub timestamp: String,
@@ -389,7 +389,7 @@ pub struct LaneChangeEvent {
     pub legality: Option<LegalityInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
 pub struct LegalityInfo {
     pub is_legal: bool,
     pub lane_line_type: String,
@@ -500,7 +500,7 @@ impl LaneChangeConfig {
 }
 
 // ============================================================================
-// 🆕 Vehicle Position (for smoother)
+// Vehicle Position (for smoother)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy)]
