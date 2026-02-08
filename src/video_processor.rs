@@ -1,8 +1,7 @@
 // src/video_processor.rs
-use crate::overtake_analyzer::TrackedVehicle;
-use crate::shadow_overtake::ShadowOvertakeDetector;
-use std::collections::HashMap;
-
+use crate::overtake_analyzer::{OvertakeEvent, TrackedVehicle};
+use crate::shadow_overtake::{ShadowOvertakeDetector, ShadowSeverity};
+use crate::types::CurveInfo;
 use crate::types::{Config, DetectedLane, VehicleState};
 use anyhow::Result;
 use opencv::{
@@ -11,6 +10,7 @@ use opencv::{
     prelude::*,
     videoio::{self, VideoCapture, VideoCaptureTraitConst, VideoWriter},
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use walkdir::WalkDir;
@@ -157,6 +157,7 @@ impl VideoReader {
         (self.current_frame as f32 / self.total_frames as f32) * 100.0
     }
 }
+/// Ultra-rich visualization with complete telemetry overlay
 pub fn draw_lanes_with_state_enhanced(
     frame: &[u8],
     width: i32,
@@ -167,6 +168,12 @@ pub fn draw_lanes_with_state_enhanced(
     tracked_vehicles: &HashMap<u32, TrackedVehicle>,
     shadow_detector: &ShadowOvertakeDetector,
     frame_id: u64,
+    timestamp_ms: f64,
+    is_overtaking: bool,
+    overtake_direction: Option<&str>,
+    vehicles_overtaken_this_maneuver: &[OvertakeEvent],
+    curve_info: Option<CurveInfo>,
+    lateral_velocity: f32,
 ) -> Result<Mat> {
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
@@ -193,10 +200,9 @@ pub fn draw_lanes_with_state_enhanced(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 2. DRAW TRACKED VEHICLES (YOLO)
+    // 2. DRAW TRACKED VEHICLES (YOLO) WITH STATUS INDICATORS
     // ══════════════════════════════════════════════════════════════════════
 
-    // Get shadow overtake vehicle IDs for highlighting
     let shadow_vehicle_ids: std::collections::HashSet<u32> = if shadow_detector.is_monitoring() {
         shadow_detector
             .get_current_shadows()
@@ -207,24 +213,32 @@ pub fn draw_lanes_with_state_enhanced(
         std::collections::HashSet::new()
     };
 
+    let overtaken_vehicle_ids: std::collections::HashSet<u32> = vehicles_overtaken_this_maneuver
+        .iter()
+        .map(|o| o.vehicle_id)
+        .collect();
+
     for (vehicle_id, vehicle) in tracked_vehicles {
-        // Get latest position
         if let Some(latest_pos) = vehicle.position_history.last() {
-            // Only draw if this position is recent (within last 10 frames)
             if frame_id.saturating_sub(latest_pos.frame_id) < 10 {
                 let bbox = &vehicle.bbox;
 
-                // Check if this vehicle is a shadow blocker
                 let is_shadow_blocker = shadow_vehicle_ids.contains(vehicle_id);
+                let was_overtaken = overtaken_vehicle_ids.contains(vehicle_id);
 
-                // Color: RED for shadow blockers, GREEN for normal vehicles
+                // Color coding:
+                // RED = shadow blocker (danger!)
+                // CYAN = overtaken vehicle
+                // GREEN = normal tracked vehicle
                 let box_color = if is_shadow_blocker {
-                    core::Scalar::new(0.0, 0.0, 255.0, 0.0) // RED - DANGER!
+                    core::Scalar::new(0.0, 0.0, 255.0, 0.0) // RED
+                } else if was_overtaken {
+                    core::Scalar::new(255.0, 255.0, 0.0, 0.0) // CYAN
                 } else {
-                    core::Scalar::new(0.0, 255.0, 0.0, 0.0) // GREEN - normal
+                    core::Scalar::new(0.0, 255.0, 0.0, 0.0) // GREEN
                 };
 
-                let thickness = if is_shadow_blocker { 3 } else { 2 };
+                let thickness = if is_shadow_blocker { 4 } else { 2 };
 
                 // Draw bounding box
                 let pt1 = core::Point::new(bbox[0] as i32, bbox[1] as i32);
@@ -238,9 +252,11 @@ pub fn draw_lanes_with_state_enhanced(
                     0,
                 )?;
 
-                // Draw label with ID and class
+                // Label with status icons
                 let label = if is_shadow_blocker {
-                    format!("⚠ {} #{}", vehicle.class_name, vehicle_id)
+                    format!("⚠ BLOCKING {} #{}", vehicle.class_name, vehicle_id)
+                } else if was_overtaken {
+                    format!("✓ {} #{}", vehicle.class_name, vehicle_id)
                 } else {
                     format!("{} #{}", vehicle.class_name, vehicle_id)
                 };
@@ -259,20 +275,19 @@ pub fn draw_lanes_with_state_enhanced(
                 imgproc::rectangle(
                     &mut output,
                     core::Rect::from_points(label_bg_pt1, label_bg_pt2),
-                    core::Scalar::new(0.0, 0.0, 0.0, 0.0), // Black background
+                    core::Scalar::new(0.0, 0.0, 0.0, 0.0),
                     -1,
                     imgproc::LINE_8,
                     0,
                 )?;
 
-                // Draw text
                 imgproc::put_text(
                     &mut output,
                     &label,
                     label_pos,
                     imgproc::FONT_HERSHEY_SIMPLEX,
                     0.5,
-                    core::Scalar::new(255.0, 255.0, 255.0, 0.0), // White text
+                    core::Scalar::new(255.0, 255.0, 255.0, 0.0),
                     1,
                     imgproc::LINE_8,
                     false,
@@ -289,65 +304,205 @@ pub fn draw_lanes_with_state_enhanced(
     imgproc::circle(
         &mut output,
         core::Point::new(vehicle_x, vehicle_y),
-        10,
-        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+        12,
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0),
         -1,
         imgproc::LINE_8,
         0,
     )?;
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 4. STATUS OVERLAY (TOP LEFT)
-    // ══════════════════════════════════════════════════════════════════════
-    let mut y_offset = 32;
-    let line_height = 28;
-
-    // Lane change state
-    let state_color = match state {
-        "CENTERED" => core::Scalar::new(0.0, 255.0, 0.0, 0.0), // Green
-        "DRIFTING" => core::Scalar::new(0.0, 165.0, 255.0, 0.0), // Orange
-        "CROSSING" => core::Scalar::new(0.0, 0.0, 255.0, 0.0), // Red
-        _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),      // White
-    };
-
-    imgproc::put_text(
-        &mut output,
-        &format!("State: {}", state),
-        core::Point::new(15, y_offset),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        0.7,
-        state_color,
-        2,
-        imgproc::LINE_8,
-        false,
-    )?;
-    y_offset += line_height;
-
-    // Vehicle offset info
-    if let Some(vs) = vehicle_state {
-        if vs.is_valid() {
-            let normalized = vs.normalized_offset().unwrap_or(0.0);
-            let offset_info = format!(
-                "Offset: {:.1}px ({:+.1}%)",
-                vs.lateral_offset,
-                normalized * 100.0
-            );
-            imgproc::put_text(
+    // Draw direction arrow if overtaking
+    if is_overtaking {
+        if let Some(direction) = overtake_direction {
+            let arrow_start = core::Point::new(vehicle_x, vehicle_y);
+            let arrow_end = if direction == "LEFT" {
+                core::Point::new(vehicle_x - 40, vehicle_y)
+            } else {
+                core::Point::new(vehicle_x + 40, vehicle_y)
+            };
+            imgproc::arrow_line(
                 &mut output,
-                &offset_info,
-                core::Point::new(15, y_offset),
-                imgproc::FONT_HERSHEY_SIMPLEX,
-                0.6,
-                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
-                1,
+                arrow_start,
+                arrow_end,
+                core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+                3,
                 imgproc::LINE_8,
-                false,
+                0,
+                0.3,
             )?;
-            y_offset += line_height;
         }
     }
 
-    // Vehicle tracking info
+    // ══════════════════════════════════════════════════════════════════════
+    // 4. TOP BANNER: CRITICAL WARNINGS
+    // ══════════════════════════════════════════════════════════════════════
+    let mut banner_active = false;
+    let mut banner_text = String::new();
+    let mut banner_color = core::Scalar::new(0.0, 0.0, 200.0, 0.0); // Default red
+
+    if shadow_detector.is_monitoring() && shadow_detector.active_shadow_count() > 0 {
+        banner_active = true;
+        banner_text = format!(
+            "⚠ SHADOW OVERTAKE: {} vehicle(s) blocking visibility! DANGER!",
+            shadow_detector.active_shadow_count()
+        );
+        banner_color = core::Scalar::new(0.0, 0.0, 255.0, 0.0); // Bright red
+    } else if let Some(curve) = curve_info {
+        if curve.is_curve && is_overtaking {
+            banner_active = true;
+            banner_text = format!(
+                "⚠ OVERTAKING IN {} CURVE ({:.1}°) - ILLEGAL!",
+                match curve.curve_type {
+                    crate::types::CurveType::Sharp => "SHARP",
+                    crate::types::CurveType::Moderate => "MODERATE",
+                    _ => "CURVE",
+                },
+                curve.angle_degrees
+            );
+            banner_color = core::Scalar::new(0.0, 100.0, 255.0, 0.0); // Orange-red
+        }
+    }
+
+    if banner_active {
+        let banner_height = 60;
+        imgproc::rectangle(
+            &mut output,
+            core::Rect::new(0, 0, width, banner_height),
+            banner_color,
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        imgproc::put_text(
+            &mut output,
+            &banner_text,
+            core::Point::new(20, 40),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.9,
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 5. LEFT PANEL: VEHICLE STATE & POSITIONING
+    // ══════════════════════════════════════════════════════════════════════
+    let panel_x = 15;
+    let mut panel_y = if banner_active { 80 } else { 30 };
+    let line_height = 26;
+
+    // Semi-transparent background
+    draw_panel_background(&mut output, 5, panel_y - 10, 450, 280)?;
+
+    // Title
+    draw_text_with_shadow(
+        &mut output,
+        "VEHICLE STATUS",
+        panel_x,
+        panel_y,
+        0.7,
+        core::Scalar::new(100.0, 200.0, 255.0, 0.0),
+        2,
+    )?;
+    panel_y += line_height;
+
+    // Frame info
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Frame: {} | Time: {:.2}s", frame_id, timestamp_ms / 1000.0),
+        panel_x,
+        panel_y,
+        0.5,
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Lane change state with color coding
+    let state_color = match state {
+        "CENTERED" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        "DRIFTING" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        "CROSSING" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+    };
+
+    draw_text_with_shadow(
+        &mut output,
+        &format!("State: {}", state),
+        panel_x,
+        panel_y,
+        0.65,
+        state_color,
+        2,
+    )?;
+    panel_y += line_height;
+
+    // Vehicle offset and velocity
+    if let Some(vs) = vehicle_state {
+        if vs.is_valid() {
+            let normalized = vs.normalized_offset().unwrap_or(0.0);
+
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    "Lateral Offset: {:.1}px ({:+.1}%)",
+                    vs.lateral_offset,
+                    normalized * 100.0
+                ),
+                panel_x,
+                panel_y,
+                0.55,
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+                1,
+            )?;
+            panel_y += line_height;
+
+            draw_text_with_shadow(
+                &mut output,
+                &format!("Lateral Velocity: {:.1} px/s", lateral_velocity),
+                panel_x,
+                panel_y,
+                0.55,
+                if lateral_velocity.abs() > 100.0 {
+                    core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange for high velocity
+                } else {
+                    core::Scalar::new(255.0, 255.0, 255.0, 0.0)
+                },
+                1,
+            )?;
+            panel_y += line_height;
+
+            if let Some(width) = vs.lane_width {
+                draw_text_with_shadow(
+                    &mut output,
+                    &format!("Lane Width: {:.0}px", width),
+                    panel_x,
+                    panel_y,
+                    0.55,
+                    core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                    1,
+                )?;
+                panel_y += line_height;
+            }
+        }
+    }
+
+    // Lane detection quality
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Lanes Detected: {}", lanes.len()),
+        panel_x,
+        panel_y,
+        0.55,
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Tracked vehicles
     let active_vehicles = tracked_vehicles
         .values()
         .filter(|v| {
@@ -358,82 +513,341 @@ pub fn draw_lanes_with_state_enhanced(
         })
         .count();
 
-    imgproc::put_text(
+    draw_text_with_shadow(
         &mut output,
-        &format!("Tracked: {} vehicles", active_vehicles),
-        core::Point::new(15, y_offset),
-        imgproc::FONT_HERSHEY_SIMPLEX,
-        0.6,
-        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        &format!("Vehicles Tracked: {}", active_vehicles),
+        panel_x,
+        panel_y,
+        0.55,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         1,
-        imgproc::LINE_8,
-        false,
     )?;
-    y_offset += line_height;
 
     // ══════════════════════════════════════════════════════════════════════
-    // 5. SHADOW OVERTAKE WARNING (if active)
+    // 6. RIGHT PANEL: OVERTAKE STATUS
     // ══════════════════════════════════════════════════════════════════════
-    if shadow_detector.is_monitoring() && shadow_detector.active_shadow_count() > 0 {
-        let warning_text = format!(
-            "⚠ SHADOW OVERTAKE: {} vehicle(s) blocking!",
-            shadow_detector.active_shadow_count()
-        );
+    let right_panel_x = width - 480;
+    let mut right_panel_y = if banner_active { 80 } else { 30 };
 
-        // Draw warning banner at the top
-        let banner_height = 50;
-        imgproc::rectangle(
-            &mut output,
-            core::Rect::new(0, 0, width, banner_height),
-            core::Scalar::new(0.0, 0.0, 200.0, 0.0), // Red background
-            -1,
-            imgproc::LINE_8,
-            0,
-        )?;
+    draw_panel_background(
+        &mut output,
+        right_panel_x - 10,
+        right_panel_y - 10,
+        470,
+        350,
+    )?;
 
-        imgproc::put_text(
-            &mut output,
-            &warning_text,
-            core::Point::new(width / 2 - 250, 32),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.8,
-            core::Scalar::new(255.0, 255.0, 255.0, 0.0), // White text
-            2,
-            imgproc::LINE_8,
-            false,
-        )?;
+    // Title
+    draw_text_with_shadow(
+        &mut output,
+        "OVERTAKE STATUS",
+        right_panel_x,
+        right_panel_y,
+        0.7,
+        core::Scalar::new(100.0, 200.0, 255.0, 0.0),
+        2,
+    )?;
+    right_panel_y += line_height;
 
-        // Severity indicator
-        if let Some(severity) = shadow_detector.worst_active_severity() {
-            let severity_text = format!("Severity: {}", severity.as_str());
-            imgproc::put_text(
+    if is_overtaking {
+        if let Some(direction) = overtake_direction {
+            draw_text_with_shadow(
                 &mut output,
-                &severity_text,
-                core::Point::new(15, y_offset),
-                imgproc::FONT_HERSHEY_SIMPLEX,
+                &format!("🚀 OVERTAKING {} ➜", direction),
+                right_panel_x,
+                right_panel_y,
                 0.7,
-                core::Scalar::new(0.0, 0.0, 255.0, 0.0), // Red
+                core::Scalar::new(0.0, 165.0, 255.0, 0.0),
                 2,
-                imgproc::LINE_8,
-                false,
+            )?;
+            right_panel_y += line_height;
+        }
+    } else {
+        draw_text_with_shadow(
+            &mut output,
+            "Status: Normal driving",
+            right_panel_x,
+            right_panel_y,
+            0.6,
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+            1,
+        )?;
+        right_panel_y += line_height;
+    }
+
+    // Vehicles overtaken this maneuver
+    if !vehicles_overtaken_this_maneuver.is_empty() {
+        draw_text_with_shadow(
+            &mut output,
+            &format!(
+                "✓ Overtaken: {} vehicle(s)",
+                vehicles_overtaken_this_maneuver.len()
+            ),
+            right_panel_x,
+            right_panel_y,
+            0.6,
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+            1,
+        )?;
+        right_panel_y += line_height;
+
+        // List overtaken vehicles
+        for (i, overtaken) in vehicles_overtaken_this_maneuver.iter().take(5).enumerate() {
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    "  • {} (ID #{})",
+                    overtaken.class_name, overtaken.vehicle_id
+                ),
+                right_panel_x + 10,
+                right_panel_y,
+                0.5,
+                core::Scalar::new(200.0, 255.0, 200.0, 0.0),
+                1,
+            )?;
+            right_panel_y += 22;
+        }
+
+        if vehicles_overtaken_this_maneuver.len() > 5 {
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    "  ... and {} more",
+                    vehicles_overtaken_this_maneuver.len() - 5
+                ),
+                right_panel_x + 10,
+                right_panel_y,
+                0.5,
+                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                1,
+            )?;
+            right_panel_y += 22;
+        }
+    } else if is_overtaking {
+        draw_text_with_shadow(
+            &mut output,
+            "Overtaken: 0 (no vehicles passed yet)",
+            right_panel_x,
+            right_panel_y,
+            0.55,
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            1,
+        )?;
+        right_panel_y += line_height;
+    }
+
+    right_panel_y += 10; // Spacing
+
+    // Shadow overtake status
+    if shadow_detector.is_monitoring() {
+        let shadow_count = shadow_detector.active_shadow_count();
+
+        if shadow_count > 0 {
+            draw_text_with_shadow(
+                &mut output,
+                &format!("⚠ SHADOW: {} vehicle(s)", shadow_count),
+                right_panel_x,
+                right_panel_y,
+                0.65,
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                2,
+            )?;
+            right_panel_y += line_height;
+
+            if let Some(severity) = shadow_detector.worst_active_severity() {
+                let severity_color = match severity {
+                    ShadowSeverity::Critical => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                    ShadowSeverity::Dangerous => core::Scalar::new(0.0, 100.0, 255.0, 0.0),
+                    ShadowSeverity::Warning => core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+                };
+
+                draw_text_with_shadow(
+                    &mut output,
+                    &format!("Severity: {}", severity.as_str()),
+                    right_panel_x + 10,
+                    right_panel_y,
+                    0.6,
+                    severity_color,
+                    2,
+                )?;
+                right_panel_y += line_height;
+            }
+
+            // List shadow blockers
+            for shadow in shadow_detector.get_current_shadows().iter().take(3) {
+                draw_text_with_shadow(
+                    &mut output,
+                    &format!(
+                        "  • {} ID #{} blocking",
+                        shadow.blocking_vehicle_class, shadow.blocking_vehicle_id
+                    ),
+                    right_panel_x + 10,
+                    right_panel_y,
+                    0.5,
+                    core::Scalar::new(255.0, 150.0, 150.0, 0.0),
+                    1,
+                )?;
+                right_panel_y += 22;
+            }
+        } else {
+            draw_text_with_shadow(
+                &mut output,
+                "Shadow: Monitoring (clear)",
+                right_panel_x,
+                right_panel_y,
+                0.55,
+                core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+                1,
+            )?;
+            right_panel_y += line_height;
+        }
+    }
+
+    // Curve detection
+    if let Some(curve) = curve_info {
+        if curve.is_curve {
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    "🌀 Curve: {} ({:.1}°)",
+                    match curve.curve_type {
+                        crate::types::CurveType::Sharp => "SHARP",
+                        crate::types::CurveType::Moderate => "MODERATE",
+                        _ => "DETECTED",
+                    },
+                    curve.angle_degrees
+                ),
+                right_panel_x,
+                right_panel_y,
+                0.6,
+                core::Scalar::new(0.0, 200.0, 255.0, 0.0),
+                1,
             )?;
         }
-    } else if shadow_detector.is_monitoring() {
-        // Show that monitoring is active but no shadows detected
-        imgproc::put_text(
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 7. LEGEND (Bottom Right)
+    // ══════════════════════════════════════════════════════════════════════
+    let legend_y = height - 120;
+    draw_panel_background(&mut output, width - 250, legend_y - 10, 240, 110)?;
+
+    draw_text_with_shadow(
+        &mut output,
+        "LEGEND",
+        width - 240,
+        legend_y,
+        0.5,
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        1,
+    )?;
+
+    let legend_items = vec![
+        (
+            "🟢 Green box:",
+            "Tracked vehicle",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            "🔵 Cyan box:",
+            "Overtaken vehicle",
+            core::Scalar::new(255.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            "🔴 Red box:",
+            "Shadow blocker!",
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        ),
+        (
+            "🟡 Yellow:",
+            "Your vehicle",
+            core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+        ),
+    ];
+
+    for (i, (label, desc, color)) in legend_items.iter().enumerate() {
+        draw_text_with_shadow(
             &mut output,
-            "Shadow monitoring: ACTIVE",
-            core::Point::new(15, y_offset),
-            imgproc::FONT_HERSHEY_SIMPLEX,
-            0.6,
-            core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Cyan
+            &format!("{} {}", label, desc),
+            width - 235,
+            legend_y + 20 + (i as i32 * 20),
+            0.4,
+            *color,
             1,
-            imgproc::LINE_8,
-            false,
         )?;
     }
 
     Ok(output)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS FOR DRAWING
+// ══════════════════════════════════════════════════════════════════════════
+
+fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32) -> Result<()> {
+    // Semi-transparent dark background
+    let mut overlay = img.clone();
+    imgproc::rectangle(
+        &mut overlay,
+        core::Rect::new(x, y, width, height),
+        core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // Blend with original (70% overlay, 30% original)
+    core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, img, -1)?;
+
+    // Border
+    imgproc::rectangle(
+        img,
+        core::Rect::new(x, y, width, height),
+        core::Scalar::new(80.0, 80.0, 80.0, 0.0),
+        2,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    Ok(())
+}
+
+fn draw_text_with_shadow(
+    img: &mut Mat,
+    text: &str,
+    x: i32,
+    y: i32,
+    scale: f64,
+    color: core::Scalar,
+    thickness: i32,
+) -> Result<()> {
+    // Shadow
+    imgproc::put_text(
+        img,
+        text,
+        core::Point::new(x + 2, y + 2),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        scale,
+        core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+        thickness,
+        imgproc::LINE_8,
+        false,
+    )?;
+
+    // Main text
+    imgproc::put_text(
+        img,
+        text,
+        core::Point::new(x, y),
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        imgproc::LINE_8,
+        false,
+    )?;
+
+    Ok(())
 }
 
 pub fn draw_lanes_with_state(

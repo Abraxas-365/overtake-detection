@@ -181,6 +181,13 @@ impl ShadowOvertakeDetector {
         }
     }
 
+    pub fn get_direction(&self) -> Direction {
+        match &self.state {
+            OvertakeState::InProgress { direction, .. } => *direction,
+            _ => Direction::Unknown,
+        }
+    }
+
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
