@@ -225,7 +225,7 @@ async fn process_video(
     info!("✓ Overtake analyzer ready");
 
     // 🆕 Initialize overtake tracker (combines lane changes into overtakes)
-    let mut overtake_tracker = OvertakeTracker::new(15.0, reader.fps);
+    let mut overtake_tracker = OvertakeTracker::new(30.0, reader.fps);
     info!("✓ Overtake tracker ready (15s timeout)");
 
     // PREPARE OUTPUT FILE
