@@ -162,6 +162,10 @@ impl ShadowOvertakeDetector {
         Self::with_config(frame_width, frame_height, ShadowOvertakeConfig::default())
     }
 
+    pub fn get_current_shadows(&self) -> &[ShadowOvertakeEvent] {
+        &self.current_overtake_shadows
+    }
+
     pub fn with_config(frame_width: f32, frame_height: f32, config: ShadowOvertakeConfig) -> Self {
         Self {
             config,

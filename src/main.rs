@@ -679,13 +679,16 @@ async fn process_video(
 
                 // Annotated video output
                 if let Some(ref mut w) = writer {
-                    if let Ok(annotated) = video_processor::draw_lanes_with_state(
+                    if let Ok(annotated) = video_processor::draw_lanes_with_state_enhanced(
                         &frame.data,
                         reader.width,
                         reader.height,
                         &detected_lanes,
                         analyzer.current_state(),
                         analyzer.last_vehicle_state(),
+                        overtake_analyzer.get_tracked_vehicles(), // 🆕 Pass tracked vehicles
+                        &shadow_detector,                         // 🆕 Pass shadow detector
+                        frame_count,                              // 🆕 Pass frame ID
                     ) {
                         use opencv::videoio::VideoWriterTrait;
                         w.write(&annotated)?;
