@@ -338,26 +338,35 @@ impl ShadowOvertakeDetector {
                 candidate.min_distance_ratio = distance_ratio;
             }
 
-            // ── Confirm if enough evidence ───────────────────────────────
-            if !candidate.confirmed
-                && candidate.frames_in_overtaking_lane >= self.config.min_confirm_frames
-            {
-                candidate.confirmed = true;
-                self.total_detected += 1;
+            // 🔧 FIX: Extract values before computing severity
+            let was_already_confirmed = candidate.confirmed;
+            let min_dist = candidate.min_distance_ratio;
+            let frames_blocked = candidate.frames_in_overtaking_lane;
+            let class_name = candidate.class_name.clone();
 
-                let severity = self.compute_severity(
-                    candidate.min_distance_ratio,
-                    candidate.frames_in_overtaking_lane,
-                );
+            // Drop the mutable borrow by closing the entry scope
+            drop(candidate);
+
+            // ── Confirm if enough evidence ───────────────────────────────
+            if !was_already_confirmed && frames_blocked >= self.config.min_confirm_frames {
+                // Now we can call compute_severity safely
+                let severity = self.compute_severity(min_dist, frames_blocked);
+
+                // Mark as confirmed
+                if let Some(c) = self.candidates.get_mut(&vehicle_id) {
+                    c.confirmed = true;
+                }
+
+                self.total_detected += 1;
 
                 let event = ShadowOvertakeEvent {
                     blocking_vehicle_id: vehicle_id,
-                    blocking_vehicle_class: candidate.class_name.clone(),
+                    blocking_vehicle_class: class_name.clone(),
                     detected_at_frame: frame_id,
                     detected_at_timestamp_ms: timestamp_ms,
-                    frames_blocked: candidate.frames_in_overtaking_lane,
+                    frames_blocked,
                     severity,
-                    closest_distance_ratio: candidate.min_distance_ratio,
+                    closest_distance_ratio: min_dist,
                     last_active_frame: frame_id,
                 };
 
@@ -375,11 +384,8 @@ impl ShadowOvertakeDetector {
             }
 
             // ── Upgrade severity of existing confirmed shadow ────────────
-            if candidate.confirmed {
-                let new_severity = self.compute_severity(
-                    candidate.min_distance_ratio,
-                    candidate.frames_in_overtaking_lane,
-                );
+            if was_already_confirmed {
+                let new_severity = self.compute_severity(min_dist, frames_blocked);
 
                 if let Some(existing) = self
                     .current_overtake_shadows
@@ -387,7 +393,7 @@ impl ShadowOvertakeDetector {
                     .find(|e| e.blocking_vehicle_id == vehicle_id)
                 {
                     existing.last_active_frame = frame_id;
-                    existing.frames_blocked = candidate.frames_in_overtaking_lane;
+                    existing.frames_blocked = frames_blocked;
 
                     if new_severity.rank() > existing.severity.rank() {
                         warn!(
@@ -398,7 +404,7 @@ impl ShadowOvertakeDetector {
                             vehicle_id,
                         );
                         existing.severity = new_severity;
-                        existing.closest_distance_ratio = candidate.min_distance_ratio;
+                        existing.closest_distance_ratio = min_dist;
                     }
                 }
             }
