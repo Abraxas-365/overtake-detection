@@ -6,6 +6,7 @@ mod inference;
 mod lane_detection;
 mod preprocessing;
 mod types;
+mod vehicle_detection; // 🆕 Add this
 mod video_processor;
 
 use analysis::LaneChangeAnalyzer;
@@ -17,6 +18,7 @@ use frame_buffer::{
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 use types::{CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
+use vehicle_detection::YoloDetector; // 🆕 Add this
 
 /// Configuration for legality analysis
 struct LegalityAnalysisConfig {
@@ -125,6 +127,11 @@ async fn main() -> Result<()> {
                 if stats.curves_detected > 0 {
                     info!("  🌀 Curves detected: {}", stats.curves_detected);
                 }
+                // 🆕 Vehicle detection stats
+                info!(
+                    "  🚙 Total vehicles detected: {}",
+                    stats.total_vehicles_detected
+                );
                 info!("  Processing Speed: {:.1} FPS", stats.avg_fps);
             }
             Err(e) => {
@@ -142,6 +149,7 @@ struct ProcessingStats {
     lane_changes_detected: usize,
     events_sent_to_api: usize,
     curves_detected: usize,
+    total_vehicles_detected: usize, // 🆕 Add this
     duration_secs: f64,
     avg_fps: f64,
 }
@@ -177,7 +185,11 @@ async fn process_video(
     let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
     analyzer.set_source_id(video_path.to_string_lossy().to_string());
 
-    // 🆕 PREPARE OUTPUT FILE (Write immediately instead of buffering in memory)
+    // 🆕 Initialize YOLO detector
+    let mut yolo_detector = YoloDetector::new("models/yolov8n.onnx")?;
+    info!("✓ YOLO vehicle detector ready");
+
+    // PREPARE OUTPUT FILE (Write immediately instead of buffering in memory)
     std::fs::create_dir_all(&config.video.output_dir)?;
     let video_name = video_path.file_stem().unwrap().to_str().unwrap();
     let jsonl_path =
@@ -191,6 +203,7 @@ async fn process_video(
     let mut frames_with_valid_position: u64 = 0;
     let mut events_sent_to_api: usize = 0;
     let mut curves_detected: usize = 0;
+    let mut total_vehicles_detected: usize = 0; // 🆕 Add this
 
     let mut previous_state = "CENTERED".to_string();
 
@@ -202,6 +215,31 @@ async fn process_video(
     while let Some(frame) = reader.read_frame()? {
         frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
+
+        // 🆕 Run vehicle detection every 3 frames (to save compute)
+        if frame_count % 3 == 0 {
+            match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.5) {
+                Ok(vehicles) => {
+                    total_vehicles_detected += vehicles.len();
+
+                    // Log vehicles every 90 frames (3 seconds at 30fps)
+                    if frame_count % 90 == 0 && !vehicles.is_empty() {
+                        info!(
+                            "Frame {}: {} vehicles ({})",
+                            frame_count,
+                            vehicles.len(),
+                            vehicles
+                                .iter()
+                                .take(3) // Show first 3
+                                .map(|v| format!("{}: {:.0}%", v.class_name, v.confidence * 100.0))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+                Err(e) => debug!("YOLO detection failed on frame {}: {}", frame_count, e),
+            }
+        }
 
         if frame_count % 50 == 0 {
             info!(
@@ -242,13 +280,13 @@ async fn process_video(
                         event.direction_name(),
                         event.video_timestamp_ms / 1000.0,
                         event.end_frame_id,
-                        event.event_id // 🆕 LOG THE ID for cross-referencing with Go
+                        event.event_id
                     );
 
-                    // 🆕 GET CURVE INFORMATION from analyzer
+                    // GET CURVE INFORMATION from analyzer
                     let curve_info = analyzer.get_curve_info();
 
-                    // 🆕 Log if curve was detected
+                    // Log if curve was detected
                     if curve_info.is_curve {
                         curves_detected += 1;
                         warn!(
@@ -314,7 +352,7 @@ async fn process_video(
                         warn!("No frames captured for lane change event");
                     }
 
-                    // 🆕 SAVE EVIDENCE IMAGES WITH ABSOLUTE PATHS
+                    // SAVE EVIDENCE IMAGES WITH ABSOLUTE PATHS
                     let video_stem = video_path.file_stem().unwrap().to_str().unwrap();
                     let start_filename =
                         format!("{}_event_{}_start.jpg", video_stem, event.event_id);
@@ -346,7 +384,7 @@ async fn process_video(
                         end_image_path: end_path_str,
                     });
 
-                    // 🆕 SAVE EVENT IMMEDIATELY TO JSONL (Don't wait until end of video)
+                    // SAVE EVENT IMMEDIATELY TO JSONL (Don't wait until end of video)
                     match serde_json::to_string(&event.to_json()) {
                         Ok(json_line) => {
                             if let Err(e) = writeln!(results_file, "{}", json_line) {
@@ -442,6 +480,7 @@ async fn process_video(
     if curves_detected > 0 {
         info!("  🌀 Curves Detected: {}", curves_detected);
     }
+    info!("  🚙 Vehicles Detected: {}", total_vehicles_detected); // 🆕 Add this
     info!("  Processing Speed: {:.1} FPS", avg_fps);
 
     Ok(ProcessingStats {
@@ -450,6 +489,7 @@ async fn process_video(
         lane_changes_detected: lane_changes_count,
         events_sent_to_api,
         curves_detected,
+        total_vehicles_detected, // 🆕 Add this
         duration_secs: duration.as_secs_f64(),
         avg_fps,
     })
