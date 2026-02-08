@@ -201,6 +201,104 @@ fn class_id_to_legality(class_id: usize) -> LineLegality {
 }
 
 // ============================================================================
+// COLOR VERIFICATION — Fixes yellow detected as white
+// ============================================================================
+
+/// Verify/correct line color by sampling actual pixel values from the marked region
+/// This fixes the common issue where yellow center lines are misclassified as white
+fn verify_line_color(
+    frame_rgb: &[u8],
+    frame_width: usize,
+    frame_height: usize,
+    marking: &mut DetectedRoadMarking,
+) {
+    // Only correct white classes that might be yellow (4=solid_single_white, 7=solid_double_white, 9=dashed_single_white)
+    let is_white_class = matches!(marking.class_id, 4 | 7 | 9);
+    if !is_white_class {
+        return;
+    }
+
+    // Sample pixels from the bbox center region
+    let cx = ((marking.bbox[0] + marking.bbox[2]) / 2.0) as usize;
+    let cy = ((marking.bbox[1] + marking.bbox[3]) / 2.0) as usize;
+    let half_w = ((marking.bbox[2] - marking.bbox[0]) / 4.0).max(3.0) as usize;
+    let half_h = ((marking.bbox[3] - marking.bbox[1]) / 4.0).max(3.0) as usize;
+
+    let mut total_r: u32 = 0;
+    let mut total_g: u32 = 0;
+    let mut total_b: u32 = 0;
+    let mut count: u32 = 0;
+
+    let y_start = cy.saturating_sub(half_h).min(frame_height - 1);
+    let y_end = (cy + half_h).min(frame_height - 1);
+    let x_start = cx.saturating_sub(half_w).min(frame_width - 1);
+    let x_end = (cx + half_w).min(frame_width - 1);
+
+    for y in y_start..=y_end {
+        for x in x_start..=x_end {
+            let idx = (y * frame_width + x) * 3;
+            if idx + 2 < frame_rgb.len() {
+                let r = frame_rgb[idx] as u32;
+                let g = frame_rgb[idx + 1] as u32;
+                let b = frame_rgb[idx + 2] as u32;
+
+                // Only sample bright pixels (likely the line, not the road)
+                let brightness = (r + g + b) / 3;
+                if brightness > 100 {
+                    total_r += r;
+                    total_g += g;
+                    total_b += b;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    if count < 5 {
+        return; // Not enough samples
+    }
+
+    let avg_r = (total_r / count) as f32;
+    let avg_g = (total_g / count) as f32;
+    let avg_b = (total_b / count) as f32;
+
+    // Yellow detection heuristic:
+    // Yellow lines have high R, high G, low B
+    // R/B ratio > 1.6 and G/B ratio > 1.3 suggests yellow
+    let is_yellow = avg_b > 10.0 // avoid div-by-zero
+        && (avg_r / avg_b) > 1.6
+        && (avg_g / avg_b) > 1.3
+        && avg_r > 140.0
+        && avg_g > 100.0;
+
+    if is_yellow {
+        let old_class = marking.class_id;
+        let new_class = match marking.class_id {
+            4 => 5,  // solid_single_white → solid_single_yellow
+            7 => 8,  // solid_double_white → solid_double_yellow
+            9 => 10, // dashed_single_white → dashed_single_yellow
+            _ => marking.class_id,
+        };
+
+        if new_class != old_class {
+            debug!(
+                "🎨 Color correction: {} → {} (R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2})",
+                class_id_to_name(old_class),
+                class_id_to_name(new_class),
+                avg_r,
+                avg_g,
+                avg_b,
+                avg_r / avg_b.max(1.0),
+                avg_g / avg_b.max(1.0)
+            );
+            marking.class_id = new_class;
+            marking.class_name = class_id_to_name(new_class).to_string();
+            marking.legality = class_id_to_legality(new_class);
+        }
+    }
+}
+
+// ============================================================================
 // LANE LEGALITY DETECTOR
 // ============================================================================
 
@@ -264,6 +362,7 @@ impl LaneLegalityDetector {
             width,
             height,
             confidence_threshold,
+            frame, // ✅ Pass original frame for color verification
         )?;
 
         // 2. Calculate vehicle offset percentage
@@ -333,7 +432,7 @@ impl LaneLegalityDetector {
             line_type_from_seg_model: intersecting_line,
             vehicle_offset_pct: offset_pct,
             all_markings,
-            ego_intersects_marking, // ✅ Use the stored value
+            ego_intersects_marking,
         })
     }
 
@@ -426,6 +525,7 @@ impl LaneLegalityDetector {
             width,
             height,
             confidence_threshold,
+            frame, // ✅ Pass original frame for color verification
         )?;
 
         // For visualization only — no violation counting
@@ -521,6 +621,7 @@ impl LaneLegalityDetector {
         orig_w: usize,
         orig_h: usize,
         conf_thresh: f32,
+        frame_rgb: &[u8], // ✅ NEW: Original frame for color verification
     ) -> Result<Vec<DetectedRoadMarking>> {
         let mut detections = Vec::new();
         let num_detections = 8400;
@@ -575,9 +676,11 @@ impl LaneLegalityDetector {
             });
         }
 
-        // NOTE: Removed apply_geometric_correction — it was causing
-        // more harm than good by blindly remapping white→yellow
-        // The fused approach handles this properly
+        // ✅ Apply color verification BEFORE NMS
+        // This corrects white→yellow misclassifications by sampling actual pixel colors
+        for marking in &mut detections {
+            verify_line_color(frame_rgb, orig_w, orig_h, marking);
+        }
 
         let detections = nms_markings(detections, 0.45);
         debug!("Detected {} road markings", detections.len());
