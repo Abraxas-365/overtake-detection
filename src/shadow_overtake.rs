@@ -445,7 +445,7 @@ impl ShadowOvertakeDetector {
         }
     }
 
-    fn compute_severity(&self, distance_ratio: f32, frames_blocked: u32) -> ShadowSeverity {
+    fn compute_severity(&mut self, distance_ratio: f32, frames_blocked: u32) -> ShadowSeverity {
         // Multiple blockers → always critical
         let confirmed_count = self
             .current_overtake_shadows
