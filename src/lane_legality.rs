@@ -281,7 +281,7 @@ fn verify_line_color(
         };
 
         if new_class != old_class {
-            debug!(
+            info!(
                 "🎨 Color correction: {} → {} (R={:.0}, G={:.0}, B={:.0}, R/B={:.2}, G/B={:.2})",
                 class_id_to_name(old_class),
                 class_id_to_name(new_class),
@@ -412,7 +412,7 @@ impl LaneLegalityDetector {
                 if confirmed {
                     (raw_verdict, Some(marking))
                 } else {
-                    debug!(
+                    info!(
                         "Temporal filter: {} not yet confirmed (need {} consecutive)",
                         raw_verdict.as_str(),
                         2
@@ -485,7 +485,7 @@ impl LaneLegalityDetector {
         }
 
         best_match.map(|(dist, marking)| {
-            debug!(
+            info!(
                 "Matched seg detection '{}' (conf={:.0}%) to {} boundary at x={:.0} (dist={:.0}px)",
                 marking.class_name,
                 marking.confidence * 100.0,
@@ -683,7 +683,7 @@ impl LaneLegalityDetector {
         }
 
         let detections = nms_markings(detections, 0.45);
-        debug!("Detected {} road markings", detections.len());
+        info!("Detected {} road markings", detections.len());
         Ok(detections)
     }
 
