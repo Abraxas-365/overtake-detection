@@ -20,8 +20,9 @@ pub struct LaneChangeFrameBuffer {
 
 impl LaneChangeFrameBuffer {
     pub fn new(max_frames: usize) -> Self {
-        // Pre-buffer holds frames BEFORE lane change starts (e.g., 20 frames)
-        let pre_buffer_size = 20;
+        // INCREASED pre-buffer to 60 frames (2 seconds) to ensure we have
+        // enough context for end-of-video analysis
+        let pre_buffer_size = 60;
 
         Self {
             frames: Vec::with_capacity(max_frames),
@@ -74,6 +75,31 @@ impl LaneChangeFrameBuffer {
         frames
     }
 
+    /// 🆕 NEW: Force return frames, including pre-buffer if main buffer is empty.
+    /// Use this for timeouts/incomplete events where we might not be actively 'crossing'
+    /// but still want to see what happened recently.
+    pub fn force_flush(&mut self) -> Vec<Frame> {
+        self.is_capturing = false;
+        self.capture_start_frame_id = None;
+
+        let mut result = std::mem::take(&mut self.frames);
+
+        // If we captured nothing (e.g. was CENTERED), allow using the pre-buffer
+        if result.is_empty() && !self.pre_buffer.is_empty() {
+            info!(
+                "📹 Active buffer empty, using {} pre-buffered frames for evidence",
+                self.pre_buffer.len()
+            );
+            for f in &self.pre_buffer {
+                result.push(f.clone());
+            }
+        } else {
+            info!("📹 Flushed capture. Total frames: {}", result.len());
+        }
+
+        result
+    }
+
     pub fn is_capturing(&self) -> bool {
         self.is_capturing
     }
@@ -92,7 +118,6 @@ impl LaneChangeFrameBuffer {
         self.pre_buffer.len()
     }
 }
-
 // ============================================================================
 // ENHANCED API STRUCTURES WITH DETECTION METADATA
 // ============================================================================

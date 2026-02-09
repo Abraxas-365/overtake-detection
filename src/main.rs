@@ -876,7 +876,8 @@ async fn process_video(
                             }
 
                             // 2. STOP CAPTURE AND SEND TO API
-                            let captured_frames = frame_buffer.stop_capture();
+                            let captured_frames = frame_buffer.force_flush();
+
                             if !captured_frames.is_empty() {
                                 let curve_info = analyzer.get_curve_info();
                                 if let Err(e) = send_overtake_to_api(
@@ -1029,7 +1030,8 @@ async fn process_video(
                 }
 
                 // 📸 CAPTURE FINAL FRAMES AND SEND TO API
-                let captured_frames = frame_buffer.stop_capture();
+                let captured_frames = frame_buffer.force_flush();
+
                 if !captured_frames.is_empty() {
                     let curve_info = analyzer.get_curve_info();
                     if let Err(e) = send_overtake_to_api(
