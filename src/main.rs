@@ -580,6 +580,8 @@ async fn process_video(
 // STAGE 1 — Vehicle Detection
 // ============================================================================
 
+// src/main.rs - run_vehicle_detection
+
 fn run_vehicle_detection(
     ps: &mut PipelineState,
     frame: &Arc<Frame>,
@@ -609,7 +611,16 @@ fn run_vehicle_detection(
         .detect(&frame.data, frame.width, frame.height, 0.3)
     {
         ps.latest_vehicle_detections = detections.clone();
+
+        // 1. Update detections in analyzer
         ps.overtake_analyzer.update(detections, frame_count);
+
+        // 2. CRITICAL FIX: Tell analyzer if overtake is active so it extends vehicle retention
+        // This prevents "forgetting" vehicles while they are in the blind spot during the pass
+        ps.overtake_analyzer
+            .set_overtake_active(ps.overtake_tracker.is_tracking());
+
+        // 3. Update tracker about nearby vehicles
         ps.overtake_tracker
             .set_vehicles_being_passed(ps.overtake_analyzer.get_active_vehicle_count() > 0);
 
