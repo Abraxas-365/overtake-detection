@@ -731,7 +731,9 @@ async fn process_video(
 
         // Overtake Timeout Monitoring
         if frame_count % 30 == 0 {
-            if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count) {
+            let lanes_visible = !analysis_lanes.is_empty();
+            if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count, lanes_visible)
+            {
                 if let OvertakeResult::Incomplete {
                     start_event,
                     reason,
