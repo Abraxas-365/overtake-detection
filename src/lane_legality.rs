@@ -259,7 +259,7 @@ fn verify_line_color(
         };
 
         if new_class != marking.class_id {
-            info!(
+            debug!(
                 "🎨 Color correction: {} → {} (R={:.0}, G={:.0}, B={:.0}, R/B={:.2})",
                 marking.class_name,
                 class_id_to_name(new_class),
@@ -313,8 +313,15 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
 
             if is_pair_double_dashed || is_pair_solid_dashed {
                 let iou = calculate_iou_arr(&a.bbox, &b.bbox);
+
+                // NEW: Check horizontal distance to prevent merging left and right lane boundaries
+                let cx_a = (a.bbox[0] + a.bbox[2]) / 2.0;
+                let cx_b = (b.bbox[0] + b.bbox[2]) / 2.0;
+                let dist_x = (cx_a - cx_b).abs();
+
                 // Threshold 0.1 allows for side-by-side adjacency
-                if iou > 0.1 {
+                // dist_x < 100.0 ensures they are part of the same line structure
+                if iou > 0.1 && dist_x < 100.0 {
                     let (solid_part, dashed_part) = if matches!(a.class_id, 9 | 10) {
                         (b, a)
                     } else {
@@ -343,13 +350,13 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
                         // If the right half of that double line is dashed, YOU can cross.
                         new_marking.class_name = "mixed_double_yellow_dashed_right".to_string();
                         new_marking.legality = LineLegality::Legal;
-                        info!("🧩 Merged Mixed Line: Dashed RIGHT (Legal)");
+                        debug!("🧩 Merged Mixed Line: Dashed RIGHT (Legal)");
                     } else {
                         // Dashed is on the LEFT. Solid is on the RIGHT (your side).
                         // You cannot cross.
                         new_marking.class_name = "mixed_double_yellow_solid_right".to_string();
                         new_marking.legality = LineLegality::CriticalIllegal;
-                        info!("🧩 Merged Mixed Line: Solid RIGHT (Illegal)");
+                        debug!("🧩 Merged Mixed Line: Solid RIGHT (Illegal)");
                     }
 
                     merged.push(new_marking);
