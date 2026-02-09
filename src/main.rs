@@ -1,13 +1,11 @@
 // src/main.rs
 //
-// Production-ready overtake detection pipeline v2.1
+// Production-ready overtake detection pipeline v2.3
 //
 // Changes:
-//   ✅ Sends INCOMPLETE overtakes to API (critical fix)
-//   ✅ Sends End-Of-Video overtakes to API
-//   ✅ Captures shadow/legality data for incomplete maneuvers
-//   ✅ Legality ring buffer (temporal alignment fix)
-//   ✅ Dynamic overtake timeout (shadow/vehicle-aware)
+//   ✅ Dynamic Model Mixing (Smart Scheduling)
+//   ✅ Smart Frame Selection Integration (Critical Frame Targeting)
+//   ✅ Optimized Logic for "Incomplete" and "End-of-Video" events
 //
 
 mod analysis;
@@ -41,8 +39,10 @@ use tracing::{debug, error, info, warn};
 use types::{CurveInfo, DetectedLane, Direction, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 use vehicle_detection::YoloDetector;
 
-// ============================================================================\n// LEGALITY RING BUFFER
-// ============================================================================\n
+// ============================================================================
+// LEGALITY RING BUFFER
+// ============================================================================
+
 struct LegalityRingBuffer {
     entries: VecDeque<LegalityBufferEntry>,
     capacity: usize,
@@ -121,8 +121,10 @@ fn severity_rank(v: LineLegality) -> u8 {
     }
 }
 
-// ============================================================================\n// API CLIENT WITH RETRY
-// ============================================================================\n
+// ============================================================================
+// API CLIENT WITH RETRY
+// ============================================================================
+
 struct ApiClient {
     client: reqwest::Client,
     max_retries: u32,
@@ -223,8 +225,10 @@ impl ApiClient {
     }
 }
 
-// ============================================================================\n// SUBSYSTEM TIMING
-// ============================================================================\n
+// ============================================================================
+// SUBSYSTEM TIMING
+// ============================================================================
+
 struct SubsystemTimings {
     lane_inference_us: u64,
     yolo_us: u64,
@@ -245,8 +249,10 @@ impl SubsystemTimings {
     }
 }
 
-// ============================================================================\n// CONFIGURATION
-// ============================================================================\n
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
 struct LegalityAnalysisConfig {
     num_frames_to_analyze: usize,
     max_buffer_frames: usize,
@@ -269,8 +275,10 @@ impl Default for LegalityAnalysisConfig {
     }
 }
 
-// ============================================================================\n// PROCESSING STATS
-// ============================================================================\n
+// ============================================================================
+// PROCESSING STATS
+// ============================================================================
+
 struct ProcessingStats {
     total_frames: u64,
     frames_with_position: u64,
@@ -290,8 +298,10 @@ struct ProcessingStats {
     avg_fps: f64,
 }
 
-// ============================================================================\n// ENTRY POINT
-// ============================================================================\n
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -563,7 +573,30 @@ async fn process_video(
             break;
         }
 
-        if frame_count % config.lane_legality.inference_interval == 0 {
+        // ═════════════════════════════════════════════════════════════════════
+        // 🧠 DYNAMIC MODEL SCHEDULING (OPTIMIZED MIXING)
+        // ═════════════════════════════════════════════════════════════════════
+
+        // 1. Determine if we are in a critical maneuver (Drifting or Crossing)
+        let is_maneuver_active = analyzer.current_state() == "DRIFTING" 
+                              || analyzer.current_state() == "CROSSING";
+
+        // 2. Schedule Vehicle Detection (YOLOv8n) - Keep at intervals
+        //    Vehicle detection is heavy, so we keep it periodic (every 3 frames)
+        let vehicle_inference_interval = 3; 
+        let should_run_vehicles = frame_count % vehicle_inference_interval == 0;
+
+        // 3. Schedule Legality (YOLO-seg) - HIGH FREQUENCY during maneuvers
+        //    If we are drifting, run EVERY FRAME to catch the exact crossing moment.
+        let legality_inference_interval = config.lane_legality.inference_interval;
+        let should_run_legality = if is_maneuver_active {
+            true // 🚀 RUN EVERY FRAME when changing lanes (Critical for mixing!)
+        } else {
+            frame_count % legality_inference_interval == 0 // Idle speed otherwise
+        };
+
+        // ─── VEHICLE DETECTION ───────────────────────────────────────────────
+        if should_run_vehicles {
             let yolo_start = Instant::now();
             match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
                 Ok(detections) => {
@@ -590,9 +623,13 @@ async fn process_video(
                 Err(e) => debug!("YOLO detection failed on frame {}: {}", frame_count, e),
             }
             timings.yolo_us = yolo_start.elapsed().as_micros() as u64;
+        }
 
+        // ─── LEGALITY DETECTION (FUSED) ──────────────────────────────────────
+        if should_run_legality {
             if let Some(ref mut detector) = legality_detector {
                 let leg_start = Instant::now();
+                // Get previous state for geometric guidance
                 let vehicle_offset = analyzer
                     .last_vehicle_state()
                     .map(|vs| vs.lateral_offset)
@@ -642,6 +679,7 @@ async fn process_video(
             }
         }
 
+        // ─── OVERTAKE TIMEOUT & PROCESSING ──────────────────────────────────
         if frame_count % 30 == 0 {
             if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count) {
                 match timeout_result {
@@ -679,8 +717,21 @@ async fn process_video(
                         }
 
                         // 2. STOP CAPTURE AND SEND TO API
-                        let captured_frames = frame_buffer.stop_capture();
+                        // 🆕 SMART FRAME SELECTION: Calculate Critical Index
+                        let (captured_frames, buffer_start_id) = frame_buffer.stop_capture();
+                        
                         if !captured_frames.is_empty() {
+                            // Find the worst frame (violation)
+                            let critical_entry = legality_buffer.worst_in_range(
+                                start_event.start_frame_id, 
+                                frame_count
+                            );
+                            
+                            // Calculate index in buffer
+                            let critical_index = critical_entry.map(|entry| {
+                                (entry.frame_id.saturating_sub(buffer_start_id)) as usize
+                            });
+
                             let curve_info = analyzer.get_curve_info();
                             if let Err(e) = send_overtake_to_api(
                                 &incomplete_event,
@@ -689,6 +740,7 @@ async fn process_video(
                                 legality_config,
                                 config,
                                 api_client,
+                                critical_index, // Pass the critical index to API builder
                             )
                             .await
                             {
@@ -820,8 +872,21 @@ async fn process_video(
                                 curves_detected += 1;
                             }
 
-                            let captured_frames = frame_buffer.stop_capture();
+                            // 🆕 SMART FRAME SELECTION: Calculate Critical Index
+                            let (captured_frames, buffer_start_id) = frame_buffer.stop_capture();
+                            
                             if !captured_frames.is_empty() {
+                                // Find the worst frame (violation)
+                                let critical_entry = legality_buffer.worst_in_range(
+                                    start_event.start_frame_id, 
+                                    end_event.end_frame_id
+                                );
+                                
+                                // Calculate index in buffer
+                                let critical_index = critical_entry.map(|entry| {
+                                    (entry.frame_id.saturating_sub(buffer_start_id)) as usize
+                                });
+
                                 if let Err(e) = send_overtake_to_api(
                                     &combined_event,
                                     &captured_frames,
@@ -829,6 +894,7 @@ async fn process_video(
                                     legality_config,
                                     config,
                                     api_client,
+                                    critical_index, // Pass index
                                 )
                                 .await
                                 {
@@ -876,9 +942,18 @@ async fn process_video(
                             }
 
                             // 2. STOP CAPTURE AND SEND TO API
-                            let captured_frames = frame_buffer.force_flush();
+                            // 🆕 SMART FRAME SELECTION
+                            let (captured_frames, buffer_start_id) = frame_buffer.force_flush();
 
                             if !captured_frames.is_empty() {
+                                let critical_entry = legality_buffer.worst_in_range(
+                                    start_event.start_frame_id, 
+                                    frame_count
+                                );
+                                let critical_index = critical_entry.map(|entry| {
+                                    (entry.frame_id.saturating_sub(buffer_start_id)) as usize
+                                });
+
                                 let curve_info = analyzer.get_curve_info();
                                 if let Err(e) = send_overtake_to_api(
                                     &incomplete_event,
@@ -887,6 +962,7 @@ async fn process_video(
                                     legality_config,
                                     config,
                                     api_client,
+                                    critical_index,
                                 )
                                 .await
                                 {
@@ -1030,9 +1106,17 @@ async fn process_video(
                 }
 
                 // 📸 CAPTURE FINAL FRAMES AND SEND TO API
-                let captured_frames = frame_buffer.force_flush();
+                let (captured_frames, buffer_start_id) = frame_buffer.force_flush();
 
                 if !captured_frames.is_empty() {
+                    let critical_entry = legality_buffer.worst_in_range(
+                        start_event.start_frame_id, 
+                        frame_count
+                    );
+                    let critical_index = critical_entry.map(|entry| {
+                        (entry.frame_id.saturating_sub(buffer_start_id)) as usize
+                    });
+
                     let curve_info = analyzer.get_curve_info();
                     if let Err(e) = send_overtake_to_api(
                         &incomplete_event,
@@ -1041,6 +1125,7 @@ async fn process_video(
                         legality_config,
                         config,
                         api_client,
+                        critical_index,
                     )
                     .await
                     {
@@ -1099,8 +1184,10 @@ async fn process_video(
     })
 }
 
-// ============================================================================\n// HELPERS
-// ============================================================================\n
+// ============================================================================
+// HELPERS
+// ============================================================================
+
 fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResult) {
     if !legality.ego_intersects_marking {
         return;
@@ -1317,6 +1404,7 @@ async fn send_overtake_to_api(
     legality_config: &LegalityAnalysisConfig,
     config: &types::Config,
     api_client: &mut ApiClient,
+    critical_frame_index: Option<usize>, // 🆕 Added parameter
 ) -> Result<()> {
     if captured_frames.is_empty() {
         return Ok(());
@@ -1327,6 +1415,7 @@ async fn send_overtake_to_api(
         captured_frames,
         legality_config.num_frames_to_analyze,
         curve_info,
+        critical_frame_index, // 🆕 Pass the index
     )
     .context("Failed to build legality request")?;
 

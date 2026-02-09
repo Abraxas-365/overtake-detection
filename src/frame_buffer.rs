@@ -67,37 +67,31 @@ impl LaneChangeFrameBuffer {
         }
     }
 
-    pub fn stop_capture(&mut self) -> Vec<Frame> {
+    pub fn stop_capture(&mut self) -> (Vec<Frame>, u64) {
+        let start_id = self.capture_start_frame_id.unwrap_or(0);
+        // Estimate start ID of pre-buffered frames
+        let effective_start = start_id.saturating_sub(self.pre_buffer_size as u64);
+
         self.is_capturing = false;
         self.capture_start_frame_id = None;
         let frames = std::mem::take(&mut self.frames);
-        info!("📹 Stopped capturing. Total frames: {}", frames.len());
-        frames
+        (frames, effective_start)
     }
 
-    /// 🆕 NEW: Force return frames, including pre-buffer if main buffer is empty.
-    /// Use this for timeouts/incomplete events where we might not be actively 'crossing'
-    /// but still want to see what happened recently.
-    pub fn force_flush(&mut self) -> Vec<Frame> {
+    pub fn force_flush(&mut self) -> (Vec<Frame>, u64) {
+        let start_id = self.capture_start_frame_id.unwrap_or(0);
+        let effective_start = start_id.saturating_sub(self.pre_buffer_size as u64);
+
         self.is_capturing = false;
         self.capture_start_frame_id = None;
 
         let mut result = std::mem::take(&mut self.frames);
-
-        // If we captured nothing (e.g. was CENTERED), allow using the pre-buffer
         if result.is_empty() && !self.pre_buffer.is_empty() {
-            info!(
-                "📹 Active buffer empty, using {} pre-buffered frames for evidence",
-                self.pre_buffer.len()
-            );
             for f in &self.pre_buffer {
                 result.push(f.clone());
             }
-        } else {
-            info!("📹 Flushed capture. Total frames: {}", result.len());
         }
-
-        result
+        (result, effective_start)
     }
 
     pub fn is_capturing(&self) -> bool {
