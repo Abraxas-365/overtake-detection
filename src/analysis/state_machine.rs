@@ -661,6 +661,7 @@ enum DetectionPath {
     VelocitySpike,
     PostOcclusion,
     BlackoutRecovery,
+    StaticHighDeviation,
 }
 
 // ============================================================================
@@ -685,9 +686,9 @@ impl ConfidenceCalculator {
             Some(DetectionPath::HighVelocity) => 0.03,
             Some(DetectionPath::PostOcclusion) => 0.02,
             Some(DetectionPath::BlackoutRecovery) => 0.00,
+            Some(DetectionPath::StaticHighDeviation) => 0.01,
             _ => 0.0,
         };
-
         let base_confidence = offset_confidence * 0.45
             + duration_confidence * 0.25
             + trajectory_confidence * 0.20
@@ -1443,6 +1444,7 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Centered;
                 }
 
+                // PATH 0: POST-OCCLUSION FAST DETECTION
                 if self.adaptive_baseline.frames_without_lanes_recent() > 0
                     && lateral_velocity.abs() > vel_medium
                     && deviation >= drift_threshold * 0.8
@@ -1456,6 +1458,7 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Drifting;
                 }
 
+                // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
                     if self.is_deviation_sustained(drift_threshold * 0.9) {
                         self.change_detection_path = Some(DetectionPath::BoundaryCrossing);
@@ -1467,6 +1470,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // PATH 2: HIGH VELOCITY + DEVIATION
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
                     if self.is_velocity_sustained(vel_medium) {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
@@ -1479,6 +1483,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // PATH 3: VELOCITY SPIKE
                 if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD && deviation >= drift_threshold
                 {
                     if self.is_velocity_sustained(vel_fast) {
@@ -1495,6 +1500,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // PATH 4: MEDIUM SPEED + HIGH DEVIATION
                 if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
@@ -1507,6 +1513,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // PATH 5: GRADUAL CHANGE
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
                     if self.is_deviation_sustained_long(DEVIATION_DRIFT_START) {
                         self.change_detection_path = Some(DetectionPath::GradualChange);
@@ -1519,12 +1526,31 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // PATH 6: LARGE DEVIATION
                 if deviation >= DEVIATION_LANE_CENTER {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::LargeDeviation);
                         info!("🚨 [LARGE] dev={:.1}%", deviation * 100.0);
                         return LaneChangeState::Drifting;
                     }
+                }
+
+                // PATH 7: STATIC HIGH DEVIATION (missed lane change during blackout)
+                // Vehicle is far from baseline but NOT moving — the return already
+                // happened during a detection gap. Only fires when seed_lock is
+                // active (i.e., we're actively watching for a return after a
+                // confirmed lane change).
+                if self.adaptive_baseline.seed_lock_frames > 0
+                    && deviation >= MEDIUM_OFFSET_THRESHOLD
+                    && self.is_deviation_sustained_long(DEVIATION_DRIFT_START)
+                {
+                    self.change_detection_path = Some(DetectionPath::StaticHighDeviation);
+                    info!(
+                        "🚨 [STATIC-HIGH-DEV] dev={:.1}%, vel={:.1}px/s — missed return detected",
+                        deviation * 100.0,
+                        lateral_velocity
+                    );
+                    return LaneChangeState::Drifting;
                 }
 
                 LaneChangeState::Centered
