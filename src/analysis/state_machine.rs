@@ -1,6 +1,6 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v3.5 - POST-OCCLUSION RECOVERY
+// LANE CHANGE DETECTION v3.6 - SPARSE DETECTION TOLERANCE
 //
 
 use super::boundary_detector::CrossingType;
@@ -28,7 +28,7 @@ const TRAJECTORY_WINDOW_SIZE: usize = 90;
 // DEVIATION THRESHOLDS
 // ============================================================================
 const DEVIATION_DRIFT_START: f32 = 0.22;
-const DEVIATION_CROSSING: f32 = 0.30;
+const DEVIATION_CROSSING: f32 = 0.25; // 🔧 Lowered from 0.30 — catch 28% drifts on sparse detection
 const DEVIATION_LANE_CENTER: f32 = 0.55;
 const DEVIATION_SIGNIFICANT: f32 = 0.45;
 
@@ -51,16 +51,16 @@ const KALMAN_MEASUREMENT_NOISE: f32 = 0.01;
 // ============================================================================
 const EWMA_ALPHA_STABLE: f32 = 0.003;
 const EWMA_ALPHA_ADAPTING: f32 = 0.015;
-const EWMA_ALPHA_FAST_RECOVER: f32 = 0.030; // 🆕 Extra fast after occlusion
-const EWMA_MIN_SAMPLES: u32 = 20; // 🔧 Reduced from 30 (FIX 5)
+const EWMA_ALPHA_FAST_RECOVER: f32 = 0.030;
+const EWMA_MIN_SAMPLES: u32 = 20;
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 const BASELINE_MAX_DRIFT: f32 = 0.25;
 const BASELINE_SANITY_CHECK: f32 = 0.35;
 
-// 🆕 Occlusion recovery thresholds (FIX 1)
-const OCCLUSION_SHORT_THRESHOLD: u32 = 30; // 1 second at 30fps
-const OCCLUSION_LONG_THRESHOLD: u32 = 60; // 2 seconds - invalidate baseline
+// Occlusion recovery thresholds
+const OCCLUSION_SHORT_THRESHOLD: u32 = 30;
+const OCCLUSION_LONG_THRESHOLD: u32 = 60;
 
 // ============================================================================
 // CURVE DETECTION
@@ -69,7 +69,7 @@ const CURVE_COMPENSATION_FACTOR: f32 = 1.0;
 const CURVE_CURVATURE_THRESHOLD: f32 = 0.015;
 
 // ============================================================================
-// VALIDATION THRESHOLDS - BALANCED
+// VALIDATION THRESHOLDS - TUNED FOR SPARSE DETECTION
 // ============================================================================
 const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55;
 const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
@@ -138,7 +138,7 @@ impl SimpleKalmanFilter {
 }
 
 // ============================================================================
-// ADAPTIVE BASELINE WITH OCCLUSION RECOVERY (FIX 1)
+// ADAPTIVE BASELINE WITH OCCLUSION RECOVERY
 // ============================================================================
 
 #[derive(Clone)]
@@ -155,7 +155,6 @@ struct AdaptiveBaseline {
     frozen_value: f32,
     has_initial: bool,
 
-    // 🆕 Occlusion tracking (FIX 1)
     frames_without_lanes: u32,
     just_recovered_from_occlusion: bool,
     fast_recovery_frames: u32,
@@ -208,11 +207,9 @@ impl AdaptiveBaseline {
         self.value.abs() < BASELINE_SANITY_CHECK
     }
 
-    // 🆕 Mark frame with no valid lanes (FIX 1)
     fn mark_no_lanes(&mut self) {
         self.frames_without_lanes += 1;
 
-        // After extended occlusion, invalidate baseline — it's stale
         if self.frames_without_lanes > OCCLUSION_LONG_THRESHOLD {
             if self.is_valid {
                 warn!(
@@ -225,10 +222,9 @@ impl AdaptiveBaseline {
         }
     }
 
-    // 🆕 Get frames since last occlusion (FIX 2)
     fn frames_without_lanes_recent(&self) -> u32 {
         if self.just_recovered_from_occlusion {
-            1 // Signal that we just recovered
+            1
         } else {
             0
         }
@@ -237,7 +233,6 @@ impl AdaptiveBaseline {
     fn update(&mut self, measurement: f32) -> f32 {
         self.sample_count += 1;
 
-        // 🆕 If we just recovered from occlusion, fast-adapt (FIX 1)
         if self.frames_without_lanes > OCCLUSION_SHORT_THRESHOLD {
             info!(
                 "🚨 Fast recovery mode after {}s occlusion",
@@ -246,10 +241,9 @@ impl AdaptiveBaseline {
             self.is_adapting = true;
             self.stable_frames = 0;
             self.just_recovered_from_occlusion = true;
-            self.fast_recovery_frames = 30; // Fast mode for 1 second
+            self.fast_recovery_frames = 30;
         }
 
-        // Reset occlusion counter - we have valid lanes now
         self.frames_without_lanes = 0;
 
         self.recent_samples.push_back(measurement);
@@ -282,14 +276,13 @@ impl AdaptiveBaseline {
             }
         }
 
-        // 🆕 Choose learning rate based on recovery state (FIX 1)
         let alpha = if self.fast_recovery_frames > 0 {
             self.fast_recovery_frames -= 1;
             if self.fast_recovery_frames == 0 {
                 self.just_recovered_from_occlusion = false;
                 info!("✅ Fast recovery complete");
             }
-            EWMA_ALPHA_FAST_RECOVER // Extra fast
+            EWMA_ALPHA_FAST_RECOVER
         } else if self.is_adapting || !self.is_valid {
             EWMA_ALPHA_ADAPTING
         } else {
@@ -565,7 +558,7 @@ enum DetectionPath {
     GradualChange,
     LargeDeviation,
     VelocitySpike,
-    PostOcclusion, // 🆕 (FIX 2)
+    PostOcclusion,
 }
 
 // ============================================================================
@@ -588,7 +581,7 @@ impl ConfidenceCalculator {
         let path_bonus = match detection_path {
             Some(DetectionPath::BoundaryCrossing) => 0.05,
             Some(DetectionPath::HighVelocity) => 0.03,
-            Some(DetectionPath::PostOcclusion) => 0.02, // 🆕
+            Some(DetectionPath::PostOcclusion) => 0.02,
             _ => 0.0,
         };
 
@@ -759,7 +752,7 @@ impl LaneChangeStateMachine {
             return Some(event);
         }
 
-        // 🆕 Mark occlusion before early return (FIX 1)
+        // Mark occlusion before early return
         if !vehicle_state.is_valid() {
             self.adaptive_baseline.mark_no_lanes();
             return None;
@@ -853,7 +846,8 @@ impl LaneChangeStateMachine {
                 let elapsed = timestamp_ms - start_time;
 
                 if elapsed > MAX_DRIFTING_MS {
-                    if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+                    // 🔧 Use LOW_OFFSET_THRESHOLD instead of MEDIUM — prevent dead-zone timeouts
+                    if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
                         info!(
                             "⏰ Long DRIFTING ({:.0}ms) with offset ({:.1}%) - auto-completing",
                             elapsed,
@@ -870,7 +864,8 @@ impl LaneChangeStateMachine {
                 }
 
                 if elapsed > self.config.max_duration_ms {
-                    if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
+                    // 🔧 Use LOW_OFFSET_THRESHOLD instead of MEDIUM
+                    if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
                         return self.force_complete(frame_id, timestamp_ms);
                     }
                     warn!(
@@ -1063,6 +1058,7 @@ impl LaneChangeStateMachine {
             return false;
         }
 
+        // VERY HIGH offset — always accept
         if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
             info!(
                 "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
@@ -1072,6 +1068,7 @@ impl LaneChangeStateMachine {
             return true;
         }
 
+        // HIGH offset — duration OR strong trajectory
         if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
             if duration >= MIN_DURATION_HIGH {
                 info!(
@@ -1083,10 +1080,10 @@ impl LaneChangeStateMachine {
             }
             if trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.6 {
                 info!(
-                "✅ Valid: high offset {:.1}%, short dur but excellent trajectory (score={:.2})",
-                self.max_offset_in_change * 100.0,
-                trajectory_analysis.shape_score
-            );
+                    "✅ Valid: high offset {:.1}%, short dur but excellent trajectory (score={:.2})",
+                    self.max_offset_in_change * 100.0,
+                    trajectory_analysis.shape_score
+                );
                 return true;
             }
             warn!(
@@ -1099,6 +1096,7 @@ impl LaneChangeStateMachine {
             return false;
         }
 
+        // MEDIUM offset — duration + (trajectory OR displacement)
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
             let has_duration = duration >= MIN_DURATION_MEDIUM;
             let has_trajectory =
@@ -1115,8 +1113,26 @@ impl LaneChangeStateMachine {
                 return true;
             }
 
+            // 🔧 Fallback: accept 2-of-3 for medium offset (sparse detection tolerance)
+            let conditions_met = [has_duration, has_trajectory, has_displacement]
+                .iter()
+                .filter(|&&x| x)
+                .count();
+
+            if conditions_met >= 2 {
+                info!(
+                    "✅ Valid: medium offset {:.1}%, {}/3 conditions met (dur={} traj={} disp={})",
+                    self.max_offset_in_change * 100.0,
+                    conditions_met,
+                    if has_duration { "✓" } else { "✗" },
+                    if has_trajectory { "✓" } else { "✗" },
+                    if has_displacement { "✓" } else { "✗" }
+                );
+                return true;
+            }
+
             warn!(
-                "❌ Rejected: medium offset {:.1}%, dur={} (need ✓) + traj={} disp={}",
+                "❌ Rejected: medium offset {:.1}%, dur={} traj={} disp={} (need dur+1 or 2of3)",
                 self.max_offset_in_change * 100.0,
                 if has_duration { "✓" } else { "✗" },
                 if has_trajectory { "✓" } else { "✗" },
@@ -1125,20 +1141,30 @@ impl LaneChangeStateMachine {
             return false;
         }
 
+        // LOW offset — 🔧 accept 2-of-3 instead of requiring ALL
         let has_duration = duration >= MIN_DURATION_LOW;
         let has_trajectory = trajectory_analysis.is_valid_overtake;
         let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-        if has_duration && has_trajectory && has_displacement {
+        let conditions_met = [has_duration, has_trajectory, has_displacement]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+
+        if conditions_met >= 2 {
             info!(
-                "✅ Valid: lower offset {:.1}%, all conditions met",
-                self.max_offset_in_change * 100.0
+                "✅ Valid: lower offset {:.1}%, {}/3 conditions met (dur={} traj={} disp={})",
+                self.max_offset_in_change * 100.0,
+                conditions_met,
+                if has_duration { "✓" } else { "✗" },
+                if has_trajectory { "✓" } else { "✗" },
+                if has_displacement { "✓" } else { "✗" }
             );
             return true;
         }
 
         warn!(
-            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need ALL)",
+            "❌ Rejected: offset {:.1}%, dur={} traj={} disp={} (need 2 of 3)",
             self.max_offset_in_change * 100.0,
             if has_duration { "✓" } else { "✗" },
             if has_trajectory { "✓" } else { "✗" },
@@ -1216,7 +1242,6 @@ impl LaneChangeStateMachine {
         metrics
     }
 
-    // 🆕 Post-occlusion fast detection (FIX 2)
     fn determine_target_state(
         &mut self,
         deviation: f32,
@@ -1237,13 +1262,10 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Centered;
                 }
 
-                // 🆕 PATH 0: POST-OCCLUSION FAST DETECTION (FIX 2)
-                // When we just regained lane visibility and see high velocity,
-                // assume a maneuver is already in progress
+                // PATH 0: POST-OCCLUSION FAST DETECTION
                 if self.adaptive_baseline.frames_without_lanes_recent() > 0
                     && lateral_velocity.abs() > vel_medium
                     && deviation >= drift_threshold * 0.8
-                // Lower threshold post-occlusion
                 {
                     self.change_detection_path = Some(DetectionPath::PostOcclusion);
                     info!(
