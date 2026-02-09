@@ -67,6 +67,8 @@ impl LaneChangeFrameBuffer {
         }
     }
 
+    /// Stop capturing and return frames + the start_frame_id of the buffer
+    /// Returns: (captured_frames, buffer_start_frame_id)
     pub fn stop_capture(&mut self) -> (Vec<Frame>, u64) {
         let start_id = self.capture_start_frame_id.unwrap_or(0);
         // Estimate start ID of pre-buffered frames
@@ -75,9 +77,13 @@ impl LaneChangeFrameBuffer {
         self.is_capturing = false;
         self.capture_start_frame_id = None;
         let frames = std::mem::take(&mut self.frames);
+
+        info!("📹 Stopped capturing. Total frames: {}", frames.len());
         (frames, effective_start)
     }
 
+    /// Force return frames, including pre-buffer if main buffer is empty.
+    /// Returns: (captured_frames, buffer_start_frame_id)
     pub fn force_flush(&mut self) -> (Vec<Frame>, u64) {
         let start_id = self.capture_start_frame_id.unwrap_or(0);
         let effective_start = start_id.saturating_sub(self.pre_buffer_size as u64);
@@ -86,11 +92,20 @@ impl LaneChangeFrameBuffer {
         self.capture_start_frame_id = None;
 
         let mut result = std::mem::take(&mut self.frames);
+
+        // If we captured nothing (e.g. was CENTERED), allow using the pre-buffer
         if result.is_empty() && !self.pre_buffer.is_empty() {
+            info!(
+                "📹 Active buffer empty, using {} pre-buffered frames for evidence",
+                self.pre_buffer.len()
+            );
             for f in &self.pre_buffer {
                 result.push(f.clone());
             }
+        } else {
+            info!("📹 Flushed capture. Total frames: {}", result.len());
         }
+
         (result, effective_start)
     }
 
@@ -297,6 +312,67 @@ pub fn frame_to_base64(frame: &Frame) -> Result<String, anyhow::Error> {
     Ok(STANDARD.encode(buffer.into_inner()))
 }
 
+pub fn extract_smart_frames(
+    frames: &[Frame],
+    count: usize,
+    critical_index: Option<usize>,
+) -> Vec<&Frame> {
+    if frames.is_empty() || count == 0 {
+        return vec![];
+    }
+    if frames.len() <= count {
+        return frames.iter().collect();
+    }
+
+    let last_idx = frames.len() - 1;
+    let mut indices = BTreeSet::new();
+
+    // 1. Always include Start and End (Context)
+    indices.insert(0);
+    indices.insert(last_idx);
+
+    // 2. Determine the Focal Point
+    // If we have a critical index (violation frame), use it. Otherwise use 50% (middle).
+    let focus = critical_index
+        .unwrap_or(frames.len() / 2)
+        .clamp(0, last_idx);
+    indices.insert(focus);
+
+    // 3. Fill remaining slots focusing around the Critical Frame
+    while indices.len() < count {
+        let mut best_candidate = 0;
+        let mut max_dist = 0;
+
+        // Find the largest gap between selected frames
+        let sorted_indices: Vec<usize> = indices.iter().cloned().collect();
+        for window in sorted_indices.windows(2) {
+            let start = window[0];
+            let end = window[1];
+            let gap = end - start;
+
+            if gap > 1 {
+                // Heuristic: Prefer gaps closer to the 'focus' point
+                let mid = start + gap / 2;
+                let dist_to_focus = (mid as isize - focus as isize).abs();
+                // Weight the gap size by proximity to focus (higher weight = better candidate)
+                let score = gap as isize * 100 - dist_to_focus;
+
+                if score > max_dist {
+                    max_dist = score;
+                    best_candidate = mid;
+                }
+            }
+        }
+
+        if max_dist == 0 {
+            break;
+        } // No more gaps to fill
+        indices.insert(best_candidate);
+    }
+
+    indices.into_iter().map(|i| &frames[i]).collect()
+}
+
 /// Build the API request payload with enhanced metadata
 /// Includes curve_info and shadow overtake info (extracted from event metadata)
 pub fn build_legality_request(
@@ -304,8 +380,11 @@ pub fn build_legality_request(
     captured_frames: &[Frame],
     num_frames_to_send: usize,
     curve_info: CurveInfo,
+    critical_frame_index: Option<usize>, // 🆕 ADDED THIS PARAMETER
 ) -> Result<LaneChangeLegalityRequest, anyhow::Error> {
-    let key_frames = extract_key_frames_for_lane_change(captured_frames, num_frames_to_send);
+    // 🆕 Use smart extractor
+    let key_frames =
+        extract_smart_frames(captured_frames, num_frames_to_send, critical_frame_index);
 
     if key_frames.is_empty() {
         anyhow::bail!("No frames to send");
@@ -320,9 +399,9 @@ pub fn build_legality_request(
         .collect();
 
     info!(
-        "📸 Selected {} frames from {} total: indices {:?}",
+        "📸 Smart Select: {} frames (Target: {:?}) -> indices {:?}",
         key_frames.len(),
-        captured_frames.len(),
+        critical_frame_index,
         selected_indices
     );
 
@@ -343,7 +422,6 @@ pub fn build_legality_request(
             offset_percentage,
         });
     }
-
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // CALCULATE VIDEO METADATA
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -730,72 +808,6 @@ pub fn build_legality_request(
         detection_path,
         temporal_info,
     };
-
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // LOGGING
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    info!(
-        "📊 Detection quality: conf={:.1}%, max_offset={:.1}%, lanes={:.0}%",
-        metadata.detection_confidence * 100.0,
-        metadata.max_offset_normalized * 100.0,
-        metadata.both_lanes_ratio * 100.0
-    );
-
-    if curve_info.is_curve {
-        info!(
-            "🌀 Curve detected: type={}, angle={:.1}°, confidence={:.0}%",
-            curve_type_str,
-            curve_info.angle_degrees,
-            curve_info.confidence * 100.0
-        );
-    }
-
-    if shadow_detected {
-        warn!(
-            "⚫ Shadow overtake: count={}, severity={}, vehicles={:?}",
-            metadata.shadow_overtake_count,
-            metadata.shadow_worst_severity,
-            metadata.shadow_blocking_vehicles
-        );
-    }
-
-    if vehicles_overtaken_count > 0 {
-        info!(
-            "🎯 Vehicles overtaken: {} ({:?})",
-            vehicles_overtaken_count, metadata.overtaken_vehicle_types
-        );
-    }
-
-    if let Some(ref line_info) = metadata.line_crossing_info {
-        let legality_emoji = if line_info.is_legal { "✅" } else { "⚠️" };
-        info!(
-            "{} Line crossing: {} [{}] (conf: {:.0}%)",
-            legality_emoji,
-            line_info.line_type,
-            line_info.severity,
-            line_info.line_detection_confidence * 100.0
-        );
-    }
-
-    info!(
-        "🏃 Velocity: peak={:.0}px/s, avg={:.0}px/s, pattern={}",
-        peak_lateral_velocity, avg_lateral_velocity, metadata.velocity_info.velocity_pattern
-    );
-
-    info!(
-        "📐 Trajectory: shape={:.2}, smooth={:.2}, reversal={}",
-        metadata.trajectory_info.shape_score,
-        metadata.trajectory_info.smoothness,
-        metadata.trajectory_info.has_direction_reversal
-    );
-
-    if let Some(ref path) = metadata.detection_path {
-        info!("🔍 Detected via: {}", path);
-    }
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // BUILD AND RETURN REQUEST
-    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     Ok(LaneChangeLegalityRequest {
         event_id: event.event_id.clone(),
@@ -1250,4 +1262,21 @@ pub struct StateTransition {
     pub to_state: String,
     pub frame_id: u64,
     pub timestamp_ms: f64,
+}
+
+pub fn save_legality_request_to_file(
+    request: &LaneChangeLegalityRequest,
+    output_dir: &str,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let dir = Path::new(output_dir).join("legality_requests");
+    std::fs::create_dir_all(&dir)?;
+
+    let filename = format!("{}_legality_request.json", request.event_id);
+    let filepath = dir.join(&filename);
+
+    let json = serde_json::to_string_pretty(request)?;
+    std::fs::write(&filepath, json)?;
+
+    info!("💾 Saved legality request to: {}", filepath.display());
+    Ok(filepath)
 }

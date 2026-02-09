@@ -6,6 +6,7 @@
 //   ✅ Dynamic Model Mixing (Smart Scheduling)
 //   ✅ Smart Frame Selection Integration (Critical Frame Targeting)
 //   ✅ Optimized Logic for "Incomplete" and "End-of-Video" events
+//   ✅ Cleaned unused imports and variables
 //
 
 mod analysis;
@@ -36,7 +37,7 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
-use types::{CurveInfo, DetectedLane, Direction, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
+use types::{CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent};
 use vehicle_detection::YoloDetector;
 
 // ============================================================================
@@ -222,30 +223,6 @@ impl ApiClient {
             .json::<frame_buffer::LaneChangeLegalityResponse>()
             .await
             .context("Failed to parse API response")
-    }
-}
-
-// ============================================================================
-// SUBSYSTEM TIMING
-// ============================================================================
-
-struct SubsystemTimings {
-    lane_inference_us: u64,
-    yolo_us: u64,
-    legality_us: u64,
-    analysis_us: u64,
-    annotation_us: u64,
-}
-
-impl SubsystemTimings {
-    fn new() -> Self {
-        Self {
-            lane_inference_us: 0,
-            yolo_us: 0,
-            legality_us: 0,
-            analysis_us: 0,
-            annotation_us: 0,
-        }
     }
 }
 
@@ -459,8 +436,6 @@ async fn process_video(
     api_client: &mut ApiClient,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ProcessingStats> {
-    use std::io::Write;
-
     let start_time = Instant::now();
 
     let mut reader = video_processor
@@ -548,7 +523,7 @@ async fn process_video(
     let mut shadow_overtakes_detected: usize = 0;
     let mut illegal_crossings: usize = 0;
     let mut critical_violations: usize = 0;
-    let mut timings = SubsystemTimings::new();
+    // Removed unused timings variable
 
     let mut previous_state = "CENTERED".to_string();
     let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
@@ -578,12 +553,12 @@ async fn process_video(
         // ═════════════════════════════════════════════════════════════════════
 
         // 1. Determine if we are in a critical maneuver (Drifting or Crossing)
-        let is_maneuver_active = analyzer.current_state() == "DRIFTING" 
-                              || analyzer.current_state() == "CROSSING";
+        let is_maneuver_active =
+            analyzer.current_state() == "DRIFTING" || analyzer.current_state() == "CROSSING";
 
         // 2. Schedule Vehicle Detection (YOLOv8n) - Keep at intervals
         //    Vehicle detection is heavy, so we keep it periodic (every 3 frames)
-        let vehicle_inference_interval = 3; 
+        let vehicle_inference_interval = 3;
         let should_run_vehicles = frame_count % vehicle_inference_interval == 0;
 
         // 3. Schedule Legality (YOLO-seg) - HIGH FREQUENCY during maneuvers
@@ -597,7 +572,6 @@ async fn process_video(
 
         // ─── VEHICLE DETECTION ───────────────────────────────────────────────
         if should_run_vehicles {
-            let yolo_start = Instant::now();
             match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
                 Ok(detections) => {
                     total_vehicles_detected += detections.len();
@@ -622,13 +596,11 @@ async fn process_video(
                 }
                 Err(e) => debug!("YOLO detection failed on frame {}: {}", frame_count, e),
             }
-            timings.yolo_us = yolo_start.elapsed().as_micros() as u64;
         }
 
         // ─── LEGALITY DETECTION (FUSED) ──────────────────────────────────────
         if should_run_legality {
             if let Some(ref mut detector) = legality_detector {
-                let leg_start = Instant::now();
                 // Get previous state for geometric guidance
                 let vehicle_offset = analyzer
                     .last_vehicle_state()
@@ -675,7 +647,6 @@ async fn process_video(
                     }
                     Err(e) => debug!("Fused legality failed on frame {}: {}", frame_count, e),
                 }
-                timings.legality_us = leg_start.elapsed().as_micros() as u64;
             }
         }
 
@@ -719,14 +690,12 @@ async fn process_video(
                         // 2. STOP CAPTURE AND SEND TO API
                         // 🆕 SMART FRAME SELECTION: Calculate Critical Index
                         let (captured_frames, buffer_start_id) = frame_buffer.stop_capture();
-                        
+
                         if !captured_frames.is_empty() {
                             // Find the worst frame (violation)
-                            let critical_entry = legality_buffer.worst_in_range(
-                                start_event.start_frame_id, 
-                                frame_count
-                            );
-                            
+                            let critical_entry = legality_buffer
+                                .worst_in_range(start_event.start_frame_id, frame_count);
+
                             // Calculate index in buffer
                             let critical_index = critical_entry.map(|entry| {
                                 (entry.frame_id.saturating_sub(buffer_start_id)) as usize
@@ -771,7 +740,6 @@ async fn process_video(
             );
         }
 
-        let inf_start = Instant::now();
         match process_frame(
             &frame,
             inference_engine,
@@ -781,7 +749,6 @@ async fn process_video(
         .await
         {
             Ok(detected_lanes) => {
-                timings.lane_inference_us = inf_start.elapsed().as_micros() as u64;
                 let analysis_start = Instant::now();
 
                 let analysis_lanes: Vec<Lane> = detected_lanes
@@ -874,14 +841,14 @@ async fn process_video(
 
                             // 🆕 SMART FRAME SELECTION: Calculate Critical Index
                             let (captured_frames, buffer_start_id) = frame_buffer.stop_capture();
-                            
+
                             if !captured_frames.is_empty() {
                                 // Find the worst frame (violation)
                                 let critical_entry = legality_buffer.worst_in_range(
-                                    start_event.start_frame_id, 
-                                    end_event.end_frame_id
+                                    start_event.start_frame_id,
+                                    end_event.end_frame_id,
                                 );
-                                
+
                                 // Calculate index in buffer
                                 let critical_index = critical_entry.map(|entry| {
                                     (entry.frame_id.saturating_sub(buffer_start_id)) as usize
@@ -946,10 +913,8 @@ async fn process_video(
                             let (captured_frames, buffer_start_id) = frame_buffer.force_flush();
 
                             if !captured_frames.is_empty() {
-                                let critical_entry = legality_buffer.worst_in_range(
-                                    start_event.start_frame_id, 
-                                    frame_count
-                                );
+                                let critical_entry = legality_buffer
+                                    .worst_in_range(start_event.start_frame_id, frame_count);
                                 let critical_index = critical_entry.map(|entry| {
                                     (entry.frame_id.saturating_sub(buffer_start_id)) as usize
                                 });
@@ -1006,7 +971,7 @@ async fn process_video(
                 }
                 previous_state = current_state;
 
-                timings.analysis_us = analysis_start.elapsed().as_micros() as u64;
+                // analysis_us assignment removed since timings struct is unused
 
                 if analyzer
                     .last_vehicle_state()
@@ -1052,7 +1017,7 @@ async fn process_video(
                         use opencv::videoio::VideoWriterTrait;
                         w.write(&annotated)?;
                     }
-                    timings.annotation_us = ann_start.elapsed().as_micros() as u64;
+                    // annotation_us assignment removed since timings struct is unused
                 }
             }
             Err(e) => {
@@ -1109,13 +1074,10 @@ async fn process_video(
                 let (captured_frames, buffer_start_id) = frame_buffer.force_flush();
 
                 if !captured_frames.is_empty() {
-                    let critical_entry = legality_buffer.worst_in_range(
-                        start_event.start_frame_id, 
-                        frame_count
-                    );
-                    let critical_index = critical_entry.map(|entry| {
-                        (entry.frame_id.saturating_sub(buffer_start_id)) as usize
-                    });
+                    let critical_entry =
+                        legality_buffer.worst_in_range(start_event.start_frame_id, frame_count);
+                    let critical_index = critical_entry
+                        .map(|entry| (entry.frame_id.saturating_sub(buffer_start_id)) as usize);
 
                     let curve_info = analyzer.get_curve_info();
                     if let Err(e) = send_overtake_to_api(
@@ -1187,6 +1149,12 @@ async fn process_video(
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+// ... (Rest of helper functions remain unchanged) ...
+// Ensure attach_legality_to_event, extract_lane_boundaries, attach_shadow_metadata,
+// create_combined_event, save_complete_overtake, save_incomplete_overtake, save_shadow_event,
+// send_overtake_to_api, process_frame, print_final_stats are included as per previous version.
+// I'll provide them below for completeness.
 
 fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResult) {
     if !legality.ego_intersects_marking {
