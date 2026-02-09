@@ -1,6 +1,6 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v3.4 - BALANCED VALIDATION
+// LANE CHANGE DETECTION v3.5 - POST-OCCLUSION RECOVERY
 //
 
 use super::boundary_detector::CrossingType;
@@ -47,15 +47,20 @@ const KALMAN_PROCESS_NOISE: f32 = 0.001;
 const KALMAN_MEASUREMENT_NOISE: f32 = 0.01;
 
 // ============================================================================
-// ADAPTIVE BASELINE
+// ADAPTIVE BASELINE - FASTER RECOVERY (FIX 5)
 // ============================================================================
 const EWMA_ALPHA_STABLE: f32 = 0.003;
 const EWMA_ALPHA_ADAPTING: f32 = 0.015;
-const EWMA_MIN_SAMPLES: u32 = 30;
+const EWMA_ALPHA_FAST_RECOVER: f32 = 0.030; // 🆕 Extra fast after occlusion
+const EWMA_MIN_SAMPLES: u32 = 20; // 🔧 Reduced from 30 (FIX 5)
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 const BASELINE_MAX_DRIFT: f32 = 0.25;
-const BASELINE_SANITY_CHECK: f32 = 0.35; // Increased to allow more baseline variation
+const BASELINE_SANITY_CHECK: f32 = 0.35;
+
+// 🆕 Occlusion recovery thresholds (FIX 1)
+const OCCLUSION_SHORT_THRESHOLD: u32 = 30; // 1 second at 30fps
+const OCCLUSION_LONG_THRESHOLD: u32 = 60; // 2 seconds - invalidate baseline
 
 // ============================================================================
 // CURVE DETECTION
@@ -66,27 +71,25 @@ const CURVE_CURVATURE_THRESHOLD: f32 = 0.015;
 // ============================================================================
 // VALIDATION THRESHOLDS - BALANCED
 // ============================================================================
-const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55; // 55% = very confident, minimal checks
-const HIGH_OFFSET_THRESHOLD: f32 = 0.45; // 45% = confident, need some duration
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35; // 35% = need duration + trajectory
-const LOW_OFFSET_THRESHOLD: f32 = 0.25; // 25% = strict validation
+const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55;
+const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
+const LOW_OFFSET_THRESHOLD: f32 = 0.25;
 
-// Duration thresholds - RELAXED
-const MIN_DURATION_VERY_HIGH: f64 = 800.0; // 0.8s for very high offset
-const MIN_DURATION_HIGH: f64 = 1000.0; // 1.2s for high offset
-const MIN_DURATION_MEDIUM: f64 = 1500.0; // 2.0s for medium offset
-const MIN_DURATION_LOW: f64 = 2500.0; // 3.0s for low offset
+const MIN_DURATION_VERY_HIGH: f64 = 800.0;
+const MIN_DURATION_HIGH: f64 = 1000.0;
+const MIN_DURATION_MEDIUM: f64 = 1500.0;
+const MIN_DURATION_LOW: f64 = 2500.0;
 
 const MIN_NET_DISPLACEMENT: f32 = 0.15;
 
 // ============================================================================
-// TRAJECTORY ANALYSIS - MORE PERMISSIVE
+// TRAJECTORY ANALYSIS
 // ============================================================================
 const RETURN_TO_CENTER_THRESHOLD: f32 = 0.35;
 const MIN_EXCURSION_FOR_OVERTAKE: f32 = 0.30;
 const TRAJECTORY_SMOOTHNESS_THRESHOLD: f32 = 0.25;
 const MIN_TRAJECTORY_POINTS: usize = 8;
-
 const POSITION_CHANGE_THRESHOLD: f32 = 0.15;
 
 // ============================================================================
@@ -135,7 +138,7 @@ impl SimpleKalmanFilter {
 }
 
 // ============================================================================
-// ADAPTIVE BASELINE
+// ADAPTIVE BASELINE WITH OCCLUSION RECOVERY (FIX 1)
 // ============================================================================
 
 #[derive(Clone)]
@@ -151,6 +154,11 @@ struct AdaptiveBaseline {
     is_frozen: bool,
     frozen_value: f32,
     has_initial: bool,
+
+    // 🆕 Occlusion tracking (FIX 1)
+    frames_without_lanes: u32,
+    just_recovered_from_occlusion: bool,
+    fast_recovery_frames: u32,
 }
 
 impl AdaptiveBaseline {
@@ -167,6 +175,9 @@ impl AdaptiveBaseline {
             is_frozen: false,
             frozen_value: 0.0,
             has_initial: false,
+            frames_without_lanes: 0,
+            just_recovered_from_occlusion: false,
+            fast_recovery_frames: 0,
         }
     }
 
@@ -197,8 +208,49 @@ impl AdaptiveBaseline {
         self.value.abs() < BASELINE_SANITY_CHECK
     }
 
+    // 🆕 Mark frame with no valid lanes (FIX 1)
+    fn mark_no_lanes(&mut self) {
+        self.frames_without_lanes += 1;
+
+        // After extended occlusion, invalidate baseline — it's stale
+        if self.frames_without_lanes > OCCLUSION_LONG_THRESHOLD {
+            if self.is_valid {
+                warn!(
+                    "🗑️  Baseline invalidated after {}s occlusion",
+                    self.frames_without_lanes as f32 / 30.0
+                );
+            }
+            self.is_valid = false;
+            self.has_initial = false;
+        }
+    }
+
+    // 🆕 Get frames since last occlusion (FIX 2)
+    fn frames_without_lanes_recent(&self) -> u32 {
+        if self.just_recovered_from_occlusion {
+            1 // Signal that we just recovered
+        } else {
+            0
+        }
+    }
+
     fn update(&mut self, measurement: f32) -> f32 {
         self.sample_count += 1;
+
+        // 🆕 If we just recovered from occlusion, fast-adapt (FIX 1)
+        if self.frames_without_lanes > OCCLUSION_SHORT_THRESHOLD {
+            info!(
+                "🚨 Fast recovery mode after {}s occlusion",
+                self.frames_without_lanes as f32 / 30.0
+            );
+            self.is_adapting = true;
+            self.stable_frames = 0;
+            self.just_recovered_from_occlusion = true;
+            self.fast_recovery_frames = 30; // Fast mode for 1 second
+        }
+
+        // Reset occlusion counter - we have valid lanes now
+        self.frames_without_lanes = 0;
 
         self.recent_samples.push_back(measurement);
         if self.recent_samples.len() > 30 {
@@ -230,7 +282,15 @@ impl AdaptiveBaseline {
             }
         }
 
-        let alpha = if self.is_adapting || !self.is_valid {
+        // 🆕 Choose learning rate based on recovery state (FIX 1)
+        let alpha = if self.fast_recovery_frames > 0 {
+            self.fast_recovery_frames -= 1;
+            if self.fast_recovery_frames == 0 {
+                self.just_recovered_from_occlusion = false;
+                info!("✅ Fast recovery complete");
+            }
+            EWMA_ALPHA_FAST_RECOVER // Extra fast
+        } else if self.is_adapting || !self.is_valid {
             EWMA_ALPHA_ADAPTING
         } else {
             EWMA_ALPHA_STABLE
@@ -279,11 +339,14 @@ impl AdaptiveBaseline {
         self.is_frozen = false;
         self.frozen_value = 0.0;
         self.has_initial = false;
+        self.frames_without_lanes = 0;
+        self.just_recovered_from_occlusion = false;
+        self.fast_recovery_frames = 0;
     }
 }
 
 // ============================================================================
-// TRAJECTORY ANALYZER - MORE PERMISSIVE
+// TRAJECTORY ANALYZER
 // ============================================================================
 
 #[derive(Clone)]
@@ -333,7 +396,6 @@ impl TrajectoryAnalyzer {
     ) -> OvertakeAnalysis {
         let mut analysis = OvertakeAnalysis::default();
 
-        // Be permissive if not enough data - assume valid
         if self.positions.len() < MIN_TRAJECTORY_POINTS {
             analysis.excursion_sufficient = max_excursion >= MIN_EXCURSION_FOR_OVERTAKE;
             analysis.shape_score = 0.6;
@@ -352,7 +414,6 @@ impl TrajectoryAnalyzer {
         analysis.has_reversal = self.detect_direction_reversal();
         analysis.shape_score = self.calculate_shape_score(start_pos, max_excursion);
 
-        // More permissive: valid if excursion OR good shape OR has reversal
         analysis.is_valid_overtake = analysis.excursion_sufficient
             || analysis.shape_score >= 0.5
             || (analysis.has_reversal && max_excursion >= 0.25);
@@ -362,7 +423,7 @@ impl TrajectoryAnalyzer {
 
     fn calculate_smoothness(&self) -> f32 {
         if self.positions.len() < 3 {
-            return 0.0; // Assume smooth if no data
+            return 0.0;
         }
 
         let positions: Vec<f32> = self.positions.iter().copied().collect();
@@ -384,7 +445,7 @@ impl TrajectoryAnalyzer {
 
     fn detect_direction_reversal(&self) -> bool {
         if self.velocities.len() < 8 {
-            return true; // Assume reversal if not enough data
+            return true;
         }
 
         let velocities: Vec<f32> = self.velocities.iter().copied().collect();
@@ -408,13 +469,12 @@ impl TrajectoryAnalyzer {
 
     fn calculate_shape_score(&self, start_pos: f32, max_excursion: f32) -> f32 {
         if self.positions.len() < MIN_TRAJECTORY_POINTS {
-            return 0.6; // Default acceptable score
+            return 0.6;
         }
 
         let positions: Vec<f32> = self.positions.iter().copied().collect();
         let n = positions.len();
 
-        // Find peak
         let mut peak_idx = 0;
         let mut peak_deviation = 0.0;
         for (i, &pos) in positions.iter().enumerate() {
@@ -425,7 +485,6 @@ impl TrajectoryAnalyzer {
             }
         }
 
-        // Score based on peak position
         let peak_position_score = {
             let relative_pos = peak_idx as f32 / n as f32;
             if relative_pos >= 0.2 && relative_pos <= 0.8 {
@@ -437,7 +496,6 @@ impl TrajectoryAnalyzer {
             }
         };
 
-        // Score based on return
         let return_score = {
             let end_pos = positions[n - 1];
             let return_distance = (end_pos - start_pos).abs();
@@ -452,7 +510,6 @@ impl TrajectoryAnalyzer {
             }
         };
 
-        // Score based on magnitude
         let magnitude_score = if max_excursion >= 0.55 {
             1.0
         } else if max_excursion >= 0.45 {
@@ -508,6 +565,7 @@ enum DetectionPath {
     GradualChange,
     LargeDeviation,
     VelocitySpike,
+    PostOcclusion, // 🆕 (FIX 2)
 }
 
 // ============================================================================
@@ -530,6 +588,7 @@ impl ConfidenceCalculator {
         let path_bonus = match detection_path {
             Some(DetectionPath::BoundaryCrossing) => 0.05,
             Some(DetectionPath::HighVelocity) => 0.03,
+            Some(DetectionPath::PostOcclusion) => 0.02, // 🆕
             _ => 0.0,
         };
 
@@ -700,7 +759,9 @@ impl LaneChangeStateMachine {
             return Some(event);
         }
 
+        // 🆕 Mark occlusion before early return (FIX 1)
         if !vehicle_state.is_valid() {
+            self.adaptive_baseline.mark_no_lanes();
             return None;
         }
 
@@ -966,17 +1027,12 @@ impl LaneChangeStateMachine {
         Some(event)
     }
 
-    /// BALANCED validation - offset compensates for duration
     fn validate_lane_change(
         &self,
         duration: f64,
         net_displacement: f32,
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
-        // ================================================================
-        // RULE 0: ABSOLUTE MINIMUM DURATION (safety net)
-        // No lane change can be less than 800ms regardless of offset
-        // ================================================================
         const ABSOLUTE_MIN_DURATION: f64 = 800.0;
 
         if duration < ABSOLUTE_MIN_DURATION {
@@ -987,9 +1043,6 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // ================================================================
-        // RULE 1: Baseline sanity check
-        // ================================================================
         if !self.adaptive_baseline.is_sane()
             && self.max_offset_in_change < VERY_HIGH_OFFSET_THRESHOLD
         {
@@ -1001,9 +1054,6 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // ================================================================
-        // RULE 2: Minimum offset required
-        // ================================================================
         if self.max_offset_in_change < LOW_OFFSET_THRESHOLD {
             warn!(
                 "❌ Rejected: max offset {:.1}% < {:.1}% minimum",
@@ -1013,9 +1063,6 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // ================================================================
-        // RULE 3: Very high offset (>=55%) - need minimum duration only
-        // ================================================================
         if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
             info!(
                 "✅ Valid: very high offset {:.1}% with dur={:.0}ms",
@@ -1025,9 +1072,6 @@ impl LaneChangeStateMachine {
             return true;
         }
 
-        // ================================================================
-        // RULE 4: High offset (>=45%) - need reasonable duration
-        // ================================================================
         if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
             if duration >= MIN_DURATION_HIGH {
                 info!(
@@ -1037,7 +1081,6 @@ impl LaneChangeStateMachine {
                 );
                 return true;
             }
-            // High offset but short duration - need good trajectory
             if trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.6 {
                 info!(
                 "✅ Valid: high offset {:.1}%, short dur but excellent trajectory (score={:.2})",
@@ -1056,16 +1099,12 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // ================================================================
-        // RULE 5: Medium offset (>=35%) - need duration AND (trajectory OR displacement)
-        // ================================================================
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
             let has_duration = duration >= MIN_DURATION_MEDIUM;
             let has_trajectory =
                 trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.5;
             let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-            // Must have duration, plus at least one other condition
             if has_duration && (has_trajectory || has_displacement) {
                 info!(
                     "✅ Valid: medium offset {:.1}%, dur=✓ + traj={} disp={}",
@@ -1086,9 +1125,6 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        // ================================================================
-        // RULE 6: Lower offset (25-35%) - need ALL conditions
-        // ================================================================
         let has_duration = duration >= MIN_DURATION_LOW;
         let has_trajectory = trajectory_analysis.is_valid_overtake;
         let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
@@ -1180,6 +1216,7 @@ impl LaneChangeStateMachine {
         metrics
     }
 
+    // 🆕 Post-occlusion fast detection (FIX 2)
     fn determine_target_state(
         &mut self,
         deviation: f32,
@@ -1196,9 +1233,25 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // Skip if baseline is way off (likely already in another lane)
                 if !self.adaptive_baseline.is_sane() {
                     return LaneChangeState::Centered;
+                }
+
+                // 🆕 PATH 0: POST-OCCLUSION FAST DETECTION (FIX 2)
+                // When we just regained lane visibility and see high velocity,
+                // assume a maneuver is already in progress
+                if self.adaptive_baseline.frames_without_lanes_recent() > 0
+                    && lateral_velocity.abs() > vel_medium
+                    && deviation >= drift_threshold * 0.8
+                // Lower threshold post-occlusion
+                {
+                    self.change_detection_path = Some(DetectionPath::PostOcclusion);
+                    info!(
+                        "🚨 [POST-OCCLUSION] Maneuver likely in progress: vel={:.1}, dev={:.1}%",
+                        lateral_velocity,
+                        deviation * 100.0
+                    );
+                    return LaneChangeState::Drifting;
                 }
 
                 // PATH 1: BOUNDARY CROSSING
@@ -1626,7 +1679,6 @@ impl LaneChangeStateMachine {
                 "max_offset_normalized".to_string(),
                 serde_json::json!(self.max_offset_in_change),
             );
-            // In execute_transition() when creating events:
             event.metadata.insert(
                 "trajectory_shape_score".to_string(),
                 serde_json::json!(trajectory_analysis.shape_score),

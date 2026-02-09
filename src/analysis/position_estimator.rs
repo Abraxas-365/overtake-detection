@@ -2,7 +2,7 @@
 
 use crate::types::{Lane, VehicleState};
 use std::collections::VecDeque;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct PositionEstimator {
     pub reference_y_ratio: f32,
@@ -13,6 +13,7 @@ pub struct PositionEstimator {
     offset_history: VecDeque<f32>,
     history_size: usize,
     last_valid_width: Option<f32>,
+    frames_without_lanes: u32, // 🆕 Track occlusion duration
 }
 
 impl PositionEstimator {
@@ -26,6 +27,7 @@ impl PositionEstimator {
             offset_history: VecDeque::with_capacity(15),
             history_size: 15,
             last_valid_width: None,
+            frames_without_lanes: 0, // 🆕 Initialize
         }
     }
 
@@ -89,6 +91,9 @@ impl PositionEstimator {
 
         match (left_x, right_x) {
             (Some(lx), Some(rx)) => {
+                // 🆕 Reset occlusion counter when lanes are detected
+                self.frames_without_lanes = 0;
+
                 let measured_width = rx - lx;
                 let stable_width = self.get_stable_lane_width(measured_width);
                 lane_width = Some(stable_width);
@@ -100,6 +105,9 @@ impl PositionEstimator {
                 self.update_offset_history(lateral_offset);
             }
             (Some(lx), None) => {
+                // 🆕 Reset occlusion counter (partial detection is still valid)
+                self.frames_without_lanes = 0;
+
                 let stable_width = self.get_stable_lane_width(self.default_lane_width);
                 let estimated_center = lx + (stable_width / 2.0);
                 raw_offset = vehicle_x - estimated_center;
@@ -108,6 +116,9 @@ impl PositionEstimator {
                 self.update_offset_history(lateral_offset);
             }
             (None, Some(rx)) => {
+                // 🆕 Reset occlusion counter (partial detection is still valid)
+                self.frames_without_lanes = 0;
+
                 let stable_width = self.get_stable_lane_width(self.default_lane_width);
                 let estimated_center = rx - (stable_width / 2.0);
                 raw_offset = vehicle_x - estimated_center;
@@ -116,12 +127,37 @@ impl PositionEstimator {
                 self.update_offset_history(lateral_offset);
             }
             (None, None) => {
-                if let Some(width) = self.last_valid_width {
-                    lane_width = Some(width);
+                // 🆕 CRITICAL FIX: Don't return stale data during occlusion
+                // This prevents poisoning the adaptive baseline with frozen values
+
+                self.frames_without_lanes += 1;
+
+                // Log first few frames of occlusion
+                if self.frames_without_lanes <= 5 {
+                    warn!(
+                        "⚠️  No lanes detected (frame {} without lanes)",
+                        self.frames_without_lanes
+                    );
+                } else if self.frames_without_lanes % 30 == 0 {
+                    // Log every second after initial warnings
+                    warn!(
+                        "⚠️  Extended occlusion: {} frames without lanes",
+                        self.frames_without_lanes
+                    );
                 }
-                if let Some(&last_offset) = self.offset_history.back() {
-                    lateral_offset = last_offset;
-                }
+
+                // 🆕 Return INVALID state instead of stale data
+                // The zero confidence signals to the state machine to ignore this frame
+                return VehicleState {
+                    lateral_offset: 0.0,
+                    lane_width: None, // 🆕 None, not last_valid_width
+                    heading_offset: 0.0,
+                    frame_id: 0,
+                    timestamp_ms: 0.0,
+                    raw_offset: 0.0,
+                    detection_confidence: 0.0, // 🆕 Zero confidence = invalid
+                    both_lanes_detected: false,
+                };
             }
         }
 
@@ -163,10 +199,16 @@ impl PositionEstimator {
         candidates.first().map(|(lane, _)| *lane)
     }
 
+    // 🆕 NEW METHOD: Get occlusion duration for diagnostics
+    pub fn get_frames_without_lanes(&self) -> u32 {
+        self.frames_without_lanes
+    }
+
     pub fn reset(&mut self) {
         self.lane_width_history.clear();
         self.offset_history.clear();
         self.last_valid_width = None;
+        self.frames_without_lanes = 0; // 🆕 Reset occlusion counter
     }
 }
 
@@ -186,6 +228,11 @@ impl PositionSmoother {
     }
 
     pub fn smooth(&mut self, state: VehicleState) -> VehicleState {
+        // 🆕 Don't smooth invalid states - pass them through unchanged
+        if !state.is_valid() {
+            return state;
+        }
+
         let smoothed_offset = match self.smoothed_offset {
             None => {
                 self.smoothed_offset = Some(state.lateral_offset);

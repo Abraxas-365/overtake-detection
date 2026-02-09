@@ -27,6 +27,7 @@ pub struct OvertakeAnalyzer {
     iou_threshold: f32,
     frame_width: f32,
     frame_height: f32,
+    is_overtake_active: bool, // 🆕 Track if overtake is in progress
 }
 
 #[derive(Debug, Clone)]
@@ -44,11 +45,28 @@ impl OvertakeAnalyzer {
             iou_threshold: 0.3,
             frame_width,
             frame_height,
+            is_overtake_active: false, // 🆕 Initialize
         }
     }
 
     pub fn get_tracked_vehicles(&self) -> &HashMap<u32, TrackedVehicle> {
         &self.tracked_vehicles
+    }
+
+    // 🆕 NEW METHOD: Set overtake active state
+    pub fn set_overtake_active(&mut self, active: bool) {
+        if self.is_overtake_active != active {
+            info!(
+                "🔄 Overtake state changed: {} → {}",
+                if self.is_overtake_active {
+                    "ACTIVE"
+                } else {
+                    "INACTIVE"
+                },
+                if active { "ACTIVE" } else { "INACTIVE" }
+            );
+            self.is_overtake_active = active;
+        }
     }
 
     pub fn update(&mut self, detections: Vec<Detection>, frame_id: u64) {
@@ -96,7 +114,7 @@ impl OvertakeAnalyzer {
                 TrackedVehicle {
                     id: self.next_id,
                     bbox: det.bbox,
-                    class_name: det.class_name,
+                    class_name: det.class_name.clone(),
                     first_seen_frame: frame_id,
                     last_seen_frame: frame_id,
                     position_history: vec![VehiclePosition {
@@ -109,31 +127,39 @@ impl OvertakeAnalyzer {
 
             info!(
                 "🆕 New vehicle tracked: ID #{}, type: {}",
-                self.next_id, self.tracked_vehicles[&self.next_id].class_name
+                self.next_id, det.class_name
             );
 
             self.next_id += 1;
         }
 
-        // 🆕 MUCH longer retention: 300 frames = ~10 seconds at 30fps
-        // This allows vehicles to be tracked even after they disappear from view during overtake
-        let removed = self.tracked_vehicles.len();
+        // 🆕 DYNAMIC RETENTION: Keep vehicles longer during active overtake
+        let retention_frames = if self.is_overtake_active {
+            900 // 30 seconds at 30fps — covers full overtake including occlusion
+        } else {
+            300 // 10 seconds default
+        };
+
+        let removed_count = self.tracked_vehicles.len();
         self.tracked_vehicles.retain(|id, track| {
-            let should_keep = frame_id - track.last_seen_frame < 300;
+            let frames_since_seen = frame_id - track.last_seen_frame;
+            let should_keep = frames_since_seen < retention_frames;
+
             if !should_keep {
                 info!(
-                    "🗑️  Removing vehicle ID #{} ({}) - not seen for {} frames",
-                    id,
-                    track.class_name,
-                    frame_id - track.last_seen_frame
+                    "🗑️  Removing vehicle ID #{} ({}) - not seen for {} frames (limit: {})",
+                    id, track.class_name, frames_since_seen, retention_frames
                 );
             }
             should_keep
         });
 
-        let removed = removed - self.tracked_vehicles.len();
-        if removed > 0 {
-            info!("🗑️  Removed {} stale vehicle(s)", removed);
+        let removed_count = removed_count - self.tracked_vehicles.len();
+        if removed_count > 0 {
+            info!(
+                "🗑️  Removed {} stale vehicle(s) (retention: {} frames, overtake_active: {})",
+                removed_count, retention_frames, self.is_overtake_active
+            );
         }
     }
 
@@ -146,7 +172,7 @@ impl OvertakeAnalyzer {
         let mut overtaken = Vec::new();
 
         // Ego vehicle is at bottom of frame
-        let ego_y = self.frame_height * 0.70; // 🆕 Changed from 0.75 to 0.70
+        let ego_y = self.frame_height * 0.70;
 
         info!(
             "🔍 Analyzing overtake: frames {}-{}, direction: {}, active vehicles: {}",
@@ -165,6 +191,7 @@ impl OvertakeAnalyzer {
                 track.last_seen_frame,
                 track.position_history.len()
             );
+
             // Only consider vehicles visible during the maneuver
             if track.last_seen_frame < start_frame || track.first_seen_frame > end_frame {
                 continue;
@@ -183,14 +210,13 @@ impl OvertakeAnalyzer {
                 .find(|p| p.frame_id <= end_frame);
 
             if let (Some(start), Some(end)) = (start_pos, end_pos) {
-                // 🆕 More lenient detection
                 // Vehicle was ahead (higher in frame = smaller Y)
-                let was_in_front = start.center_y < ego_y - 30.0; // 🆕 Changed from 50 to 30
+                let was_in_front = start.center_y < ego_y - 30.0;
 
                 // Vehicle is now behind/alongside (lower in frame = larger Y)
-                let is_behind = end.center_y > ego_y - 50.0; // 🆕 Changed from -20 to -50
+                let is_behind = end.center_y > ego_y - 50.0;
 
-                // 🆕 Also check if vehicle moved DOWN in frame (relative motion)
+                // Also check if vehicle moved DOWN in frame (relative motion)
                 let moved_down = end.center_y > start.center_y + 20.0;
 
                 info!(
@@ -202,17 +228,15 @@ impl OvertakeAnalyzer {
                     was_in_front, is_behind, moved_down
                 );
 
-                // 🆕 More flexible detection: either classic logic OR relative motion
+                // More flexible detection: either classic logic OR relative motion
                 if (was_in_front && is_behind) || (moved_down && start.center_y < ego_y) {
                     // Check if vehicle is in the target lane
-                    // 🆕 CORRECTED: When overtaking LEFT, vehicle is on the RIGHT (your original lane)
-                    // When overtaking RIGHT, vehicle is on the LEFT (your original lane)
                     let is_in_target_lane = if direction == "LEFT" {
                         // Overtaking by going left → vehicle is on the right
-                        start.center_x > self.frame_width / 2.0 - 100.0 // ✅ RIGHT side
+                        start.center_x > self.frame_width / 2.0 - 100.0
                     } else {
                         // Overtaking by going right → vehicle is on the left
-                        start.center_x < self.frame_width / 2.0 + 100.0 // ✅ LEFT side
+                        start.center_x < self.frame_width / 2.0 + 100.0
                     };
 
                     info!(
