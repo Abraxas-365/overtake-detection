@@ -736,6 +736,123 @@ impl LaneChangeStateMachine {
             blackout_started_frame: None,
         }
     }
+    pub fn update(
+        &mut self,
+        vehicle_state: &VehicleState,
+        frame_id: u64,
+        timestamp_ms: f64,
+        crossing_type: CrossingType,
+    ) -> Option<LaneChangeEvent> {
+        self.total_frames_processed += 1;
+
+        if self.total_frames_processed < self.config.skip_initial_frames {
+            return None;
+        }
+
+        if self.cooldown_remaining > 0 {
+            self.cooldown_remaining -= 1;
+            if self.cooldown_remaining == 0 {
+                self.state = LaneChangeState::Centered;
+                self.frames_in_state = 0;
+            }
+            return None;
+        }
+
+        if self.post_lane_change_grace > 0 {
+            self.post_lane_change_grace -= 1;
+        }
+
+        if let Some(event) = self.handle_timeouts(frame_id, timestamp_ms) {
+            return Some(event);
+        }
+
+        // Mark occlusion before early return
+        if !vehicle_state.is_valid() {
+            self.adaptive_baseline.mark_no_lanes();
+            return None;
+        }
+
+        let lane_width = vehicle_state.lane_width.unwrap();
+        let raw_offset = vehicle_state.lateral_offset / lane_width;
+        let normalized_offset = self.position_filter.update(raw_offset);
+
+        let lateral_velocity = self
+            .velocity_tracker
+            .get_velocity(vehicle_state.lateral_offset, timestamp_ms);
+
+        self.update_histories(normalized_offset, lateral_velocity);
+
+        if self.post_lane_change_grace > 0 {
+            self.adaptive_baseline.update(normalized_offset);
+            return None;
+        }
+
+        self.adaptive_baseline.update(normalized_offset);
+
+        if !self.adaptive_baseline.is_valid {
+            return None;
+        }
+
+        if self.adaptive_baseline.sample_count == EWMA_MIN_SAMPLES {
+            info!(
+                "✅ Adaptive baseline ready: {:.1}% at frame {} ({:.1}s)",
+                self.adaptive_baseline.value * 100.0,
+                frame_id,
+                timestamp_ms / 1000.0
+            );
+        }
+
+        let baseline = self.adaptive_baseline.effective_value();
+        let signed_deviation = normalized_offset - baseline;
+        let deviation = signed_deviation.abs();
+        let current_direction = Direction::from_offset(signed_deviation);
+
+        self.trajectory_analyzer
+            .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
+        self.track_max_offset(deviation);
+        self.update_samples(
+            normalized_offset,
+            deviation,
+            timestamp_ms,
+            lateral_velocity,
+            current_direction,
+        );
+
+        let window_metrics = self.calculate_window_metrics(timestamp_ms, lane_width);
+
+        let target_state = self.determine_target_state(
+            deviation,
+            crossing_type,
+            lateral_velocity,
+            current_direction,
+            &window_metrics,
+        );
+
+        debug!(
+            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, state={:?}→{:?}",
+            frame_id,
+            normalized_offset * 100.0,
+            baseline * 100.0,
+            if self.adaptive_baseline.is_frozen {
+                "🧊"
+            } else {
+                ""
+            },
+            deviation * 100.0,
+            self.max_offset_in_change * 100.0,
+            self.state,
+            target_state
+        );
+
+        self.check_transition(
+            target_state,
+            current_direction,
+            frame_id,
+            timestamp_ms,
+            deviation,
+            normalized_offset,
+        )
+    }
 
     pub fn current_state(&self) -> &str {
         self.state.as_str()
