@@ -192,6 +192,96 @@ impl AdaptiveBaseline {
         }
     }
 
+    fn update(&mut self, measurement: f32) -> f32 {
+        self.sample_count += 1;
+
+        if self.frames_without_lanes > OCCLUSION_SHORT_THRESHOLD {
+            info!(
+                "🚨 Fast recovery mode after {}s occlusion",
+                self.frames_without_lanes as f32 / 30.0
+            );
+            self.is_adapting = true;
+            self.stable_frames = 0;
+            self.just_recovered_from_occlusion = true;
+            self.fast_recovery_frames = 30;
+        }
+
+        self.frames_without_lanes = 0;
+
+        self.recent_samples.push_back(measurement);
+        if self.recent_samples.len() > 30 {
+            self.recent_samples.pop_front();
+        }
+
+        if self.recent_samples.len() >= 10 {
+            let samples: Vec<f32> = self.recent_samples.iter().copied().collect();
+            let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
+            self.variance =
+                samples.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / samples.len() as f32;
+        }
+
+        if self.is_frozen {
+            return self.frozen_value;
+        }
+
+        let deviation_from_baseline = (measurement - self.value).abs();
+
+        if self.variance < STABILITY_VARIANCE_THRESHOLD {
+            self.stable_frames += 1;
+            if self.stable_frames > 30 {
+                self.is_adapting = false;
+            }
+        } else {
+            self.stable_frames = 0;
+            if deviation_from_baseline > 0.15 {
+                self.is_adapting = true;
+            }
+        }
+
+        let alpha = if self.fast_recovery_frames > 0 {
+            self.fast_recovery_frames -= 1;
+            if self.fast_recovery_frames == 0 {
+                self.just_recovered_from_occlusion = false;
+                info!("✅ Fast recovery complete");
+            }
+            EWMA_ALPHA_FAST_RECOVER
+        } else if self.is_adapting || !self.is_valid {
+            EWMA_ALPHA_ADAPTING
+        } else {
+            EWMA_ALPHA_STABLE
+        };
+
+        if self.sample_count == 1 {
+            self.value = measurement;
+        } else {
+            let new_value = alpha * measurement + (1.0 - alpha) * self.value;
+
+            if self.has_initial {
+                let drift = (new_value - self.initial_value).abs();
+                if drift <= BASELINE_MAX_DRIFT {
+                    self.value = new_value;
+                }
+            } else {
+                self.value = new_value;
+            }
+        }
+
+        if !self.has_initial
+            && self.sample_count >= EWMA_MIN_SAMPLES
+            && self.variance < INSTABILITY_VARIANCE_THRESHOLD
+        {
+            self.initial_value = self.value;
+            self.has_initial = true;
+            self.is_valid = true;
+        }
+
+        if self.sample_count >= EWMA_MIN_SAMPLES && self.variance < INSTABILITY_VARIANCE_THRESHOLD {
+            self.is_valid = true;
+        }
+
+        self.value
+    }
+
     fn reset_to(&mut self, initial_value: f32) {
         self.value = initial_value;
         self.initial_value = initial_value;
