@@ -461,6 +461,9 @@ pub struct LaneLegalityDetector {
     // Lane width memory for single-boundary fallback
     lane_width_history: VecDeque<f32>,
     last_valid_width: Option<f32>,
+
+    last_left_lane_x: Option<f32>,
+    last_right_lane_x: Option<f32>,
 }
 
 impl LaneLegalityDetector {
@@ -471,6 +474,7 @@ impl LaneLegalityDetector {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
+
         info!("✓ Lane legality detector initialized");
         Ok(Self {
             session,
@@ -478,6 +482,9 @@ impl LaneLegalityDetector {
             temporal_filter: TemporalViolationFilter::new(2, 6),
             lane_width_history: VecDeque::with_capacity(WIDTH_HISTORY_SIZE),
             last_valid_width: None,
+            // 🆕 Initialize these to None:
+            last_left_lane_x: None,
+            last_right_lane_x: None,
         })
     }
 
