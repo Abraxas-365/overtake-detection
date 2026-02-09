@@ -190,6 +190,24 @@ impl AdaptiveBaseline {
         }
     }
 
+    fn reset_to(&mut self, initial_value: f32) {
+        self.value = initial_value;
+        self.initial_value = initial_value;
+        self.variance = 1.0;
+        self.sample_count = 0;
+        self.is_valid = false;
+        self.recent_samples.clear();
+        self.is_adapting = true;
+        self.stable_frames = 0;
+        self.is_frozen = false;
+        self.frozen_value = 0.0;
+        self.has_initial = false;
+        self.frames_without_lanes = 0;
+        self.just_recovered_from_occlusion = false;
+        self.fast_recovery_frames = 0;
+        info!("🎯 Baseline seeded at {:.1}%", initial_value * 100.0);
+    }
+
     fn freeze(&mut self) {
         if !self.is_frozen {
             self.is_frozen = true;
@@ -349,7 +367,6 @@ impl AdaptiveBaseline {
 
     fn update_guarded(&mut self, measurement: f32, confidence: f32) -> f32 {
         // PRODUCTION FIX: If YOLO confidence is low, don't move the baseline.
-        // This stops the "baseline drift" that creates false velocity spikes.
         if confidence < 0.4 {
             self.frames_without_lanes += 1;
             return self.value;
@@ -358,15 +375,53 @@ impl AdaptiveBaseline {
         self.sample_count += 1;
         self.frames_without_lanes = 0;
 
-        // Sticky Alpha: Adjust baseline slower if we are currently "frozen" or "maneuvering"
-        let alpha = if self.is_frozen {
-            0.0
+        if self.is_frozen {
+            return self.frozen_value;
+        }
+
+        // FIX: First sample after reset should SNAP to measurement,
+        // not blend with stale 0.0
+        if self.sample_count == 1 {
+            self.value = measurement;
+            return self.value;
+        }
+
+        // FIX: Use faster alpha during initial establishment phase,
+        // then slow down once baseline is stable.
+        // Old code always used EWMA_ALPHA_STABLE (0.003) which meant
+        // the baseline took 500+ frames to converge after reset.
+        let alpha = if !self.is_valid {
+            EWMA_ALPHA_ADAPTING // 0.015 — 5x faster during establishment
+        } else if self.is_adapting {
+            EWMA_ALPHA_ADAPTING // 0.015
         } else {
-            EWMA_ALPHA_STABLE
+            EWMA_ALPHA_STABLE // 0.003 — slow once locked in
         };
 
         self.value = alpha * measurement + (1.0 - alpha) * self.value;
         self.is_valid = self.sample_count >= EWMA_MIN_SAMPLES;
+
+        // Track variance for adapting/stable transition
+        self.recent_samples.push_back(measurement);
+        if self.recent_samples.len() > 30 {
+            self.recent_samples.pop_front();
+        }
+        if self.recent_samples.len() >= 10 {
+            let samples: Vec<f32> = self.recent_samples.iter().copied().collect();
+            let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
+            self.variance =
+                samples.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / samples.len() as f32;
+
+            if self.variance < STABILITY_VARIANCE_THRESHOLD {
+                self.stable_frames += 1;
+                if self.stable_frames > 30 {
+                    self.is_adapting = false;
+                }
+            } else {
+                self.stable_frames = 0;
+            }
+        }
+
         self.value
     }
 }
@@ -1086,7 +1141,27 @@ impl LaneChangeStateMachine {
             confidence
         );
 
-        self.finalize_lane_change();
+        // ========================================================================
+        // 🔧 FIX: Seed baseline at current position instead of resetting to 0.0
+        // ========================================================================
+        // This enables detection of the RETURN lane change after an overtake.
+        // Without this fix, baseline resets to 0.0, and when the vehicle returns
+        // from position -0.30 to 0.0, the deviation is only ~10% (MISSED).
+        // With this fix, baseline starts at -0.30, so return creates ~30% deviation (DETECTED).
+
+        let current_pos = self.offset_history.last().copied().unwrap_or(0.0);
+        self.adaptive_baseline.reset_to(current_pos);
+        self.position_filter.reset();
+        self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
+        self.offset_samples.clear();
+        self.cooldown_remaining = self.config.cooldown_frames;
+
+        info!(
+            "🔄 Baseline seeded at {:.1}% — ready for return detection",
+            current_pos * 100.0
+        );
+        self.reset_lane_change();
+
         Some(event)
     }
 
@@ -1603,12 +1678,25 @@ impl LaneChangeStateMachine {
     }
 
     fn finalize_lane_change(&mut self) {
-        self.adaptive_baseline.reset();
+        // FIX: Seed the baseline at the CURRENT position instead of 0.0.
+        // This is critical for detecting the RETURN lane change.
+        //
+        // Old behavior: baseline.reset() → value = 0.0
+        //   → return maneuver produces only ~10% deviation → MISSED
+        //
+        // New behavior: baseline.reset_to(current_pos)
+        //   → return maneuver produces full ~30%+ deviation → DETECTED ✅
+        let current_pos = self.offset_history.last().copied().unwrap_or(0.0);
+        self.adaptive_baseline.reset_to(current_pos);
+
         self.position_filter.reset();
         self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
         self.offset_samples.clear();
         self.cooldown_remaining = self.config.cooldown_frames;
-        info!("🔄 Baseline reset - will adapt to new position");
+        info!(
+            "🔄 Baseline seeded at {:.1}% — ready for return detection",
+            current_pos * 100.0
+        );
         self.reset_lane_change();
     }
 
