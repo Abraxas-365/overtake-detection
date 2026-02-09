@@ -789,7 +789,7 @@ async fn process_video(
                     }
                     frames_with_valid_position += 1;
                 } else {
-                    // ❌ PRIMARY FAILED: Use fallback estimation
+                    // ❌ PRIMARY FAILED: Try fallback estimation
                     let road_markings = legality_buffer
                         .latest()
                         .map(|r| r.all_markings.clone())
@@ -802,67 +802,90 @@ async fn process_video(
                     ) {
                         frames_with_fallback += 1;
 
-                        // Create synthetic VehicleState from fallback
-                        let synthetic_state = VehicleState {
-                            lateral_offset: fallback.lateral_offset,
-                            lane_width: Some(fallback.lane_width),
-                            heading_offset: 0.0,
-                            frame_id: frame_count,
-                            timestamp_ms,
-                            raw_offset: fallback.lateral_offset,
-                            detection_confidence: fallback.confidence,
-                            both_lanes_detected: false,
-                        };
+                        // 🔒 GATED FALLBACK: Only use for tracking ongoing maneuvers, NOT initiating new ones
+                        let current_state = analyzer.current_state();
+                        let is_already_maneuvering =
+                            current_state == "DRIFTING" || current_state == "CROSSING";
 
-                        // Feed to state machine with reduced confidence threshold
-                        if fallback.confidence > 0.25 {
-                            if let Some(mut fallback_event) = analyzer.analyze_with_state(
-                                &synthetic_state,
-                                frame_count,
+                        // Only feed fallback state if:
+                        // 1. We're already in a maneuver (tracking mode), OR
+                        // 2. Fallback has very high confidence (>0.75) AND strong lateral velocity
+                        let allow_fallback = is_already_maneuvering
+                            || (fallback.confidence > 0.75
+                                && fallback_estimator.fallback_lateral_velocity.abs() > 200.0);
+
+                        if allow_fallback {
+                            // Create synthetic VehicleState from fallback
+                            let synthetic_state = VehicleState {
+                                lateral_offset: fallback.lateral_offset,
+                                lane_width: Some(fallback.lane_width),
+                                heading_offset: 0.0,
+                                frame_id: frame_count,
                                 timestamp_ms,
-                            ) {
-                                // Tag event with fallback metadata
-                                fallback_event.metadata.insert(
-                                    "detection_source".to_string(),
-                                    serde_json::json!(fallback.source.as_str()),
-                                );
-                                fallback_event.metadata.insert(
-                                    "fallback_confidence".to_string(),
-                                    serde_json::json!(fallback.confidence),
-                                );
+                                raw_offset: fallback.lateral_offset,
+                                detection_confidence: fallback.confidence,
+                                both_lanes_detected: false,
+                            };
 
-                                // Process like a normal event
-                                lane_changes_count += 1;
-                                info!(
-                                    "🔶 FALLBACK LANE CHANGE: {} at {:.2}s ({})",
-                                    fallback_event.direction_name(),
-                                    fallback_event.video_timestamp_ms / 1000.0,
-                                    fallback.source.as_str()
-                                );
-
-                                process_lane_change_event(
-                                    fallback_event,
-                                    &mut overtake_tracker,
-                                    &mut shadow_detector,
-                                    &mut overtake_analyzer,
-                                    &mut analyzer,
-                                    &mut legality_buffer,
-                                    &mut frame_buffer,
-                                    &mut complete_overtakes,
-                                    &mut incomplete_overtakes,
-                                    &mut simple_lane_changes,
-                                    &mut shadow_overtakes_detected,
-                                    &mut total_vehicles_overtaken,
-                                    &mut events_sent_to_api,
-                                    &mut current_overtake_vehicles,
-                                    &mut results_file,
+                            // Feed to state machine
+                            if fallback.confidence > 0.25 {
+                                if let Some(mut fallback_event) = analyzer.analyze_with_state(
+                                    &synthetic_state,
                                     frame_count,
-                                    legality_config,
-                                    config,
-                                    api_client,
-                                )
-                                .await?;
+                                    timestamp_ms,
+                                ) {
+                                    // Tag event with fallback metadata
+                                    fallback_event.metadata.insert(
+                                        "detection_source".to_string(),
+                                        serde_json::json!(fallback.source.as_str()),
+                                    );
+                                    fallback_event.metadata.insert(
+                                        "fallback_confidence".to_string(),
+                                        serde_json::json!(fallback.confidence),
+                                    );
+
+                                    // Process like a normal event
+                                    lane_changes_count += 1;
+                                    info!(
+                                        "🔶 FALLBACK LANE CHANGE: {} at {:.2}s ({}, conf={:.2})",
+                                        fallback_event.direction_name(),
+                                        fallback_event.video_timestamp_ms / 1000.0,
+                                        fallback.source.as_str(),
+                                        fallback.confidence
+                                    );
+
+                                    process_lane_change_event(
+                                        fallback_event,
+                                        &mut overtake_tracker,
+                                        &mut shadow_detector,
+                                        &mut overtake_analyzer,
+                                        &mut analyzer,
+                                        &mut legality_buffer,
+                                        &mut frame_buffer,
+                                        &mut complete_overtakes,
+                                        &mut incomplete_overtakes,
+                                        &mut simple_lane_changes,
+                                        &mut shadow_overtakes_detected,
+                                        &mut total_vehicles_overtaken,
+                                        &mut events_sent_to_api,
+                                        &mut current_overtake_vehicles,
+                                        &mut results_file,
+                                        frame_count,
+                                        legality_config,
+                                        config,
+                                        api_client,
+                                    )
+                                    .await?;
+                                }
                             }
+                        } else if !is_already_maneuvering {
+                            // Primary failed, fallback not confident enough → suppress noise
+                            debug!(
+                                "🔇 Fallback suppressed (state={}, conf={:.2}, vel={:.1}px/s)",
+                                current_state,
+                                fallback.confidence,
+                                fallback_estimator.fallback_lateral_velocity
+                            );
                         }
 
                         if fallback.source == EstimationSource::DeadReckoning {
@@ -874,7 +897,7 @@ async fn process_video(
                     }
                 }
 
-                // Process primary event if it exists
+                // Process primary event if it exists (unchanged)
                 if let Some(event) = event_opt {
                     lane_changes_count += 1;
                     info!(
