@@ -851,7 +851,7 @@ async fn process_video(
                 &current_overtake_vehicles,
                 Some(curve_info),
                 lateral_velocity,
-                legality_buffer.latest_as_legality_result().as_ref(),
+                legality_for_overlay,
                 detection_source, // 👈 ADD THIS ARGUMENT (passed from the loop
             ) {
                 use opencv::videoio::VideoWriterTrait;
