@@ -38,6 +38,23 @@ impl LaneChangeAnalyzer {
             valid_estimates: 0,
         }
     }
+    pub fn analyze_with_state(
+        &mut self,
+        vehicle_state: &VehicleState,
+        frame_id: u64,
+        timestamp_ms: f64,
+    ) -> Option<LaneChangeEvent> {
+        self.frame_count += 1;
+
+        let smoothed = self.smoother.smooth(*vehicle_state);
+        self.last_state = Some(smoothed);
+
+        // No boundary crossing info from fallback
+        let crossing_type = crate::analysis::lane_state_machine::CrossingType::None;
+
+        self.state_machine
+            .update(&smoothed, frame_id, timestamp_ms, crossing_type)
+    }
 
     pub fn analyze(
         &mut self,

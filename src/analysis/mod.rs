@@ -2,6 +2,7 @@
 
 mod boundary_detector;
 mod curve_detector;
+pub mod fallback_estimator;
 mod lane_analyzer;
 mod position_estimator;
 mod state_machine;
