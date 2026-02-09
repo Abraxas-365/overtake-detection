@@ -425,32 +425,6 @@ impl LaneLegalityDetector {
         )
     }
 
-    /// Get all detected road markings for a frame (for cross-validation)
-    /// This is used by Phase 2 to extract lane position from YOLOv8-seg
-    pub fn get_markings_only(
-        &mut self,
-        frame: &[u8],
-        width: usize,
-        height: usize,
-        confidence_threshold: f32,
-    ) -> Result<Vec<DetectedRoadMarking>> {
-        let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
-        let (box_output, mask_proto, _) = self.infer(&input)?;
-
-        self.postprocess(
-            &box_output,
-            &mask_proto,
-            &[],
-            scale,
-            pad_x,
-            pad_y,
-            width,
-            height,
-            confidence_threshold,
-            frame,
-        )
-    }
-
     pub fn set_ego_bbox_ratio(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         self.ego_bbox_ratio = [x1, y1, x2, y2];
     }
