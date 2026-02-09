@@ -485,7 +485,7 @@ async fn process_video(
 
     let mut reader = video_processor
         .open_video(video_path)
-        .with_context(|| format("Failed to open video: {}", video_path.display()))?;
+        .with_context(|| format!("Failed to open video: {}", video_path.display()))?;
 
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
@@ -533,8 +533,7 @@ async fn process_video(
             run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms)?;
 
         // ── STAGE 3: Position Analysis ──
-        let event_opt =
-            run_position_analysis(&mut ps, &analysis_lanes, timestamp_ms);
+        let event_opt = run_position_analysis(&mut ps, &analysis_lanes, timestamp_ms);
 
         // ── STAGE 4: Handle detected events ──
         if let Some(event) = event_opt {
@@ -597,18 +596,18 @@ fn run_vehicle_detection(
         .map(|vs| vs.detection_confidence)
         .unwrap_or(0.0);
 
-    let should_run = ps.inference_scheduler.should_run_yolo(
-        ufld_confidence,
-        ufld_confidence,
-        is_maneuvering,
-        0,
-    );
+    let should_run =
+        ps.inference_scheduler
+            .should_run_yolo(ufld_confidence, ufld_confidence, is_maneuvering, 0);
 
     if !should_run {
         return Ok(());
     }
 
-    if let Ok(detections) = ps.yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
+    if let Ok(detections) = ps
+        .yolo_detector
+        .detect(&frame.data, frame.width, frame.height, 0.3)
+    {
         ps.latest_vehicle_detections = detections.clone();
         ps.overtake_analyzer.update(detections, frame_count);
         ps.overtake_tracker
@@ -682,10 +681,15 @@ fn run_lane_detection(
                 if frame_count % 3 == 0 {
                     // DISJOINT BORROW FIX:
                     // Pass only what's needed to the helper, not the whole state.
-                    let vehicle_offset = ps.analyzer.last_vehicle_state()
+                    let vehicle_offset = ps
+                        .analyzer
+                        .last_vehicle_state()
                         .map(|vs| vs.lateral_offset)
                         .unwrap_or(0.0);
-                    let lane_width = ps.analyzer.last_vehicle_state().and_then(|vs| vs.lane_width);
+                    let lane_width = ps
+                        .analyzer
+                        .last_vehicle_state()
+                        .and_then(|vs| vs.lane_width);
 
                     buffer_legality_result(
                         detector,
@@ -697,7 +701,7 @@ fn run_lane_detection(
                         frame_count,
                         timestamp_ms,
                         vehicle_offset,
-                        lane_width
+                        lane_width,
                     );
                 }
             }
@@ -771,13 +775,9 @@ fn run_position_analysis(
     ps.last_right_lane_x = right_bound;
 
     // Primary analysis via state machine
-    let event_opt = ps.analyzer.analyze_perfect(
-        analysis_lanes,
-        1280,
-        720,
-        frame_count,
-        timestamp_ms,
-    );
+    let event_opt =
+        ps.analyzer
+            .analyze_perfect(analysis_lanes, 1280, 720, frame_count, timestamp_ms);
 
     // Track valid position frames & sync fallback
     if ps
@@ -893,7 +893,10 @@ fn check_overtake_timeout(
     let lanes_visible = !analysis_lanes.is_empty();
     let frame_count = ps.frame_count;
 
-    if let Some(timeout_result) = ps.overtake_tracker.check_timeout(frame_count, lanes_visible) {
+    if let Some(timeout_result) = ps
+        .overtake_tracker
+        .check_timeout(frame_count, lanes_visible)
+    {
         if let OvertakeResult::Incomplete {
             start_event,
             reason,
@@ -1435,7 +1438,10 @@ fn print_final_stats(stats: &ProcessingStats) {
     info!("  ⚠️  Incomplete overtakes: {}", stats.incomplete_overtakes);
     info!("  ↔️  Simple lane changes: {}", stats.simple_lane_changes);
     info!("  Events sent to API: {}", stats.events_sent_to_api);
-    info!("  Shadow overtakes detected: {}", stats.shadow_overtakes_detected);
+    info!(
+        "  Shadow overtakes detected: {}",
+        stats.shadow_overtakes_detected
+    );
 
     info!(
         "  Processing: {:.1} FPS ({:.1}s total)",
