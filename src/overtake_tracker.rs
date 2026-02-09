@@ -179,13 +179,24 @@ impl OvertakeTracker {
         }
     }
 
-    pub fn check_timeout(&mut self, current_frame: u64) -> Option<OvertakeResult> {
+    pub fn check_timeout(
+        &mut self,
+        current_frame: u64,
+        lanes_visible: bool,
+    ) -> Option<OvertakeResult> {
         if let OvertakeState::InProgress {
             start_event,
             start_frame,
             ..
         } = &self.state
         {
+            // 🚀 PRODUCTION FIX: If lanes are NOT visible, we pause the timeout.
+            // We assume the vehicle is still overtaking until proven otherwise.
+            // This prevents "Incomplete" status during desert road 'blind spots'.
+            if !lanes_visible {
+                return None;
+            }
+
             let elapsed = current_frame - start_frame;
 
             if elapsed > self.effective_timeout {
@@ -201,7 +212,7 @@ impl OvertakeTracker {
                     )
                 } else {
                     format!(
-                        "No return to original lane within {} frames",
+                        "No return to original lane within {} frames (Lanes were visible)",
                         self.effective_timeout
                     )
                 };
