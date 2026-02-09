@@ -1405,12 +1405,12 @@ fn print_final_stats(stats: &ProcessingStats) {
     info!(
         "║ YOLOv8-seg Primary: {:>5} frames ({:.1}%)             ║",
         stats.yolo_primary_count,
-        stats.yolo_primary_count as f32 / stats.total_frames.max(1) as f64 * 100.0
+        stats.yolo_primary_count as f64 / stats.total_frames.max(1) as f64 * 100.0
     );
     info!(
         "║ UFLDv2 Fallback:    {:>5} frames ({:.1}%)             ║",
         stats.ufld_fallback_count,
-        stats.ufld_fallback_count as f32 / stats.total_frames.max(1) as f64 * 100.0
+        stats.ufld_fallback_count as f64 / stats.total_frames.max(1) as f64 * 100.0
     );
     info!("╚════════════════════════════════════════════════════════╝");
 
@@ -1429,4 +1429,3 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.avg_fps, stats.duration_secs
     );
 }
-
