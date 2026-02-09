@@ -100,42 +100,65 @@ impl LaneChangeFrameBuffer {
 /// Detection quality metadata to help AI make better decisions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionMetadata {
-    /// Confidence of the lane change detection (0.0-1.0)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // EXISTING FIELDS (keep these)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     pub detection_confidence: f32,
-    /// Maximum lateral offset reached during maneuver (normalized, 0.0-1.0)
     pub max_offset_normalized: f32,
-    /// Average lane detection confidence across frames (0.0-1.0)
     pub avg_lane_confidence: f32,
-    /// Percentage of frames where both lanes were detected (0.0-1.0)
     pub both_lanes_ratio: f32,
-    /// Video resolution (e.g., "1280x720")
     pub video_resolution: String,
-    /// Frames per second
     pub fps: f32,
-    /// Country/region for traffic rules (e.g., "PE" for Peru)
     pub region: String,
-    /// Average lane width in pixels during the maneuver
     pub avg_lane_width_px: Option<f32>,
 
-    // CURVE DETECTION METADATA
-    /// Whether a curve was detected during the maneuver
+    // Curve info
     pub curve_detected: bool,
-    /// Average angle of the curve in degrees (0 if no curve)
     pub curve_angle_degrees: f32,
-    /// Confidence of curve detection (0.0-1.0)
     pub curve_confidence: f32,
-    /// Type of curve: "NONE", "MODERATE", "SHARP"
     pub curve_type: String,
 
-    // SHADOW OVERTAKE METADATA
-    /// Whether a shadow overtake was detected (vehicle blocking visibility ahead)
+    // Shadow overtake
     pub shadow_overtake_detected: bool,
-    /// Number of distinct vehicles that blocked visibility during the maneuver
     pub shadow_overtake_count: u32,
-    /// Worst severity level: "NONE", "WARNING", "DANGEROUS", "CRITICAL"
     pub shadow_worst_severity: String,
-    /// List of blocking vehicles e.g. ["car (ID #3)", "truck (ID #7)"]
     pub shadow_blocking_vehicles: Vec<String>,
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 NEW FIELDS - Comprehensive Context
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    // ─── LANE LINE LEGALITY ───
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_crossing_info: Option<LineCrossingInfo>,
+
+    // ─── VEHICLES OVERTAKEN ───
+    pub vehicles_overtaken_count: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overtaken_vehicle_types: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overtaken_vehicle_ids: Vec<u32>,
+
+    // ─── MANEUVER CHARACTERISTICS ───
+    pub maneuver_type: String, // "complete_overtake", "incomplete_overtake", "simple_lane_change"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
+
+    // ─── TRAJECTORY ANALYSIS ───
+    pub trajectory_info: TrajectoryInfo,
+
+    // ─── VELOCITY & DYNAMICS ───
+    pub velocity_info: VelocityInfo,
+
+    // ─── POSITIONING DETAILS ───
+    pub positioning_info: PositioningInfo,
+
+    // ─── DETECTION METHOD ───
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_path: Option<String>, // How was this detected?
+
+    // ─── TEMPORAL ANALYSIS ───
+    pub temporal_info: TemporalInfo,
 }
 
 /// Enhanced payload for the legality analysis API
@@ -302,7 +325,10 @@ pub fn build_legality_request(
         });
     }
 
-    // Calculate video metadata
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // CALCULATE VIDEO METADATA
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     let video_resolution = format!(
         "{}x{}",
         key_frames.first().unwrap().width,
@@ -321,6 +347,10 @@ pub fn build_legality_request(
     } else {
         25.0
     };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // EXTRACT BASIC DETECTION QUALITY METADATA
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     let max_offset_normalized = event
         .metadata
@@ -349,14 +379,268 @@ pub fn build_legality_request(
         .and_then(|v| v.as_f64())
         .map(|v| v as f32);
 
-    // ── Curve info ───────────────────────────────────────────────────────
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT LINE CROSSING INFORMATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let line_crossing_info = if let Some(legality) = &event.legality {
+        Some(LineCrossingInfo {
+            line_crossed: true,
+            line_type: legality.lane_line_type.clone(),
+            is_legal: legality.is_legal,
+            severity: if legality.is_legal {
+                "LEGAL".to_string()
+            } else {
+                event
+                    .metadata
+                    .get("line_legality_verdict")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ILLEGAL")
+                    .to_string()
+            },
+            line_detection_confidence: legality.confidence,
+            crossed_at_frame: event
+                .metadata
+                .get("line_legality_frame")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(event.start_frame_id),
+            additional_lines_crossed: vec![], // Could be enhanced to track multiple
+            analysis_details: legality.analysis_details.clone(),
+        })
+    } else {
+        None
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT VEHICLES OVERTAKEN
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let vehicles_overtaken_count = event
+        .metadata
+        .get("vehicles_overtaken")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let overtaken_vehicle_types: Vec<String> = event
+        .metadata
+        .get("overtaken_vehicle_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let overtaken_vehicle_ids: Vec<u32> = event
+        .metadata
+        .get("overtaken_vehicle_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT MANEUVER TYPE & STATUS
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let maneuver_type = event
+        .metadata
+        .get("maneuver_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("simple_lane_change")
+        .to_string();
+
+    let incomplete_reason = event
+        .metadata
+        .get("incomplete_reason")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT TRAJECTORY INFORMATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let initial_position = event
+        .metadata
+        .get("initial_position")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+
+    let final_position = event
+        .metadata
+        .get("final_position")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+
+    let net_displacement = event
+        .metadata
+        .get("net_displacement")
+        .and_then(|v| v.as_f64())
+        .unwrap_or((final_position - initial_position).abs() as f64)
+        as f32;
+
+    let trajectory_info = TrajectoryInfo {
+        initial_position,
+        final_position,
+        net_displacement,
+        returned_to_start: net_displacement.abs() < 0.20,
+        excursion_sufficient: max_offset_normalized >= 0.30,
+        shape_score: event
+            .metadata
+            .get("trajectory_shape_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5) as f32,
+        smoothness: event
+            .metadata
+            .get("trajectory_smoothness")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32,
+        has_direction_reversal: event
+            .metadata
+            .get("has_direction_reversal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT VELOCITY INFORMATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let peak_lateral_velocity = event
+        .metadata
+        .get("peak_lateral_velocity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+
+    let avg_lateral_velocity = event
+        .metadata
+        .get("avg_lateral_velocity")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+
+    let velocity_pattern = event
+        .metadata
+        .get("velocity_pattern")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            // Infer pattern from available data
+            if peak_lateral_velocity > 180.0 {
+                "spike".to_string()
+            } else if peak_lateral_velocity > 100.0 && avg_lateral_velocity > 60.0 {
+                "sustained".to_string()
+            } else if peak_lateral_velocity > 0.0 {
+                "moderate".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+
+    let velocity_info = VelocityInfo {
+        peak_lateral_velocity,
+        avg_lateral_velocity,
+        velocity_pattern,
+        max_acceleration: event
+            .metadata
+            .get("max_acceleration")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT POSITIONING INFORMATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let avg_width = avg_lane_width_px.unwrap_or(400.0);
+
+    let lane_width_min = event
+        .metadata
+        .get("lane_width_min")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(avg_width as f64) as f32;
+
+    let lane_width_max = event
+        .metadata
+        .get("lane_width_max")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(avg_width as f64) as f32;
+
+    let lane_width_variation = lane_width_max - lane_width_min;
+    let lane_width_stable = lane_width_variation < (avg_width * 0.15); // < 15% variation
+
+    let positioning_info = PositioningInfo {
+        lane_width_min,
+        lane_width_max,
+        lane_width_avg: avg_width,
+        lane_width_stable,
+        adjacent_lane_penetration: max_offset_normalized,
+        baseline_offset: event
+            .metadata
+            .get("baseline_offset")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as f32,
+        baseline_frozen: event
+            .metadata
+            .get("baseline_frozen")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT DETECTION PATH
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let detection_path = event
+        .metadata
+        .get("detection_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 🆕 EXTRACT TEMPORAL INFORMATION
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    let total_duration = event.duration_ms.unwrap_or(0.0);
+
+    let time_drifting_ms = event
+        .metadata
+        .get("time_drifting_ms")
+        .and_then(|v| v.as_f64());
+
+    let time_crossing_ms = event
+        .metadata
+        .get("time_crossing_ms")
+        .and_then(|v| v.as_f64());
+
+    // Duration is plausible if between 800ms and 10s
+    let duration_plausible = total_duration >= 800.0 && total_duration <= 10000.0;
+
+    let temporal_info = TemporalInfo {
+        time_drifting_ms,
+        time_crossing_ms,
+        total_maneuver_duration_ms: total_duration,
+        duration_plausible,
+        state_progression: vec![], // Could be enhanced with detailed state transitions
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // CURVE INFORMATION (existing)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     let curve_type_str = match curve_info.curve_type {
         CurveType::None => "NONE",
         CurveType::Moderate => "MODERATE",
         CurveType::Sharp => "SHARP",
     };
 
-    // ── Shadow overtake info (extracted from event metadata) ─────────────
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // SHADOW OVERTAKE INFORMATION (existing)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     let shadow_detected = event
         .metadata
         .get("shadow_overtake_detected")
@@ -387,8 +671,12 @@ pub fn build_legality_request(
         })
         .unwrap_or_default();
 
-    // ── Build metadata struct ────────────────────────────────────────────
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // BUILD COMPREHENSIVE METADATA STRUCTURE
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     let metadata = DetectionMetadata {
+        // Basic detection quality
         detection_confidence: event.confidence,
         max_offset_normalized,
         avg_lane_confidence,
@@ -397,17 +685,36 @@ pub fn build_legality_request(
         fps,
         region: "PE".to_string(),
         avg_lane_width_px,
-        // Curve
+
+        // Curve information
         curve_detected: curve_info.is_curve,
         curve_angle_degrees: curve_info.angle_degrees,
         curve_confidence: curve_info.confidence,
         curve_type: curve_type_str.to_string(),
+
         // Shadow overtake
         shadow_overtake_detected: shadow_detected,
         shadow_overtake_count: shadow_count,
         shadow_worst_severity: shadow_severity,
         shadow_blocking_vehicles: shadow_vehicles,
+
+        // 🆕 NEW COMPREHENSIVE FIELDS
+        line_crossing_info,
+        vehicles_overtaken_count,
+        overtaken_vehicle_types,
+        overtaken_vehicle_ids,
+        maneuver_type,
+        incomplete_reason,
+        trajectory_info,
+        velocity_info,
+        positioning_info,
+        detection_path,
+        temporal_info,
     };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // LOGGING
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     info!(
         "📊 Detection quality: conf={:.1}%, max_offset={:.1}%, lanes={:.0}%",
@@ -416,7 +723,6 @@ pub fn build_legality_request(
         metadata.both_lanes_ratio * 100.0
     );
 
-    // Log curve info if detected
     if curve_info.is_curve {
         info!(
             "🌀 Curve detected: type={}, angle={:.1}°, confidence={:.0}%",
@@ -426,15 +732,52 @@ pub fn build_legality_request(
         );
     }
 
-    // Log shadow overtake info if detected
     if shadow_detected {
         warn!(
-            "⚫ Shadow overtake included in request: count={}, severity={}, vehicles={:?}",
+            "⚫ Shadow overtake: count={}, severity={}, vehicles={:?}",
             metadata.shadow_overtake_count,
             metadata.shadow_worst_severity,
             metadata.shadow_blocking_vehicles
         );
     }
+
+    if vehicles_overtaken_count > 0 {
+        info!(
+            "🎯 Vehicles overtaken: {} ({:?})",
+            vehicles_overtaken_count, overtaken_vehicle_types
+        );
+    }
+
+    if let Some(ref line_info) = metadata.line_crossing_info {
+        let legality_emoji = if line_info.is_legal { "✅" } else { "⚠️" };
+        info!(
+            "{} Line crossing: {} [{}] (conf: {:.0}%)",
+            legality_emoji,
+            line_info.line_type,
+            line_info.severity,
+            line_info.line_detection_confidence * 100.0
+        );
+    }
+
+    info!(
+        "🏃 Velocity: peak={:.0}px/s, avg={:.0}px/s, pattern={}",
+        peak_lateral_velocity, avg_lateral_velocity, metadata.velocity_info.velocity_pattern
+    );
+
+    info!(
+        "📐 Trajectory: shape={:.2}, smooth={:.2}, reversal={}",
+        trajectory_info.shape_score,
+        trajectory_info.smoothness,
+        trajectory_info.has_direction_reversal
+    );
+
+    if let Some(ref path) = detection_path {
+        info!("🔍 Detected via: {}", path);
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // BUILD AND RETURN REQUEST
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     Ok(LaneChangeLegalityRequest {
         event_id: event.event_id.clone(),
@@ -771,4 +1114,122 @@ mod tests {
         assert_eq!(shadow_vehicles[0], "car (ID #3)");
         assert_eq!(shadow_vehicles[1], "truck (ID #7)");
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineCrossingInfo {
+    /// Was a line crossed during the maneuver?
+    pub line_crossed: bool,
+
+    /// Type of line crossed (e.g., "solid_single_yellow", "dashed_single_white")
+    pub line_type: String,
+
+    /// Is crossing this line legal?
+    pub is_legal: bool,
+
+    /// Severity level
+    pub severity: String, // "LEGAL", "ILLEGAL", "CRITICAL_ILLEGAL"
+
+    /// Confidence of the line detection
+    pub line_detection_confidence: f32,
+
+    /// Frame ID where the line was crossed
+    pub crossed_at_frame: u64,
+
+    /// Multiple lines crossed?
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_lines_crossed: Vec<String>,
+
+    /// Legality analysis details from the segmentation model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_details: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrajectoryInfo {
+    /// Initial normalized position (before maneuver)
+    pub initial_position: f32,
+
+    /// Final normalized position (after maneuver)
+    pub final_position: f32,
+
+    /// Net displacement (final - initial)
+    pub net_displacement: f32,
+
+    /// Did the vehicle return close to starting position?
+    pub returned_to_start: bool,
+
+    /// Was excursion sufficient for a real lane change?
+    pub excursion_sufficient: bool,
+
+    /// Trajectory shape score (0.0-1.0, higher = cleaner arc)
+    pub shape_score: f32,
+
+    /// Smoothness score (lower = smoother, < 0.25 is good)
+    pub smoothness: f32,
+
+    /// Was there a clear direction reversal?
+    pub has_direction_reversal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VelocityInfo {
+    /// Peak lateral velocity (px/s)
+    pub peak_lateral_velocity: f32,
+
+    /// Average lateral velocity during maneuver
+    pub avg_lateral_velocity: f32,
+
+    /// Was velocity sustained or erratic?
+    pub velocity_pattern: String, // "sustained", "erratic", "spike"
+
+    /// Maximum acceleration (change in velocity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_acceleration: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositioningInfo {
+    /// Lane width statistics
+    pub lane_width_min: f32,
+    pub lane_width_max: f32,
+    pub lane_width_avg: f32,
+    pub lane_width_stable: bool, // Did width vary significantly?
+
+    /// How far into adjacent lane did vehicle go? (0.0 = just crossed, 1.0 = centered in new lane)
+    pub adjacent_lane_penetration: f32,
+
+    /// Baseline offset the system was tracking from
+    pub baseline_offset: f32,
+
+    /// Was baseline frozen during detection?
+    pub baseline_frozen: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalInfo {
+    /// Time spent in DRIFTING state (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_drifting_ms: Option<f64>,
+
+    /// Time spent in CROSSING state (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_crossing_ms: Option<f64>,
+
+    /// Total duration from first drift to completion
+    pub total_maneuver_duration_ms: f64,
+
+    /// Was duration within expected range for this type?
+    pub duration_plausible: bool,
+
+    /// State progression summary
+    pub state_progression: Vec<StateTransition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateTransition {
+    pub from_state: String,
+    pub to_state: String,
+    pub frame_id: u64,
+    pub timestamp_ms: f64,
 }

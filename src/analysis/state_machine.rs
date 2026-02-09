@@ -1626,6 +1626,36 @@ impl LaneChangeStateMachine {
                 "max_offset_normalized".to_string(),
                 serde_json::json!(self.max_offset_in_change),
             );
+            // In execute_transition() when creating events:
+            event.metadata.insert(
+                "trajectory_shape_score".to_string(),
+                serde_json::json!(trajectory_analysis.shape_score),
+            );
+            event.metadata.insert(
+                "trajectory_smoothness".to_string(),
+                serde_json::json!(trajectory_analysis.smoothness),
+            );
+            event.metadata.insert(
+                "has_direction_reversal".to_string(),
+                serde_json::json!(trajectory_analysis.has_reversal),
+            );
+            event.metadata.insert(
+                "peak_lateral_velocity".to_string(),
+                serde_json::json!(self.peak_velocity_in_window),
+            );
+            event.metadata.insert(
+                "detection_path".to_string(),
+                serde_json::json!(format!("{:?}", self.change_detection_path)),
+            );
+            event.metadata.insert(
+                "baseline_offset".to_string(),
+                serde_json::json!(self.adaptive_baseline.effective_value()),
+            );
+            event.metadata.insert(
+                "baseline_frozen".to_string(),
+                serde_json::json!(self.adaptive_baseline.is_frozen),
+            );
+
             if let Some(initial) = self.initial_position_frozen {
                 event
                     .metadata
