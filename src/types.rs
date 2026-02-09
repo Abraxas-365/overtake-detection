@@ -1,5 +1,6 @@
 // src/types.rs
 
+use anyhow::Context; // 🆕 ADDED THIS LINE
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -15,7 +16,7 @@ pub struct Config {
     pub video: VideoConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
-    pub lane_legality: LaneLegalityConfig, // 🆕
+    pub lane_legality: LaneLegalityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,8 +124,6 @@ pub struct VideoConfig {
 pub struct LoggingConfig {
     pub level: String,
 }
-
-// Add this impl block to Config in types.rs
 
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
@@ -438,7 +437,7 @@ impl std::fmt::Display for Direction {
 // Evidence Paths
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidencePaths {
     pub start_image_path: String,
     pub end_image_path: String,
@@ -478,7 +477,7 @@ impl CurveInfo {
 // Lane Change Event
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneChangeEvent {
     pub event_id: String,
     pub timestamp: String,
@@ -495,7 +494,7 @@ pub struct LaneChangeEvent {
     pub legality: Option<LegalityInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)] // 🆕 Added PartialEq
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LegalityInfo {
     pub is_legal: bool,
     pub lane_line_type: String,
