@@ -50,7 +50,7 @@ impl LaneChangeAnalyzer {
         self.last_state = Some(smoothed);
 
         // No boundary crossing info from fallback
-        let crossing_type = crate::analysis::lane_state_machine::CrossingType::None;
+        let crossing_type = CrossingType::None;
 
         self.state_machine
             .update(&smoothed, frame_id, timestamp_ms, crossing_type)
