@@ -76,10 +76,10 @@ const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
 const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
 const LOW_OFFSET_THRESHOLD: f32 = 0.25;
 
-const MIN_DURATION_VERY_HIGH: f64 = 800.0;
-const MIN_DURATION_HIGH: f64 = 1000.0;
-const MIN_DURATION_MEDIUM: f64 = 1500.0;
-const MIN_DURATION_LOW: f64 = 2500.0;
+const MIN_DURATION_VERY_HIGH: f64 = 400.0;
+const MIN_DURATION_HIGH: f64 = 600.0;
+const MIN_DURATION_MEDIUM: f64 = 1000.0;
+const MIN_DURATION_LOW: f64 = 1800.0;
 
 const MIN_NET_DISPLACEMENT: f32 = 0.15;
 
@@ -1033,7 +1033,7 @@ impl LaneChangeStateMachine {
         net_displacement: f32,
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
-        const ABSOLUTE_MIN_DURATION: f64 = 800.0;
+        const ABSOLUTE_MIN_DURATION: f64 = 400.0;
 
         if duration < ABSOLUTE_MIN_DURATION {
             warn!(
