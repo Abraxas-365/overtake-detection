@@ -1,6 +1,10 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v3.6 - SPARSE DETECTION TOLERANCE
+// LANE CHANGE DETECTION v3.7 - CURVE DRIFT REJECTION
+//
+// v3.7: Added MIN_DRIFT_RATE_PER_SEC (5%/s) to reject slow curve-following drift
+//       that was being misclassified as lane changes on mountain haul road curves.
+//       Applied in: handle_timeouts force-complete, validate_lane_change LOW tier.
 //
 
 use super::boundary_detector::CrossingType;
@@ -67,6 +71,12 @@ const OCCLUSION_LONG_THRESHOLD: u32 = 60;
 // ============================================================================
 const CURVE_COMPENSATION_FACTOR: f32 = 1.0;
 const CURVE_CURVATURE_THRESHOLD: f32 = 0.015;
+
+// Minimum drift rate to distinguish real lane changes from gradual curve drift.
+// Real lane changes: 20-70%/s (30%+ offset in 0.5-1.5s)
+// Curve following:   2-5%/s  (25-30% offset accumulating over 5-10s)
+// Threshold set at 5%/s — well above curve drift, well below real maneuvers.
+const MIN_DRIFT_RATE_PER_SEC: f32 = 5.0;
 
 // ============================================================================
 // VALIDATION THRESHOLDS - TUNED FOR SPARSE DETECTION
@@ -848,14 +858,32 @@ impl LaneChangeStateMachine {
                 if elapsed > MAX_DRIFTING_MS {
                     // 🔧 Use LOW_OFFSET_THRESHOLD instead of MEDIUM — prevent dead-zone timeouts
                     if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
+                        // 🔧 Reject gradual curve drift — real lane changes have high drift rates
+                        let drift_duration_s = (elapsed / 1000.0) as f32;
+                        let drift_rate = if drift_duration_s > 0.0 {
+                            (self.max_offset_in_change * 100.0) / drift_duration_s
+                        } else {
+                            999.0
+                        };
+                        if drift_rate < MIN_DRIFT_RATE_PER_SEC {
+                            warn!(
+                                "❌ Force-complete rejected: drift rate {:.1}%/s < {:.1}%/s min (curve drift, not lane change)",
+                                drift_rate, MIN_DRIFT_RATE_PER_SEC
+                            );
+                            self.adaptive_baseline.unfreeze();
+                            self.reset_lane_change();
+                            self.cooldown_remaining = 60;
+                            return None;
+                        }
                         info!(
-                            "⏰ Long DRIFTING ({:.0}ms) with offset ({:.1}%) - auto-completing",
+                            "⏰ Long DRIFTING ({:.0}ms) with offset ({:.1}%), rate={:.1}%/s — auto-completing",
                             elapsed,
-                            self.max_offset_in_change * 100.0
+                            self.max_offset_in_change * 100.0,
+                            drift_rate
                         );
                         return self.force_complete(frame_id, timestamp_ms);
                     } else {
-                        warn!("⏰ Timeout with low offset - cancelling");
+                        warn!("⏰ Timeout with low offset — cancelling");
                         self.adaptive_baseline.unfreeze();
                         self.reset_lane_change();
                         self.cooldown_remaining = 30;
@@ -866,6 +894,23 @@ impl LaneChangeStateMachine {
                 if elapsed > self.config.max_duration_ms {
                     // 🔧 Use LOW_OFFSET_THRESHOLD instead of MEDIUM
                     if self.max_offset_in_change >= LOW_OFFSET_THRESHOLD {
+                        // 🔧 Reject gradual curve drift here too
+                        let drift_duration_s = (elapsed / 1000.0) as f32;
+                        let drift_rate = if drift_duration_s > 0.0 {
+                            (self.max_offset_in_change * 100.0) / drift_duration_s
+                        } else {
+                            999.0
+                        };
+                        if drift_rate < MIN_DRIFT_RATE_PER_SEC {
+                            warn!(
+                                "❌ Timeout force-complete rejected: drift rate {:.1}%/s < {:.1}%/s min (curve drift)",
+                                drift_rate, MIN_DRIFT_RATE_PER_SEC
+                            );
+                            self.adaptive_baseline.unfreeze();
+                            self.reset_lane_change();
+                            self.cooldown_remaining = 60;
+                            return None;
+                        }
                         return self.force_complete(frame_id, timestamp_ms);
                     }
                     warn!(
@@ -1142,6 +1187,24 @@ impl LaneChangeStateMachine {
         }
 
         // LOW offset — 🔧 accept 2-of-3 instead of requiring ALL
+        // 🔧 But first: reject slow drift that indicates curve-following, not lane change
+        let drift_duration_s = (duration / 1000.0) as f32;
+        let drift_rate = if drift_duration_s > 0.0 {
+            (self.max_offset_in_change * 100.0) / drift_duration_s
+        } else {
+            999.0
+        };
+        if drift_rate < MIN_DRIFT_RATE_PER_SEC {
+            warn!(
+                "❌ Rejected: LOW offset {:.1}% over {:.1}s = {:.1}%/s drift rate (< {:.1}%/s min — curve drift)",
+                self.max_offset_in_change * 100.0,
+                drift_duration_s,
+                drift_rate,
+                MIN_DRIFT_RATE_PER_SEC
+            );
+            return false;
+        }
+
         let has_duration = duration >= MIN_DURATION_LOW;
         let has_trajectory = trajectory_analysis.is_valid_overtake;
         let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
@@ -1153,12 +1216,13 @@ impl LaneChangeStateMachine {
 
         if conditions_met >= 2 {
             info!(
-                "✅ Valid: lower offset {:.1}%, {}/3 conditions met (dur={} traj={} disp={})",
+                "✅ Valid: lower offset {:.1}%, {}/3 conditions met (dur={} traj={} disp={}), rate={:.1}%/s",
                 self.max_offset_in_change * 100.0,
                 conditions_met,
                 if has_duration { "✓" } else { "✗" },
                 if has_trajectory { "✓" } else { "✗" },
-                if has_displacement { "✓" } else { "✗" }
+                if has_displacement { "✓" } else { "✗" },
+                drift_rate
             );
             return true;
         }
@@ -1789,3 +1853,4 @@ impl LaneChangeStateMachine {
         self.source_id = source_id;
     }
 }
+
