@@ -58,6 +58,31 @@ impl LineLegality {
     pub fn is_illegal(&self) -> bool {
         matches!(self, LineLegality::Illegal | LineLegality::CriticalIllegal)
     }
+
+    /// Get all detected road markings for a frame (for cross-validation)
+    pub fn get_markings_only(
+        &mut self,
+        frame: &[u8],
+        width: usize,
+        height: usize,
+        confidence_threshold: f32,
+    ) -> Result<Vec<DetectedRoadMarking>> {
+        let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
+        let (box_output, mask_proto, _) = self.infer(&input)?;
+
+        self.postprocess(
+            &box_output,
+            &mask_proto,
+            &[],
+            scale,
+            pad_x,
+            pad_y,
+            width,
+            height,
+            confidence_threshold,
+            frame,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

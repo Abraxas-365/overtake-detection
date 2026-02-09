@@ -1,11 +1,12 @@
 // src/main.rs
 //
-// Production-ready overtake detection pipeline v2.4
+// Production-ready overtake detection pipeline v2.5 - PHASE 2 INTEGRATED
 //
 // Changes:
 //   ✅ Dynamic Model Mixing (Smart Scheduling)
 //   ✅ Smart Frame Selection Integration (Critical Frame Targeting)
-//   ✅ 🆕 FALLBACK POSITION ESTIMATOR (YOLO-based lane-blind detection)
+//   ✅ Fallback Position Estimator (YOLO-based lane-blind detection)
+//   ✅ 🆕 PHASE 2: Cross-Validation System (UFLDv2 + YOLOv8-seg fusion)
 //
 
 mod analysis;
@@ -19,10 +20,14 @@ mod preprocessing;
 mod shadow_overtake;
 mod types;
 mod vehicle_detection;
-mod video_processor; // 🆕 FALLBACK
+mod video_processor;
 
-use analysis::fallback_estimator::{EstimationSource, FallbackPositionEstimator}; // 🆕 FALLBACK
+use analysis::fallback_estimator::{EstimationSource, FallbackPositionEstimator};
 use analysis::LaneChangeAnalyzer;
+// 🆕 PHASE 2 IMPORTS
+use analysis::model_agreement::estimate_offset_from_markings;
+use analysis::{AgreementChecker, InferenceScheduler};
+
 use anyhow::{Context, Result};
 use frame_buffer::{
     build_legality_request, print_legality_request, save_legality_request_to_file,
@@ -39,7 +44,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use types::{
     CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent, VehicleState,
-}; // 🆕 Added VehicleState
+};
 use vehicle_detection::YoloDetector;
 
 // ============================================================================
@@ -258,7 +263,7 @@ impl Default for LegalityAnalysisConfig {
 struct ProcessingStats {
     total_frames: u64,
     frames_with_position: u64,
-    frames_with_fallback: u64, // 🆕 FALLBACK
+    frames_with_fallback: u64,
     lane_changes_detected: usize,
     complete_overtakes: usize,
     incomplete_overtakes: usize,
@@ -273,6 +278,10 @@ struct ProcessingStats {
     critical_violations: usize,
     duration_secs: f64,
     avg_fps: f64,
+    // 🆕 PHASE 2 stats
+    agreement_rate: f32,
+    yolo_invocations: u64,
+    yolo_frequency: f32,
 }
 
 // ============================================================================
@@ -290,7 +299,7 @@ async fn main() -> Result<()> {
         .with_thread_ids(true)
         .init();
 
-    info!("🚗 Lane Change Detection System Starting (production mode v2.4 - Fallback enabled)");
+    info!("🚗 Lane Change Detection System Starting (v2.5 - Phase 2 Cross-Validation)");
 
     let config = types::Config::load("config.yaml").context("Failed to load config.yaml")?;
     validate_config(&config)?;
@@ -489,10 +498,16 @@ async fn process_video(
     let mut velocity_tracker = crate::analysis::velocity_tracker::LateralVelocityTracker::new();
     info!("✓ Velocity tracker ready");
 
-    // 🆕 FALLBACK: Initialize fallback position estimator
     let mut fallback_estimator =
         FallbackPositionEstimator::new(reader.width as f32, reader.height as f32);
     info!("✓ Fallback position estimator ready");
+
+    // 🆕 PHASE 2: Initialize cross-validation system
+    let mut agreement_checker = AgreementChecker::new();
+    info!("✓ Agreement checker ready");
+
+    let mut inference_scheduler = InferenceScheduler::new();
+    info!("✓ Inference scheduler ready");
 
     let mut legality_buffer = LegalityRingBuffer::new(300);
     info!("✓ Legality ring buffer ready (capacity: 300 frames)");
@@ -514,7 +529,7 @@ async fn process_video(
     let mut simple_lane_changes: usize = 0;
     let mut frame_count: u64 = 0;
     let mut frames_with_valid_position: u64 = 0;
-    let mut frames_with_fallback: u64 = 0; // 🆕 FALLBACK
+    let mut frames_with_fallback: u64 = 0;
     let mut events_sent_to_api: usize = 0;
     let mut curves_detected: usize = 0;
     let mut total_vehicles_detected: usize = 0;
@@ -529,7 +544,6 @@ async fn process_video(
     let mut last_right_lane_x: Option<f32> = None;
     let mut current_overtake_vehicles: Vec<overtake_analyzer::OvertakeEvent> = Vec::new();
 
-    // 🆕 FALLBACK: Cache latest detections for fallback
     let mut latest_vehicle_detections: Vec<vehicle_detection::Detection> = Vec::new();
 
     // ═════════════════════════════════════════════════════════════════
@@ -556,7 +570,6 @@ async fn process_video(
         let is_maneuver_active =
             analyzer.current_state() == "DRIFTING" || analyzer.current_state() == "CROSSING";
 
-        // 🆕 FALLBACK: Also run legality if fallback needs fresh road marking data
         let is_blind = fallback_estimator.frames_without_primary() > 10;
 
         let vehicle_inference_interval = 3;
@@ -564,7 +577,7 @@ async fn process_video(
 
         let legality_inference_interval = config.lane_legality.inference_interval;
         let should_run_legality = if is_maneuver_active || is_blind {
-            true // Run every frame during maneuvers OR when lane detector is blind
+            true
         } else {
             frame_count % legality_inference_interval == 0
         };
@@ -573,7 +586,7 @@ async fn process_video(
         if should_run_vehicles {
             match yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
                 Ok(detections) => {
-                    latest_vehicle_detections = detections.clone(); // 🆕 FALLBACK: Cache
+                    latest_vehicle_detections = detections.clone();
                     total_vehicles_detected += detections.len();
                     overtake_analyzer.update(detections, frame_count);
 
@@ -723,7 +736,7 @@ async fn process_video(
                 "Progress: {:.1}% | State: {} | Fallback: {} | Shadow: {}",
                 reader.progress(),
                 analyzer.current_state(),
-                fallback_estimator.active_source().as_str(), // 🆕 FALLBACK
+                fallback_estimator.active_source().as_str(),
                 if shadow_detector.is_monitoring() {
                     "YES"
                 } else {
@@ -733,7 +746,7 @@ async fn process_video(
         }
 
         // ═════════════════════════════════════════════════════════════════════
-        // 🆕 FALLBACK: PRIMARY LANE DETECTION WITH FALLBACK CASCADE
+        // PRIMARY LANE DETECTION WITH FALLBACK CASCADE + PHASE 2 FUSION
         // ═════════════════════════════════════════════════════════════════════
 
         match process_frame(
@@ -764,7 +777,11 @@ async fn process_video(
                     frame_buffer.add_to_pre_buffer(frame.clone());
                 }
 
-                // Try primary analysis
+                // ═══════════════════════════════════════════════════════════
+                // 🆕 PHASE 2: CROSS-VALIDATION SYSTEM
+                // ═══════════════════════════════════════════════════════════
+
+                // Get primary UFLDv2 result
                 let event_opt = analyzer.analyze(
                     &analysis_lanes,
                     frame.width as u32,
@@ -773,13 +790,97 @@ async fn process_video(
                     timestamp_ms,
                 );
 
-                // 🆕 FALLBACK: Check if primary succeeded or failed
+                // Get UFLDv2 vehicle state
+                let ufld_state = analyzer.last_vehicle_state();
+
+                // Get confidence levels for scheduling
+                let ufld_conf = ufld_state.map(|s| s.detection_confidence).unwrap_or(0.0);
+                let baseline_conf = 0.8; // TODO: Integrate with baseline_confidence when ready
+
+                // Decide if we should run YOLOv8-seg validation
+                let should_validate = inference_scheduler.should_run_yolo(
+                    ufld_conf,
+                    baseline_conf,
+                    is_maneuver_active,
+                    0, // TODO: Track frames_since_occlusion
+                );
+
+                // Run cross-validation if scheduled
+                let mut yolo_offset: Option<f32> = None;
+                let mut yolo_confidence = 0.0;
+
+                if should_validate && legality_detector.is_some() {
+                    if let Some(ref mut detector) = legality_detector {
+                        match detector.get_markings_only(
+                            &frame.data,
+                            frame.width,
+                            frame.height,
+                            config.lane_legality.confidence_threshold,
+                        ) {
+                            Ok(markings) => {
+                                if let Some((offset, conf)) = estimate_offset_from_markings(
+                                    &markings,
+                                    left_x,
+                                    right_x,
+                                    frame.width as f32,
+                                ) {
+                                    yolo_offset = Some(offset);
+                                    yolo_confidence = conf;
+                                }
+                            }
+                            Err(e) => debug!("YOLOv8-seg markings failed: {}", e),
+                        }
+                    }
+                }
+
+                // Perform fusion
+                if let Some(state) = ufld_state {
+                    let fused =
+                        agreement_checker.fuse_estimates(state, yolo_offset, yolo_confidence);
+
+                    // Log significant events
+                    if should_validate && yolo_offset.is_some() {
+                        use analysis::model_agreement::AgreementLevel;
+                        match fused.agreement_level {
+                            AgreementLevel::CriticalDisagreement => {
+                                warn!(
+                                    "⚠️  Critical disagreement: diff={:.1}px, using {}",
+                                    fused.position_diff_px,
+                                    fused.primary_source.as_str()
+                                );
+                            }
+                            AgreementLevel::Disagreement => {
+                                debug!(
+                                    "❌ Disagreement: diff={:.1}px, conf={:.2}",
+                                    fused.position_diff_px, fused.confidence
+                                );
+                            }
+                            _ => {
+                                debug!(
+                                    "✅ {:?}, source={}, conf={:.2}",
+                                    fused.agreement_level,
+                                    fused.primary_source.as_str(),
+                                    fused.confidence
+                                );
+                            }
+                        }
+                    }
+
+                    // NOTE: For now, we just log fusion results for validation
+                    // In full integration, you would use fused.lateral_offset
+                    // to override UFLDv2 estimates when confidence is low
+                }
+
+                // ═══════════════════════════════════════════════════════════
+                // END PHASE 2 INTEGRATION
+                // ═══════════════════════════════════════════════════════════
+
+                // Check if primary succeeded or failed
                 let primary_succeeded = analyzer
                     .last_vehicle_state()
                     .map_or(false, |vs| vs.is_valid());
 
                 if primary_succeeded {
-                    // ✅ PRIMARY SUCCESS: Sync fallback systems
                     if let Some(vs) = analyzer.last_vehicle_state() {
                         fallback_estimator.sync_from_primary(
                             vs.lateral_offset,
@@ -789,7 +890,7 @@ async fn process_video(
                     }
                     frames_with_valid_position += 1;
                 } else {
-                    // ❌ PRIMARY FAILED: Try fallback estimation
+                    // PRIMARY FAILED: Try fallback estimation
                     let road_markings = legality_buffer
                         .latest()
                         .map(|r| r.all_markings.clone())
@@ -802,20 +903,15 @@ async fn process_video(
                     ) {
                         frames_with_fallback += 1;
 
-                        // 🔒 GATED FALLBACK: Only use for tracking ongoing maneuvers, NOT initiating new ones
                         let current_state = analyzer.current_state();
                         let is_already_maneuvering =
                             current_state == "DRIFTING" || current_state == "CROSSING";
 
-                        // Only feed fallback state if:
-                        // 1. We're already in a maneuver (tracking mode), OR
-                        // 2. Fallback has very high confidence (>0.75) AND strong lateral velocity
                         let allow_fallback = is_already_maneuvering
                             || (fallback.confidence > 0.75
                                 && fallback_estimator.fallback_lateral_velocity.abs() > 200.0);
 
                         if allow_fallback {
-                            // Create synthetic VehicleState from fallback
                             let synthetic_state = VehicleState {
                                 lateral_offset: fallback.lateral_offset,
                                 lane_width: Some(fallback.lane_width),
@@ -827,14 +923,12 @@ async fn process_video(
                                 both_lanes_detected: false,
                             };
 
-                            // Feed to state machine
                             if fallback.confidence > 0.25 {
                                 if let Some(mut fallback_event) = analyzer.analyze_with_state(
                                     &synthetic_state,
                                     frame_count,
                                     timestamp_ms,
                                 ) {
-                                    // Tag event with fallback metadata
                                     fallback_event.metadata.insert(
                                         "detection_source".to_string(),
                                         serde_json::json!(fallback.source.as_str()),
@@ -844,7 +938,6 @@ async fn process_video(
                                         serde_json::json!(fallback.confidence),
                                     );
 
-                                    // Process like a normal event
                                     lane_changes_count += 1;
                                     info!(
                                         "🔶 FALLBACK LANE CHANGE: {} at {:.2}s ({}, conf={:.2})",
@@ -879,7 +972,6 @@ async fn process_video(
                                 }
                             }
                         } else if !is_already_maneuvering {
-                            // Primary failed, fallback not confident enough → suppress noise
                             debug!(
                                 "🔇 Fallback suppressed (state={}, conf={:.2}, vel={:.1}px/s)",
                                 current_state,
@@ -897,7 +989,7 @@ async fn process_video(
                     }
                 }
 
-                // Process primary event if it exists (unchanged)
+                // Process primary event if it exists
                 if let Some(event) = event_opt {
                     lane_changes_count += 1;
                     info!(
@@ -1082,10 +1174,14 @@ async fn process_video(
     };
     let unique_vehicles = overtake_analyzer.get_total_unique_vehicles();
 
+    // 🆕 PHASE 2: Get cross-validation statistics
+    let agreement_stats = agreement_checker.get_stats();
+    let scheduler_stats = inference_scheduler.get_stats();
+
     Ok(ProcessingStats {
         total_frames: frame_count,
         frames_with_position: frames_with_valid_position,
-        frames_with_fallback, // 🆕 FALLBACK
+        frames_with_fallback,
         lane_changes_detected: lane_changes_count,
         complete_overtakes,
         incomplete_overtakes,
@@ -1100,11 +1196,15 @@ async fn process_video(
         critical_violations,
         duration_secs: duration.as_secs_f64(),
         avg_fps,
+        // 🆕 PHASE 2 stats
+        agreement_rate: agreement_stats.agreement_rate,
+        yolo_invocations: scheduler_stats.yolo_invocations,
+        yolo_frequency: scheduler_stats.yolo_frequency,
     })
 }
 
 // ============================================================================
-// 🆕 HELPER: Process Lane Change Event (Extracted for DRY)
+// HELPER: Process Lane Change Event (Extracted for DRY)
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
@@ -1279,7 +1379,7 @@ async fn process_lane_change_event(
 }
 
 // ============================================================================
-// HELPERS (unchanged from original)
+// HELPERS
 // ============================================================================
 
 fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResult) {
@@ -1589,7 +1689,6 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.frames_with_position,
         100.0 * stats.frames_with_position as f64 / stats.total_frames.max(1) as f64
     );
-    // 🆕 FALLBACK stats
     info!(
         "  🔶 Fallback estimation: {} frames ({:.1}%)",
         stats.frames_with_fallback,
@@ -1662,4 +1761,24 @@ fn print_final_stats(stats: &ProcessingStats) {
         "  Processing: {:.1} FPS ({:.1}s total)",
         stats.avg_fps, stats.duration_secs
     );
+
+    // 🆕 PHASE 2: Print cross-validation statistics
+    info!("\n╔════════════════════════════════════════════════════════╗");
+    info!("║         PHASE 2 CROSS-VALIDATION STATISTICS           ║");
+    info!("╠════════════════════════════════════════════════════════╣");
+    info!(
+        "║ Agreement Rate: {:.1}%                                  ",
+        stats.agreement_rate * 100.0
+    );
+    info!("╠════════════════════════════════════════════════════════╣");
+    info!(
+        "║ YOLOv8-seg Invocations: {} / {}                       ",
+        stats.yolo_invocations, stats.total_frames
+    );
+    info!(
+        "║ YOLOv8-seg Frequency: {:.1}%                             ",
+        stats.yolo_frequency * 100.0
+    );
+    info!("╚════════════════════════════════════════════════════════╝\n");
 }
+
