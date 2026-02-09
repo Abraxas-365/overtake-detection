@@ -719,7 +719,9 @@ fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<Dete
     if dets.is_empty() {
         return dets;
     }
+    // Sort by confidence (descending)
     dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
     let mut keep = Vec::new();
     let mut suppressed_indices = HashSet::new();
 
@@ -728,15 +730,6 @@ fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<Dete
             continue;
         }
         let current = &dets[i];
-
-        // Priority: Mixed (99) > Double (7,8) > Single (4,5,9,10)
-        let prio_curr = if current.class_id == 99 {
-            3
-        } else if matches!(current.class_id, 7 | 8) {
-            2
-        } else {
-            1
-        };
         let mut should_keep_current = true;
 
         for j in 0..dets.len() {
@@ -747,21 +740,22 @@ fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<Dete
             let iou = calculate_iou_arr(&current.bbox, &other.bbox);
 
             if iou > iou_thresh {
-                let prio_other = if other.class_id == 99 {
-                    3
-                } else if matches!(other.class_id, 7 | 8) {
-                    2
-                } else {
-                    1
-                };
+                // FIXED: Prioritize "Mixed" lines (Class 99) but otherwise respect confidence.
+                // The old logic prioritized "Double" lines over "Single" regardless of confidence,
+                // causing high-confidence white lines to be hidden by low-confidence yellow hallucinations.
 
-                if prio_curr > prio_other {
-                    suppressed_indices.insert(j);
-                } else if prio_curr < prio_other {
+                let is_curr_mixed = current.class_id == 99;
+                let is_other_mixed = other.class_id == 99;
+
+                if is_other_mixed && !is_curr_mixed {
+                    // If the other detection is a "Merged" line (Double+Dashed), it contains more info.
+                    // Even if `current` has higher confidence, the Mixed line is the "true" complete structure.
                     should_keep_current = false;
                     break;
                 } else {
-                    suppressed_indices.insert(j); // Same priority, keep higher confidence (current)
+                    // Otherwise, `current` is either Mixed itself, or it's a standard class with higher confidence
+                    // (since the list is sorted). We keep `current` and suppress `other`.
+                    suppressed_indices.insert(j);
                 }
             }
         }
