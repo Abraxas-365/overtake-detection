@@ -611,32 +611,9 @@ async fn process_video(
         // 2. FALLBACK TO UFLDv2 (If YOLO failed)
         // -----------------------------------------------------
         if analysis_lanes.is_empty() {
-            detection_source = "UFLD_FALLBACK";
-            ufld_fallback_count += 1;
-
-            // Run existing UFLD inference
-            match process_frame(
-                &frame,
-                inference_engine,
-                config,
-                config.detection.min_lane_confidence,
-            )
-            .await
-            {
-                Ok(detected_lanes) => {
-                    detected_lanes_for_draw = detected_lanes.clone();
-                    if !detected_lanes.is_empty() {
-                        analysis_lanes = detected_lanes
-                            .iter()
-                            .enumerate()
-                            .map(|(i, dl)| Lane::from_detected(i, dl))
-                            .collect();
-                    }
-                }
-                Err(e) => {
-                    // error!("UFLD Inference failed: {}", e);
-                }
-            }
+            detection_source = "YOLO_MISS";
+            ufld_fallback_count += 1; // counts as a miss now
+                                      // Intentionally empty — isolating pure YOLO-seg performance
         }
 
         // ═════════════════════════════════════════════════════════════════════
