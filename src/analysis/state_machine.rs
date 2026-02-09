@@ -1,10 +1,11 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v3.8 - BLACKOUT RECOVERY
+// LANE CHANGE DETECTION v3.8.1 - BLACKOUT RECOVERY (FIXED)
 //
-// v3.8: Added blackout recovery to detect lane changes that occur during
-//       lane detection failures (e.g., desert road curves with poor markings).
-//       Infers lane changes by detecting position jumps when lanes reappear.
+// v3.8.1: Fixed 3 critical bugs from v3.8:
+//   1. reset_blackout_state() no longer corrupts adaptive_baseline.frames_without_lanes
+//   2. Blackout recovery uses SEPARATE counter (not baseline's shared counter)
+//   3. Kalman filter no longer double-updated on recovery frames
 //
 
 use super::boundary_detector::CrossingType;
@@ -358,7 +359,6 @@ impl AdaptiveBaseline {
 
         self.sample_count += 1;
 
-        // Check for recovery from blackout
         if self.frames_without_lanes > OCCLUSION_SHORT_THRESHOLD {
             info!(
                 "🚨 Fast recovery mode after {}s occlusion",
@@ -662,7 +662,7 @@ enum DetectionPath {
     LargeDeviation,
     VelocitySpike,
     PostOcclusion,
-    BlackoutRecovery, // NEW
+    BlackoutRecovery,
 }
 
 // ============================================================================
@@ -686,7 +686,7 @@ impl ConfidenceCalculator {
             Some(DetectionPath::BoundaryCrossing) => 0.05,
             Some(DetectionPath::HighVelocity) => 0.03,
             Some(DetectionPath::PostOcclusion) => 0.02,
-            Some(DetectionPath::BlackoutRecovery) => 0.00, // Medium confidence for inferred
+            Some(DetectionPath::BlackoutRecovery) => 0.00,
             _ => 0.0,
         };
 
@@ -776,10 +776,12 @@ pub struct LaneChangeStateMachine {
     pending_change_direction: Direction,
     pending_max_offset: f32,
 
-    // NEW: Blackout recovery tracking
+    // 🔧 FIX 1: Blackout uses its OWN counter, completely separate from baseline
     in_blackout: bool,
+    blackout_consecutive_frames: u32,
     position_before_blackout: Option<f32>,
     blackout_started_frame: Option<u64>,
+    blackout_started_time: Option<f64>,
 }
 
 impl LaneChangeStateMachine {
@@ -820,12 +822,15 @@ impl LaneChangeStateMachine {
             pending_change_direction: Direction::Unknown,
             pending_max_offset: 0.0,
 
-            // NEW
+            // 🔧 FIX 1: Separate blackout state
             in_blackout: false,
+            blackout_consecutive_frames: 0,
             position_before_blackout: None,
             blackout_started_frame: None,
+            blackout_started_time: None,
         }
     }
+
     pub fn update(
         &mut self,
         vehicle_state: &VehicleState,
@@ -856,7 +861,6 @@ impl LaneChangeStateMachine {
             return Some(event);
         }
 
-        // Mark occlusion before early return
         if !vehicle_state.is_valid() {
             self.adaptive_baseline.mark_no_lanes();
             return None;
@@ -954,71 +958,14 @@ impl LaneChangeStateMachine {
         self.is_in_curve
     }
 
+    // 🔧 FIX 1: Does NOT touch adaptive_baseline.frames_without_lanes
     fn reset_blackout_state(&mut self) {
         self.in_blackout = false;
+        self.blackout_consecutive_frames = 0;
         self.position_before_blackout = None;
         self.blackout_started_frame = None;
-        self.adaptive_baseline.frames_without_lanes = 0;
+        self.blackout_started_time = None;
     }
-
-    fn create_blackout_inferred_event(
-        &self,
-        direction: Direction,
-        start_pos: f32,
-        end_pos: f32,
-        blackout_frames: u32,
-        current_frame: u64,
-    ) -> LaneChangeEvent {
-        let start_frame = self
-            .blackout_started_frame
-            .unwrap_or(current_frame - blackout_frames as u64);
-        let duration_ms = (blackout_frames as f64 / 30.0) * 1000.0;
-        let start_time = (start_frame as f64 / 30.0) * 1000.0;
-
-        let max_offset = end_pos.abs().max(start_pos.abs());
-        let trajectory_analysis = OvertakeAnalysis {
-            excursion_sufficient: true,
-            returned_to_start: false,
-            is_smooth: false,
-            has_reversal: false,
-            shape_score: 0.5,
-            smoothness: 0.0,
-            is_valid_overtake: true,
-        };
-
-        let confidence = ConfidenceCalculator::calculate(
-            max_offset,
-            duration_ms,
-            &trajectory_analysis,
-            Some(DetectionPath::BlackoutRecovery),
-        );
-
-        let mut event = LaneChangeEvent::new(
-            start_time,
-            start_frame,
-            current_frame,
-            direction,
-            confidence * 0.8, // Reduce confidence for inferred events
-        );
-        event.duration_ms = Some(duration_ms);
-        event.source_id = self.source_id.clone();
-        event.metadata.insert(
-            "detection_path".to_string(),
-            serde_json::json!("BlackoutRecovery"),
-        );
-        event.metadata.insert(
-            "blackout_frames".to_string(),
-            serde_json::json!(blackout_frames),
-        );
-        event.metadata.insert(
-            "position_jump".to_string(),
-            serde_json::json!((end_pos - start_pos).abs()),
-        );
-
-        event
-    }
-
-    // ... [Continue with rest of the methods - I'll include the key modified ones]
 
     fn handle_timeouts(&mut self, frame_id: u64, timestamp_ms: f64) -> Option<LaneChangeEvent> {
         if self.state == LaneChangeState::Drifting {
@@ -2021,7 +1968,7 @@ impl LaneChangeStateMachine {
     }
 
     // ============================================================================
-    // MAIN UPDATE METHOD WITH BLACKOUT RECOVERY
+    // update_perfect WITH BLACKOUT RECOVERY (FIXED)
     // ============================================================================
 
     pub fn update_perfect(
@@ -2055,28 +2002,31 @@ impl LaneChangeStateMachine {
         }
 
         // ============================================================
-        // 🆕 BLACKOUT RECOVERY LOGIC
+        // BLACKOUT TRACKING
+        // 🔧 FIX 2: Uses blackout_consecutive_frames (OWN counter)
+        //            NOT adaptive_baseline.frames_without_lanes
         // ============================================================
 
         if !vehicle_state.is_valid() {
-            // Lanes not detected this frame
-            self.adaptive_baseline.mark_no_lanes();
+            self.adaptive_baseline.mark_no_lanes(); // Baseline manages itself
+            self.blackout_consecutive_frames += 1; // Our own independent counter
 
-            // Enter blackout state
+            // Enter blackout state after sustained gap
             if !self.in_blackout
-                && self.adaptive_baseline.frames_without_lanes
-                    >= self.config.blackout_detection_frames
+                && self.blackout_consecutive_frames >= self.config.blackout_detection_frames
                 && self.config.enable_blackout_recovery
             {
                 self.in_blackout = true;
                 self.blackout_started_frame = Some(frame_id);
+                self.blackout_started_time = Some(timestamp_ms);
 
-                // Store last known position before blackout
+                // Store last known FILTERED position
                 if let Some(last_pos) = self.position_filter.get_last_value() {
                     self.position_before_blackout = Some(last_pos);
                     warn!(
-                        "⚫ Blackout started at frame {} (position before: {:.1}%)",
+                        "⚫ Blackout started at frame {} ({:.1}s), position before: {:.1}%",
                         frame_id,
+                        timestamp_ms / 1000.0,
                         last_pos * 100.0
                     );
                 }
@@ -2085,61 +2035,125 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        // Lanes detected - check if recovering from blackout
+        // ============================================================
+        // BLACKOUT RECOVERY CHECK
+        // 🔧 FIX 3: Does NOT call position_filter.update() here.
+        //            Only peeks at the raw value. Normal processing
+        //            below will do the actual Kalman update.
+        // ============================================================
+
         if self.in_blackout && self.config.enable_blackout_recovery {
-            let blackout_duration = self.adaptive_baseline.frames_without_lanes;
+            let blackout_frames = self.blackout_consecutive_frames;
+
+            // 🔧 FIX 3: Peek at raw position WITHOUT updating Kalman filter
             let lane_width = vehicle_state.lane_width.unwrap_or(450.0);
-            let raw_offset = vehicle_state.lateral_offset / lane_width;
-            let new_position = self.position_filter.update(raw_offset);
+            let raw_new_position = vehicle_state.lateral_offset / lane_width;
 
             if let Some(old_position) = self.position_before_blackout {
-                let position_delta = (new_position - old_position).abs();
+                let position_delta = (raw_new_position - old_position).abs();
 
                 info!(
-                    "🔄 Recovered from {}-frame blackout: {:.1}% → {:.1}% (Δ={:.1}%)",
-                    blackout_duration,
+                    "🔄 Recovered from {}-frame ({:.1}s) blackout: {:.1}% → {:.1}% (Δ={:.1}%)",
+                    blackout_frames,
+                    blackout_frames as f32 / 30.0,
                     old_position * 100.0,
-                    new_position * 100.0,
+                    raw_new_position * 100.0,
                     position_delta * 100.0
                 );
 
-                // Detect lane change during blackout
-                if position_delta >= self.config.blackout_jump_threshold {
-                    let direction = if new_position > old_position {
+                // Only infer lane change if:
+                //  1. Jump is large enough
+                //  2. Blackout was genuinely long (not a brief flicker)
+                if position_delta >= self.config.blackout_jump_threshold
+                    && blackout_frames >= self.config.blackout_detection_frames * 2
+                {
+                    let direction = if raw_new_position > old_position {
                         Direction::Right
                     } else {
                         Direction::Left
                     };
 
                     warn!(
-                        "🎯 INFERRED LANE CHANGE during blackout: {} (jump: {:.1}%)",
+                        "🎯 INFERRED LANE CHANGE during {}-frame blackout: {} (Δ={:.1}%)",
+                        blackout_frames,
                         direction.as_str(),
                         position_delta * 100.0
                     );
 
-                    let event = self.create_blackout_inferred_event(
-                        direction,
-                        old_position,
-                        new_position,
-                        blackout_duration,
+                    let start_time = self.blackout_started_time.unwrap_or(timestamp_ms);
+                    let start_frame = self.blackout_started_frame.unwrap_or(frame_id);
+                    let duration_ms = timestamp_ms - start_time;
+
+                    let trajectory_analysis = OvertakeAnalysis {
+                        excursion_sufficient: true,
+                        returned_to_start: false,
+                        is_smooth: false,
+                        has_reversal: false,
+                        shape_score: 0.5,
+                        smoothness: 0.0,
+                        is_valid_overtake: true,
+                    };
+
+                    let confidence = ConfidenceCalculator::calculate(
+                        position_delta,
+                        duration_ms,
+                        &trajectory_analysis,
+                        Some(DetectionPath::BlackoutRecovery),
+                    ) * 0.75; // Reduce confidence for inferred events
+
+                    let mut event = LaneChangeEvent::new(
+                        start_time,
+                        start_frame,
                         frame_id,
+                        direction,
+                        confidence,
+                    );
+                    event.duration_ms = Some(duration_ms);
+                    event.source_id = self.source_id.clone();
+                    event.metadata.insert(
+                        "detection_path".to_string(),
+                        serde_json::json!("BlackoutRecovery"),
+                    );
+                    event.metadata.insert(
+                        "blackout_frames".to_string(),
+                        serde_json::json!(blackout_frames),
+                    );
+                    event.metadata.insert(
+                        "position_jump".to_string(),
+                        serde_json::json!(position_delta),
                     );
 
-                    // Reset states
-                    self.reset_blackout_state();
-                    self.adaptive_baseline.reset_to(new_position);
+                    info!(
+                        "✅ BLACKOUT CONFIRMED: {} at {:.2}s, dur={:.0}ms, jump={:.1}%, conf={:.2}",
+                        direction.as_str(),
+                        start_time / 1000.0,
+                        duration_ms,
+                        position_delta * 100.0,
+                        confidence
+                    );
+
+                    // Seed baseline at recovered position
+                    self.adaptive_baseline.reset_to(raw_new_position);
+                    self.position_filter.reset();
+                    self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
+                    self.offset_samples.clear();
                     self.cooldown_remaining = self.config.cooldown_frames;
+                    self.reset_lane_change();
+                    self.reset_blackout_state();
 
                     return Some(event);
                 }
             }
 
-            // Reset blackout tracking
+            // No jump detected — clear blackout, continue normally
             self.reset_blackout_state();
         }
 
+        // Reset consecutive counter on valid frame
+        self.blackout_consecutive_frames = 0;
+
         // ============================================================
-        // NORMAL PROCESSING CONTINUES
+        // NORMAL PROCESSING (identical to v3.7)
         // ============================================================
 
         let lane_width = vehicle_state.lane_width.unwrap_or(450.0);
