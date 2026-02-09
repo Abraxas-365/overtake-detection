@@ -1,6 +1,6 @@
 // src/types.rs
 
-use anyhow::Context; // 🆕 ADDED THIS LINE
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,8 +85,17 @@ pub struct DetectionConfig {
     pub skip_initial_frames: u64,
     #[serde(default = "default_require_both_lanes")]
     pub require_both_lanes: bool,
+
+    // NEW: Blackout recovery fields added here
+    #[serde(default = "default_blackout_frames")]
+    pub blackout_detection_frames: u32,
+    #[serde(default = "default_blackout_jump")]
+    pub blackout_jump_threshold: f32,
+    #[serde(default = "default_blackout_enable")]
+    pub enable_blackout_recovery: bool,
 }
 
+// Default value helper functions
 fn default_drift_threshold() -> f32 {
     0.30
 }
@@ -106,6 +115,17 @@ fn default_skip_initial() -> u64 {
     150
 }
 fn default_require_both_lanes() -> bool {
+    true
+}
+
+// Defaults for new blackout fields
+fn default_blackout_frames() -> u32 {
+    10
+}
+fn default_blackout_jump() -> f32 {
+    0.25
+}
+fn default_blackout_enable() -> bool {
     true
 }
 
@@ -552,8 +572,6 @@ impl LaneChangeEvent {
 // ============================================================================
 // Lane Change Config
 // ============================================================================
-// Lane Change Config
-// ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneChangeConfig {
@@ -568,6 +586,11 @@ pub struct LaneChangeConfig {
     pub max_duration_ms: f64,
     pub skip_initial_frames: u64,
     pub require_both_lanes: bool,
+
+    // Blackout recovery - detects lane changes during lane detection failures
+    pub blackout_detection_frames: u32,
+    pub blackout_jump_threshold: f32,
+    pub enable_blackout_recovery: bool,
 }
 
 impl Default for LaneChangeConfig {
@@ -584,6 +607,11 @@ impl Default for LaneChangeConfig {
             max_duration_ms: 5000.0,
             skip_initial_frames: 150,
             require_both_lanes: true,
+
+            // Blackout recovery defaults
+            blackout_detection_frames: 10,
+            blackout_jump_threshold: 0.25,
+            enable_blackout_recovery: true,
         }
     }
 }
@@ -602,6 +630,11 @@ impl LaneChangeConfig {
             max_duration_ms: detection.max_lane_change_duration_ms,
             skip_initial_frames: detection.skip_initial_frames,
             require_both_lanes: detection.require_both_lanes,
+
+            // Blackout recovery mapping
+            blackout_detection_frames: detection.blackout_detection_frames,
+            blackout_jump_threshold: detection.blackout_jump_threshold,
+            enable_blackout_recovery: detection.enable_blackout_recovery,
         }
     }
 }
