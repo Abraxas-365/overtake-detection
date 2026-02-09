@@ -1177,13 +1177,21 @@ impl LaneChangeStateMachine {
 
         let current_pos = self.offset_history.last().copied().unwrap_or(0.0);
         self.adaptive_baseline.reset_to(current_pos);
+
+        // 🔧 FIX: Lock baseline so it doesn't drift during cooldown/grace.
+        // Without this, the EWMA baseline tracks the vehicle back toward
+        // the original lane during the 90-frame cooldown + 90-frame grace,
+        // eating the deviation signal and preventing return detection.
+        // 300 frames ≈ 10s at 30fps — covers the typical return window.
+        self.adaptive_baseline.seed_lock_frames = 300;
+
         self.position_filter.reset();
         self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
         self.offset_samples.clear();
         self.cooldown_remaining = self.config.cooldown_frames;
 
         info!(
-            "🔄 Baseline seeded at {:.1}% — ready for return detection",
+            "🔄 Baseline seeded at {:.1}% with 300-frame lock — ready for return detection",
             current_pos * 100.0
         );
         self.reset_lane_change();
@@ -1719,12 +1727,22 @@ impl LaneChangeStateMachine {
         let current_pos = self.offset_history.last().copied().unwrap_or(0.0);
         self.adaptive_baseline.reset_to(current_pos);
 
+        // 🔧 FIX: Lock baseline so it doesn't drift during cooldown/grace.
+        // After a confirmed lane change (e.g. the initial LEFT of an overtake),
+        // the baseline must stay anchored at the overtaking-lane position.
+        // Otherwise the EWMA adaptation (α=0.015) causes the baseline to
+        // follow the vehicle back toward center during the grace period,
+        // suppressing the deviation and making the return RIGHT undetectable.
+        // 300 frames ≈ 10s at 30fps — long enough to catch the return.
+        self.adaptive_baseline.seed_lock_frames = 300;
+
         self.position_filter.reset();
         self.post_lane_change_grace = POST_CHANGE_GRACE_FRAMES;
         self.offset_samples.clear();
         self.cooldown_remaining = self.config.cooldown_frames;
+
         info!(
-            "🔄 Baseline seeded at {:.1}% — ready for return detection",
+            "🔄 Baseline seeded at {:.1}% with 300-frame lock — ready for return detection",
             current_pos * 100.0
         );
         self.reset_lane_change();
