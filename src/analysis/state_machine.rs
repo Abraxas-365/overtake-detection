@@ -171,6 +171,7 @@ struct AdaptiveBaseline {
     frames_without_lanes: u32,
     just_recovered_from_occlusion: bool,
     fast_recovery_frames: u32,
+    seed_lock_frames: u32,
 }
 
 impl AdaptiveBaseline {
@@ -190,6 +191,7 @@ impl AdaptiveBaseline {
             frames_without_lanes: 0,
             just_recovered_from_occlusion: false,
             fast_recovery_frames: 0,
+            seed_lock_frames: 0,
         }
     }
 
@@ -239,7 +241,14 @@ impl AdaptiveBaseline {
             }
         }
 
-        let alpha = if self.fast_recovery_frames > 0 {
+        // 🔧 NEW: Seed lock takes priority — keeps baseline anchored after lane change
+        let alpha = if self.seed_lock_frames > 0 {
+            self.seed_lock_frames -= 1;
+            if self.seed_lock_frames == 0 {
+                info!("🔓 Baseline seed lock expired");
+            }
+            0.0005 // Ultra-slow: baseline barely moves during return detection window
+        } else if self.fast_recovery_frames > 0 {
             self.fast_recovery_frames -= 1;
             if self.fast_recovery_frames == 0 {
                 self.just_recovered_from_occlusion = false;
@@ -298,6 +307,8 @@ impl AdaptiveBaseline {
         self.frames_without_lanes = 0;
         self.just_recovered_from_occlusion = false;
         self.fast_recovery_frames = 0;
+        self.seed_lock_frames = 0;
+
         info!("🎯 Baseline seeded at {:.1}%", initial_value * 100.0);
     }
 
@@ -352,7 +363,6 @@ impl AdaptiveBaseline {
     }
 
     fn update_guarded(&mut self, measurement: f32, confidence: f32) -> f32 {
-        // PRODUCTION FIX: If YOLO confidence is low, don't move the baseline.
         if confidence < 0.4 {
             self.frames_without_lanes += 1;
             return self.value;
@@ -365,28 +375,29 @@ impl AdaptiveBaseline {
             return self.frozen_value;
         }
 
-        // FIX: First sample after reset should SNAP to measurement,
-        // not blend with stale 0.0
         if self.sample_count == 1 {
             self.value = measurement;
             return self.value;
         }
 
-        // FIX: Use faster alpha during initial establishment phase,
-        // then slow down once baseline is stable.
-        // NO fast recovery here — that only belongs in update(), not update_guarded()
-        let alpha = if !self.is_valid {
-            EWMA_ALPHA_ADAPTING // 0.015 — 5x faster during establishment
+        // 🔧 NEW: Ultra-slow alpha during seed lock to keep baseline anchored
+        let alpha = if self.seed_lock_frames > 0 {
+            self.seed_lock_frames -= 1;
+            if self.seed_lock_frames == 0 {
+                info!("🔓 Baseline seed lock expired");
+            }
+            0.0005 // Barely moves: 29.3% → ~27% over 450 frames
+        } else if !self.is_valid {
+            EWMA_ALPHA_ADAPTING
         } else if self.is_adapting {
-            EWMA_ALPHA_ADAPTING // 0.015
+            EWMA_ALPHA_ADAPTING
         } else {
-            EWMA_ALPHA_STABLE // 0.003 — slow once locked in
+            EWMA_ALPHA_STABLE
         };
 
         self.value = alpha * measurement + (1.0 - alpha) * self.value;
         self.is_valid = self.sample_count >= EWMA_MIN_SAMPLES;
 
-        // Track variance for adapting/stable transition
         self.recent_samples.push_back(measurement);
         if self.recent_samples.len() > 30 {
             self.recent_samples.pop_front();
