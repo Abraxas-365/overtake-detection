@@ -839,7 +839,7 @@ async fn process_video(
                 &frame.data,
                 reader.width,
                 reader.height,
-                &final_analysis_lanes, // Make sure you are passing the FINAL lanes here!
+                &detected_lanes_for_draw, // Use the detected lanes for drawing
                 analyzer.current_state(),
                 analyzer.last_vehicle_state(),
                 overtake_analyzer.get_tracked_vehicles(),
