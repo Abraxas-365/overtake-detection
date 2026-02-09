@@ -380,13 +380,13 @@ impl AdaptiveBaseline {
             return self.value;
         }
 
-        // 🔧 NEW: Ultra-slow alpha during seed lock to keep baseline anchored
+        // 🔧 Seed lock takes priority — keeps baseline anchored after lane change
         let alpha = if self.seed_lock_frames > 0 {
             self.seed_lock_frames -= 1;
             if self.seed_lock_frames == 0 {
                 info!("🔓 Baseline seed lock expired");
             }
-            0.0005 // Barely moves: 29.3% → ~27% over 450 frames
+            0.0005
         } else if !self.is_valid {
             EWMA_ALPHA_ADAPTING
         } else if self.is_adapting {
