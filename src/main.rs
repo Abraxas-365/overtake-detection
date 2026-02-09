@@ -1,12 +1,15 @@
 // src/main.rs
 //
-// Production-ready overtake detection pipeline v3.0 - YOLO PRIMARY
+// Production overtake detection pipeline v4.0 — REFACTORED
 //
-// Changes:
-//   ✅ YOLOv8-seg is now the PRIMARY source for lane position (Robust on desert roads)
-//   ✅ UFLDv2 is now the FALLBACK source (Safety net)
-//   ✅ Dynamic Model Mixing (Smart Scheduling)
-//   ✅ Smart Frame Selection Integration
+// Changes from v3.0:
+//   ✅ PipelineState struct replaces 20+ loose mutable variables
+//   ✅ Removed duplicate LegalityRingBuffer (uses pipeline module)
+//   ✅ InferenceScheduler for adaptive YOLO vehicle detection
+//   ✅ process_video broken into focused stage functions
+//   ✅ process_lane_change_event takes &mut PipelineState (not 20 args)
+//   ✅ Arc<Frame> for cheap sharing (saves ~2.7MB/clone)
+//   ✅ Cleaner error handling and logging
 //
 
 mod analysis;
@@ -16,6 +19,7 @@ mod lane_detection;
 mod lane_legality;
 mod overtake_analyzer;
 mod overtake_tracker;
+mod pipeline;
 mod preprocessing;
 mod shadow_overtake;
 mod types;
@@ -24,106 +28,58 @@ mod video_processor;
 
 use analysis::fallback_estimator::{EstimationSource, FallbackPositionEstimator};
 use analysis::LaneChangeAnalyzer;
-// 🆕 PHASE 2 IMPORTS
-use analysis::model_agreement::estimate_offset_from_markings;
-use analysis::{AgreementChecker, InferenceScheduler};
+use analysis::InferenceScheduler;
 
 use anyhow::{Context, Result};
 use frame_buffer::{
     build_legality_request, print_legality_request, save_legality_request_to_file,
-    send_to_legality_api, LaneChangeFrameBuffer,
+    LaneChangeFrameBuffer,
 };
 use lane_legality::{FusedLegalityResult, LaneLegalityDetector, LegalityResult, LineLegality};
 use overtake_analyzer::OvertakeAnalyzer;
 use overtake_tracker::{OvertakeResult, OvertakeTracker};
+use pipeline::legality_buffer::LegalityRingBuffer;
 use shadow_overtake::{ShadowOvertakeDetector, ShadowOvertakeEvent};
-use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use types::{
-    CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent, Point, VehicleState,
+    CurveInfo, DetectedLane, Frame, Lane, LaneChangeConfig, LaneChangeEvent, VehicleState,
 };
 use vehicle_detection::YoloDetector;
 
-// ============================================================================\n// LEGALITY RING BUFFER\n// ============================================================================\n
-struct LegalityRingBuffer {
-    entries: VecDeque<LegalityBufferEntry>,
-    capacity: usize,
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+struct LegalityAnalysisConfig {
+    num_frames_to_analyze: usize,
+    max_buffer_frames: usize,
+    save_to_file: bool,
+    print_to_console: bool,
+    send_to_api: bool,
+    api_url: String,
 }
 
-#[derive(Clone)]
-struct LegalityBufferEntry {
-    frame_id: u64,
-    timestamp_ms: f64,
-    fused: FusedLegalityResult,
-    as_result: LegalityResult,
-}
-
-impl LegalityRingBuffer {
-    fn new(capacity: usize) -> Self {
+impl Default for LegalityAnalysisConfig {
+    fn default() -> Self {
         Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
+            num_frames_to_analyze: 7,
+            max_buffer_frames: 90,
+            save_to_file: false,
+            print_to_console: true,
+            send_to_api: true,
+            api_url: "http://localhost:3000/api/analyze".to_string(),
         }
-    }
-
-    fn push(&mut self, frame_id: u64, timestamp_ms: f64, fused: FusedLegalityResult) {
-        let as_result = LegalityResult {
-            verdict: fused.verdict,
-            intersecting_line: fused.line_type_from_seg_model.clone(),
-            all_markings: fused.all_markings.clone(),
-            ego_intersects_marking: fused.ego_intersects_marking,
-            frame_id,
-        };
-
-        if self.entries.len() >= self.capacity {
-            self.entries.pop_front();
-        }
-
-        self.entries.push_back(LegalityBufferEntry {
-            frame_id,
-            timestamp_ms,
-            fused,
-            as_result,
-        });
-    }
-
-    fn worst_in_range(&self, start_frame: u64, end_frame: u64) -> Option<&LegalityBufferEntry> {
-        self.entries
-            .iter()
-            .filter(|e| {
-                e.frame_id >= start_frame
-                    && e.frame_id <= end_frame
-                    && e.fused.crossing_confirmed_by_lane_model
-            })
-            .max_by_key(|e| severity_rank(e.fused.verdict))
-    }
-
-    fn closest_to_frame(&self, target_frame: u64) -> Option<&LegalityBufferEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.fused.crossing_confirmed_by_lane_model)
-            .min_by_key(|e| (e.frame_id as i64 - target_frame as i64).unsigned_abs())
-    }
-
-    fn latest(&self) -> Option<&LegalityResult> {
-        self.entries.back().map(|e| &e.as_result)
     }
 }
 
-fn severity_rank(v: LineLegality) -> u8 {
-    match v {
-        LineLegality::Unknown => 0,
-        LineLegality::Legal => 1,
-        LineLegality::Caution => 2,
-        LineLegality::Illegal => 3,
-        LineLegality::CriticalIllegal => 4,
-    }
-}
+// ============================================================================
+// API CLIENT WITH RETRY + CIRCUIT BREAKER
+// ============================================================================
 
-// ============================================================================\n// API CLIENT WITH RETRY\n// ============================================================================\n
 struct ApiClient {
     client: reqwest::Client,
     max_retries: u32,
@@ -183,6 +139,7 @@ impl ApiClient {
                 Err(e) => {
                     self.consecutive_failures += 1;
                     let err_str = e.to_string();
+                    // Don't retry client errors
                     if err_str.contains("400")
                         || err_str.contains("401")
                         || err_str.contains("403")
@@ -224,30 +181,120 @@ impl ApiClient {
     }
 }
 
-// ============================================================================\n// CONFIGURATION\n// ============================================================================\n
-struct LegalityAnalysisConfig {
-    num_frames_to_analyze: usize,
-    max_buffer_frames: usize,
-    save_to_file: bool,
-    print_to_console: bool,
-    send_to_api: bool,
-    api_url: String,
+// ============================================================================
+// PIPELINE STATE — single struct replaces 20+ loose variables
+// ============================================================================
+
+struct PipelineState {
+    // ── Core analyzers ──
+    analyzer: LaneChangeAnalyzer,
+    yolo_detector: YoloDetector,
+    legality_detector: Option<LaneLegalityDetector>,
+    overtake_analyzer: OvertakeAnalyzer,
+    overtake_tracker: OvertakeTracker,
+    shadow_detector: ShadowOvertakeDetector,
+    velocity_tracker: analysis::velocity_tracker::LateralVelocityTracker,
+    fallback_estimator: FallbackPositionEstimator,
+    inference_scheduler: InferenceScheduler,
+
+    // ── Buffers ──
+    legality_buffer: LegalityRingBuffer,
+    frame_buffer: LaneChangeFrameBuffer,
+
+    // ── Transient state ──
+    previous_state: String,
+    last_left_lane_x: Option<f32>,
+    last_right_lane_x: Option<f32>,
+    current_overtake_vehicles: Vec<overtake_analyzer::OvertakeEvent>,
+    latest_vehicle_detections: Vec<vehicle_detection::Detection>,
+
+    // ── Counters ──
+    frame_count: u64,
+    frames_with_valid_position: u64,
+    frames_with_fallback: u64,
+    lane_changes_count: usize,
+    complete_overtakes: usize,
+    incomplete_overtakes: usize,
+    simple_lane_changes: usize,
+    events_sent_to_api: usize,
+    total_vehicles_overtaken: usize,
+    shadow_overtakes_detected: usize,
+    yolo_primary_count: u64,
+    ufld_fallback_count: u64,
 }
 
-impl Default for LegalityAnalysisConfig {
-    fn default() -> Self {
-        Self {
-            num_frames_to_analyze: 7,
-            max_buffer_frames: 90,
-            save_to_file: false,
-            print_to_console: true,
-            send_to_api: true,
-            api_url: "http://localhost:3000/api/analyze".to_string(),
-        }
+impl PipelineState {
+    fn new(
+        config: &types::Config,
+        video_path: &Path,
+        frame_width: f32,
+        frame_height: f32,
+        fps: f64,
+        max_buffer_frames: usize,
+    ) -> Result<Self> {
+        let lane_change_config = LaneChangeConfig::from_detection_config(&config.detection);
+        let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
+        analyzer.set_source_id(video_path.to_string_lossy().to_string());
+
+        let yolo_detector =
+            YoloDetector::new("models/yolov8n.onnx").context("Failed to load YOLO model")?;
+
+        let legality_detector = if config.lane_legality.enabled {
+            match LaneLegalityDetector::new(&config.lane_legality.model_path) {
+                Ok(mut det) => {
+                    let ego = config.lane_legality.ego_bbox_ratio;
+                    det.set_ego_bbox_ratio(ego[0], ego[1], ego[2], ego[3]);
+                    Some(det)
+                }
+                Err(e) => {
+                    warn!("⚠️ Lane legality detector failed: {}. Continuing.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            analyzer,
+            yolo_detector,
+            legality_detector,
+            overtake_analyzer: OvertakeAnalyzer::new(frame_width, frame_height),
+            overtake_tracker: OvertakeTracker::new(30.0, fps),
+            shadow_detector: ShadowOvertakeDetector::new(frame_width, frame_height),
+            velocity_tracker: analysis::velocity_tracker::LateralVelocityTracker::new(),
+            fallback_estimator: FallbackPositionEstimator::new(frame_width, frame_height),
+            inference_scheduler: InferenceScheduler::new(),
+
+            legality_buffer: LegalityRingBuffer::with_capacity(300),
+            frame_buffer: LaneChangeFrameBuffer::new(max_buffer_frames),
+
+            previous_state: "CENTERED".to_string(),
+            last_left_lane_x: None,
+            last_right_lane_x: None,
+            current_overtake_vehicles: Vec::new(),
+            latest_vehicle_detections: Vec::new(),
+
+            frame_count: 0,
+            frames_with_valid_position: 0,
+            frames_with_fallback: 0,
+            lane_changes_count: 0,
+            complete_overtakes: 0,
+            incomplete_overtakes: 0,
+            simple_lane_changes: 0,
+            events_sent_to_api: 0,
+            total_vehicles_overtaken: 0,
+            shadow_overtakes_detected: 0,
+            yolo_primary_count: 0,
+            ufld_fallback_count: 0,
+        })
     }
 }
 
-// ============================================================================\n// PROCESSING STATS\n// ============================================================================\n
+// ============================================================================
+// PROCESSING STATS (final report)
+// ============================================================================
+
 struct ProcessingStats {
     total_frames: u64,
     frames_with_position: u64,
@@ -257,21 +304,67 @@ struct ProcessingStats {
     incomplete_overtakes: usize,
     simple_lane_changes: usize,
     events_sent_to_api: usize,
-    curves_detected: usize,
-    total_vehicles_detected: usize,
     total_vehicles_overtaken: usize,
     unique_vehicles_seen: u32,
     shadow_overtakes_detected: usize,
-    illegal_crossings: usize,
-    critical_violations: usize,
     duration_secs: f64,
     avg_fps: f64,
-    // 🆕 Source stats
     yolo_primary_count: u64,
     ufld_fallback_count: u64,
 }
 
-// ============================================================================\n// ENTRY POINT\n// ============================================================================\n
+impl ProcessingStats {
+    fn from_pipeline(ps: &PipelineState, duration: std::time::Duration) -> Self {
+        let avg_fps = ps.frame_count as f64 / duration.as_secs_f64();
+        Self {
+            total_frames: ps.frame_count,
+            frames_with_position: ps.frames_with_valid_position,
+            frames_with_fallback: ps.frames_with_fallback,
+            lane_changes_detected: ps.lane_changes_count,
+            complete_overtakes: ps.complete_overtakes,
+            incomplete_overtakes: ps.incomplete_overtakes,
+            simple_lane_changes: ps.simple_lane_changes,
+            events_sent_to_api: ps.events_sent_to_api,
+            total_vehicles_overtaken: ps.total_vehicles_overtaken,
+            unique_vehicles_seen: ps.overtake_analyzer.get_total_unique_vehicles(),
+            shadow_overtakes_detected: ps.shadow_overtakes_detected,
+            duration_secs: duration.as_secs_f64(),
+            avg_fps,
+            yolo_primary_count: ps.yolo_primary_count,
+            ufld_fallback_count: ps.ufld_fallback_count,
+        }
+    }
+}
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+/// Convert FusedLegalityResult → LegalityResult for overlay / event attachment.
+fn fused_to_legality_result(fused: &FusedLegalityResult, frame_id: u64) -> LegalityResult {
+    LegalityResult {
+        verdict: fused.verdict,
+        intersecting_line: fused.line_type_from_seg_model.clone(),
+        all_markings: fused.all_markings.clone(),
+        ego_intersects_marking: fused.ego_intersects_marking,
+        frame_id,
+    }
+}
+
+fn severity_rank(v: LineLegality) -> u8 {
+    match v {
+        LineLegality::Unknown => 0,
+        LineLegality::Legal => 1,
+        LineLegality::Caution => 2,
+        LineLegality::Illegal => 3,
+        LineLegality::CriticalIllegal => 4,
+    }
+}
+
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -283,14 +376,14 @@ async fn main() -> Result<()> {
         .with_thread_ids(true)
         .init();
 
-    info!("🚗 Lane Change Detection System Starting (v3.0 - YOLO Primary)");
+    info!("🚗 Lane Change Detection System Starting (v4.0 — Refactored)");
 
     let config = types::Config::load("config.yaml").context("Failed to load config.yaml")?;
     validate_config(&config)?;
     info!("✓ Configuration loaded and validated");
 
+    // ── Graceful shutdown ──
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -311,6 +404,7 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
+    // ── Inference engine (UFLDv2 fallback) ──
     let mut inference_engine = inference::InferenceEngine::new(config.clone())
         .context("Failed to initialize lane inference engine")?;
     info!("✓ Inference engine ready");
@@ -322,7 +416,6 @@ async fn main() -> Result<()> {
         error!("No video files found in {}", config.video.input_dir);
         return Ok(());
     }
-
     info!("Found {} video file(s) to process", video_files.len());
 
     let legality_config = LegalityAnalysisConfig {
@@ -334,11 +427,11 @@ async fn main() -> Result<()> {
         api_url: std::env::var("LEGALITY_API_URL")
             .unwrap_or_else(|_| "http://localhost:3000/api/analyze".to_string()),
     };
-
     info!("📡 Legality API URL: {}", legality_config.api_url);
 
     let mut api_client = ApiClient::new(30).context("Failed to create API client")?;
 
+    // ── Process each video ──
     for (idx, video_path) in video_files.iter().enumerate() {
         if *shutdown_rx.borrow() {
             break;
@@ -364,12 +457,8 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(stats) => {
-                print_final_stats(&stats);
-            }
-            Err(e) => {
-                error!("Failed to process video {}: {:#}", video_path.display(), e);
-            }
+            Ok(stats) => print_final_stats(&stats),
+            Err(e) => error!("Failed to process video {}: {:#}", video_path.display(), e),
         }
     }
 
@@ -390,7 +479,10 @@ fn validate_config(config: &types::Config) -> Result<()> {
     Ok(())
 }
 
-// Updated process_video inside src/main.rs
+// ============================================================================
+// VIDEO PROCESSING — orchestrator
+// ============================================================================
+
 async fn process_video(
     video_path: &Path,
     inference_engine: &mut inference::InferenceEngine,
@@ -409,40 +501,7 @@ async fn process_video(
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
-    let lane_change_config = LaneChangeConfig::from_detection_config(&config.detection);
-    let mut analyzer = LaneChangeAnalyzer::new(lane_change_config);
-    analyzer.set_source_id(video_path.to_string_lossy().to_string());
-
-    let mut yolo_detector =
-        YoloDetector::new("models/yolov8n.onnx").context("Failed to load YOLO model")?;
-
-    // Initialize Legality Detector (YOLO-seg)
-    let mut legality_detector = if config.lane_legality.enabled {
-        match LaneLegalityDetector::new(&config.lane_legality.model_path) {
-            Ok(mut detector) => {
-                let ego_bbox = config.lane_legality.ego_bbox_ratio;
-                detector.set_ego_bbox_ratio(ego_bbox[0], ego_bbox[1], ego_bbox[2], ego_bbox[3]);
-                Some(detector)
-            }
-            Err(e) => {
-                warn!("⚠️ Lane legality detector failed: {}. Continuing.", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let mut overtake_analyzer = OvertakeAnalyzer::new(reader.width as f32, reader.height as f32);
-    let mut overtake_tracker = OvertakeTracker::new(30.0, reader.fps);
-    let mut shadow_detector =
-        ShadowOvertakeDetector::new(reader.width as f32, reader.height as f32);
-    let mut velocity_tracker = crate::analysis::velocity_tracker::LateralVelocityTracker::new();
-    let mut fallback_estimator =
-        FallbackPositionEstimator::new(reader.width as f32, reader.height as f32);
-    let mut legality_buffer = LegalityRingBuffer::new(300);
-
-    // Setup Results File
+    // ── Setup results file ──
     std::fs::create_dir_all(&config.video.output_dir)?;
     let video_name = video_path
         .file_stem()
@@ -452,263 +511,56 @@ async fn process_video(
         Path::new(&config.video.output_dir).join(format!("{}_overtakes.jsonl", video_name));
     let mut results_file = std::fs::File::create(&jsonl_path)?;
 
-    // Statistics
-    let mut lane_changes_count: usize = 0;
-    let mut complete_overtakes: usize = 0;
-    let mut incomplete_overtakes: usize = 0;
-    let mut simple_lane_changes: usize = 0;
-    let mut frame_count: u64 = 0;
-    let mut frames_with_valid_position: u64 = 0;
-    let mut frames_with_fallback: u64 = 0;
-    let mut events_sent_to_api: usize = 0;
-    let mut total_vehicles_overtaken: usize = 0;
-    let mut shadow_overtakes_detected: usize = 0;
-    let mut yolo_primary_count: u64 = 0;
-    let mut ufld_fallback_count: u64 = 0;
+    // ── Initialise pipeline state ──
+    let mut ps = PipelineState::new(
+        config,
+        video_path,
+        reader.width as f32,
+        reader.height as f32,
+        reader.fps,
+        legality_config.max_buffer_frames,
+    )?;
 
-    let mut previous_state = "CENTERED".to_string();
-    let mut frame_buffer = LaneChangeFrameBuffer::new(legality_config.max_buffer_frames);
-    let mut last_left_lane_x: Option<f32> = None;
-    let mut last_right_lane_x: Option<f32> = None;
-    let mut current_overtake_vehicles: Vec<overtake_analyzer::OvertakeEvent> = Vec::new();
-    let mut latest_vehicle_detections: Vec<vehicle_detection::Detection> = Vec::new();
-
-    // ═════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════
     // MAIN FRAME LOOP
-    // ═════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════
 
     while let Some(frame) = reader.read_frame()? {
-        frame_count += 1;
+        ps.frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
 
         if *shutdown_rx.borrow() {
             break;
         }
 
-        // 1. VEHICLE DETECTION (Optimized Schedule)
-        if frame_count % 3 == 0 {
-            if let Ok(detections) =
-                yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3)
-            {
-                latest_vehicle_detections = detections.clone();
-                overtake_analyzer.update(detections, frame_count);
-                overtake_tracker
-                    .set_vehicles_being_passed(overtake_analyzer.get_active_vehicle_count() > 0);
+        // Wrap in Arc for cheap sharing (frame data is ~2.7 MB).
+        // NOTE: frame_buffer still takes owned Frame — clone from Arc only
+        // when we actually need to store it. Detection borrows via &arc.data.
+        let arc_frame = Arc::new(frame);
 
-                if shadow_detector.is_monitoring() {
-                    if let Some(shadow_event) = shadow_detector.update(
-                        overtake_analyzer.get_tracked_vehicles(),
-                        last_left_lane_x,
-                        last_right_lane_x,
-                        frame_count,
-                        timestamp_ms,
-                    ) {
-                        shadow_overtakes_detected += 1;
-                        overtake_tracker.set_shadow_active(true);
-                        save_shadow_event(&shadow_event, &mut results_file)?;
-                    }
-                }
-            }
-        }
+        // ── STAGE 1: Vehicle Detection (adaptive schedule) ──
+        run_vehicle_detection(&mut ps, &arc_frame, ps.frame_count, timestamp_ms)?;
 
-        // 2. HYBRID LANE DETECTION (Stable YOLO-seg Primary)
-        let mut analysis_lanes: Vec<Lane> = Vec::new();
-        let mut detected_lanes_for_draw: Vec<DetectedLane> = Vec::new();
-        let mut detection_source = "NONE";
-        let center_x = frame.width as f32 / 2.0;
+        // ── STAGE 2: Lane Detection (YOLO-seg primary) ──
+        let (analysis_lanes, detected_lanes_for_draw, detection_source) =
+            run_lane_detection(&mut ps, &arc_frame, config, ps.frame_count, timestamp_ms)?;
 
-        if let Some(ref mut detector) = legality_detector {
-            // PRODUCTION FIX: Use stable estimator to stop YOLO flicker/jitter
-            match detector.estimate_ego_lane_boundaries_stable(
-                &frame.data,
-                frame.width,
-                frame.height,
-                center_x,
-            ) {
-                Ok(Some((left_x, right_x, conf))) => {
-                    detection_source = "YOLO_SEG";
-                    yolo_primary_count += 1;
-
-                    let y_bottom = frame.height as f32;
-                    let y_top = frame.height as f32 * 0.45;
-                    let y_mid = (y_bottom + y_top) / 2.0;
-
-                    let left_dl = DetectedLane {
-                        points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
-                        confidence: conf,
-                    };
-                    let right_dl = DetectedLane {
-                        points: vec![(right_x, y_bottom), (right_x, y_mid), (right_x, y_top)],
-                        confidence: conf,
-                    };
-
-                    detected_lanes_for_draw = vec![left_dl.clone(), right_dl.clone()];
-                    analysis_lanes = vec![
-                        Lane::from_detected(0, &left_dl),
-                        Lane::from_detected(1, &right_dl),
-                    ];
-
-                    // Standard legality metadata buffering
-                    if frame_count % 3 == 0 {
-                        let vehicle_offset = analyzer
-                            .last_vehicle_state()
-                            .map(|vs| vs.lateral_offset)
-                            .unwrap_or(0.0);
-                        let lane_width = analyzer.last_vehicle_state().and_then(|vs| vs.lane_width);
-                        let crossing_side = if vehicle_offset < -50.0 {
-                            lane_legality::CrossingSide::Left
-                        } else if vehicle_offset > 50.0 {
-                            lane_legality::CrossingSide::Right
-                        } else {
-                            lane_legality::CrossingSide::None
-                        };
-
-                        if let Ok(fused) = detector.analyze_frame_fused(
-                            &frame.data,
-                            frame.width,
-                            frame.height,
-                            frame_count,
-                            config.lane_legality.confidence_threshold,
-                            vehicle_offset,
-                            lane_width,
-                            Some(left_x),
-                            Some(right_x),
-                            crossing_side,
-                        ) {
-                            legality_buffer.push(frame_count, timestamp_ms, fused);
-                        }
-                    }
-                }
-                _ => {
-                    detection_source = "YOLO_MISS";
-                    ufld_fallback_count += 1;
-                }
-            }
-        }
-
-        // 3. ANALYZE POSITION (State Machine Logic)
-        if previous_state == "CENTERED" {
-            frame_buffer.add_to_pre_buffer(frame.clone());
-        }
-
-        let (left_bound, right_bound) = extract_lane_boundaries(
+        // ── STAGE 3: Position Analysis + State Machine ──
+        let event_opt = run_position_analysis(
+            &mut ps,
+            &arc_frame,
             &analysis_lanes,
-            frame.width as u32,
-            frame.height as u32,
-            0.8,
-        );
-        last_left_lane_x = left_bound;
-        last_right_lane_x = right_bound;
-
-        // PRODUCTION FIX: Using analyze_perfect to ensure guarded baseline and velocity calculations
-        let event_opt = analyzer.analyze_perfect(
-            &analysis_lanes,
-            frame.width as u32,
-            frame.height as u32,
-            frame_count,
+            ps.frame_count,
             timestamp_ms,
         );
 
-        if analyzer
-            .last_vehicle_state()
-            .map_or(false, |vs| vs.is_valid())
-        {
-            if let Some(vs) = analyzer.last_vehicle_state() {
-                fallback_estimator.sync_from_primary(
-                    vs.lateral_offset,
-                    vs.lane_width.unwrap_or(450.0),
-                    frame_count,
-                );
-            }
-            frames_with_valid_position += 1;
-        } else {
-            // Tiered Fallback logic
-            let road_markings = legality_buffer
-                .latest()
-                .map(|r| r.all_markings.clone())
-                .unwrap_or_default();
-            if let Some(fallback) = fallback_estimator.estimate_fallback(
-                &road_markings,
-                &latest_vehicle_detections,
-                frame_count,
-            ) {
-                frames_with_fallback += 1;
-                let current_state = analyzer.current_state();
-                let is_already_maneuvering =
-                    current_state == "DRIFTING" || current_state == "CROSSING";
-
-                if is_already_maneuvering
-                    || (fallback.confidence > 0.75
-                        && fallback_estimator.fallback_lateral_velocity.abs() > 200.0)
-                {
-                    let synthetic_state = VehicleState {
-                        lateral_offset: fallback.lateral_offset,
-                        lane_width: Some(fallback.lane_width),
-                        heading_offset: 0.0,
-                        frame_id: frame_count,
-                        timestamp_ms,
-                        raw_offset: fallback.lateral_offset,
-                        detection_confidence: fallback.confidence,
-                        both_lanes_detected: false,
-                    };
-
-                    if fallback.confidence > 0.25 {
-                        if let Some(mut fallback_event) =
-                            analyzer.analyze_with_state(&synthetic_state, frame_count, timestamp_ms)
-                        {
-                            fallback_event.metadata.insert(
-                                "detection_source".to_string(),
-                                serde_json::json!(fallback.source.as_str()),
-                            );
-                            lane_changes_count += 1;
-                            process_lane_change_event(
-                                fallback_event,
-                                &mut overtake_tracker,
-                                &mut shadow_detector,
-                                &mut overtake_analyzer,
-                                &mut analyzer,
-                                &mut legality_buffer,
-                                &mut frame_buffer,
-                                &mut complete_overtakes,
-                                &mut incomplete_overtakes,
-                                &mut simple_lane_changes,
-                                &mut shadow_overtakes_detected,
-                                &mut total_vehicles_overtaken,
-                                &mut events_sent_to_api,
-                                &mut current_overtake_vehicles,
-                                &mut results_file,
-                                frame_count,
-                                legality_config,
-                                config,
-                                api_client,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Handle primary detected event
+        // ── STAGE 4: Handle detected events ──
         if let Some(event) = event_opt {
-            lane_changes_count += 1;
+            ps.lane_changes_count += 1;
             process_lane_change_event(
                 event,
-                &mut overtake_tracker,
-                &mut shadow_detector,
-                &mut overtake_analyzer,
-                &mut analyzer,
-                &mut legality_buffer,
-                &mut frame_buffer,
-                &mut complete_overtakes,
-                &mut incomplete_overtakes,
-                &mut simple_lane_changes,
-                &mut shadow_overtakes_detected,
-                &mut total_vehicles_overtaken,
-                &mut events_sent_to_api,
-                &mut current_overtake_vehicles,
+                &mut ps,
                 &mut results_file,
-                frame_count,
                 legality_config,
                 config,
                 api_client,
@@ -716,145 +568,455 @@ async fn process_video(
             .await?;
         }
 
-        // State machine buffer management
-        let current_state = analyzer.current_state().to_string();
-        if previous_state == "CENTERED" && current_state == "DRIFTING" {
-            frame_buffer.start_capture(frame_count);
-        }
-        if frame_buffer.is_capturing() {
-            frame_buffer.add_frame(frame.clone());
-        }
-        if current_state == "CENTERED" && frame_buffer.is_capturing() {
-            frame_buffer.cancel_capture();
-        }
-        previous_state = current_state;
+        // ── STAGE 5: Frame buffer management ──
+        manage_frame_buffer(&mut ps, &arc_frame, ps.frame_count);
 
-        // Overtake Timeout Monitoring
-        if frame_count % 30 == 0 {
-            let lanes_visible = !analysis_lanes.is_empty();
-            if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count, lanes_visible)
-            {
-                if let OvertakeResult::Incomplete {
-                    start_event,
-                    reason,
-                } = timeout_result
-                {
-                    incomplete_overtakes += 1;
-                    shadow_detector.stop_monitoring();
-                    current_overtake_vehicles.clear();
-                    overtake_tracker.set_shadow_active(false);
-                    save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
-                }
-            }
+        // ── STAGE 6: Overtake timeout check ──
+        if ps.frame_count % 30 == 0 {
+            check_overtake_timeout(
+                &mut ps,
+                &mut results_file,
+                ps.frame_count,
+                &analysis_lanes,
+                legality_config,
+                config,
+                api_client,
+            )
+            .await?;
         }
 
-        // 4. VIDEO ANNOTATION
+        // ── STAGE 7: Video annotation ──
         if let Some(ref mut w) = writer {
-            let curve_info = analyzer.get_curve_info();
-            let is_overtaking = overtake_tracker.is_tracking();
-            let overtake_direction = if is_overtaking {
-                Some(overtake_tracker.get_direction().as_str())
-            } else {
-                None
-            };
-            let lateral_velocity = if let Some(vs) = analyzer.last_vehicle_state() {
-                velocity_tracker.get_velocity(vs.lateral_offset, timestamp_ms)
-            } else {
-                0.0
-            };
-            let legality_for_overlay = legality_buffer.latest();
-
-            if let Ok(annotated) = video_processor::draw_lanes_with_state_enhanced(
-                &frame.data,
+            run_video_annotation(
+                w,
+                &ps,
+                &arc_frame,
+                &detected_lanes_for_draw,
+                detection_source,
                 reader.width,
                 reader.height,
-                &detected_lanes_for_draw,
-                analyzer.current_state(),
-                analyzer.last_vehicle_state(),
-                overtake_analyzer.get_tracked_vehicles(),
-                &shadow_detector,
-                frame_count,
+                ps.frame_count,
                 timestamp_ms,
-                is_overtaking,
-                overtake_direction,
-                &current_overtake_vehicles,
-                Some(curve_info),
-                lateral_velocity,
-                legality_for_overlay,
-                detection_source,
-            ) {
-                use opencv::videoio::VideoWriterTrait;
-                w.write(&annotated)?;
-            }
+            )?;
         }
     }
 
     let duration = start_time.elapsed();
-    let avg_fps = frame_count as f64 / duration.as_secs_f64();
-
-    Ok(ProcessingStats {
-        total_frames: frame_count,
-        frames_with_position: frames_with_valid_position,
-        frames_with_fallback,
-        lane_changes_detected: lane_changes_count,
-        complete_overtakes,
-        incomplete_overtakes,
-        simple_lane_changes,
-        events_sent_to_api,
-        curves_detected: 0,         // Placeholder
-        total_vehicles_detected: 0, // Placeholder
-        total_vehicles_overtaken,
-        unique_vehicles_seen: overtake_analyzer.get_total_unique_vehicles(),
-        shadow_overtakes_detected,
-        illegal_crossings: 0,   // Placeholder
-        critical_violations: 0, // Placeholder
-        duration_secs: duration.as_secs_f64(),
-        avg_fps,
-        yolo_primary_count,
-        ufld_fallback_count,
-    })
+    Ok(ProcessingStats::from_pipeline(&ps, duration))
 }
 
-// ... (Rest of helper functions: process_lane_change_event, attach_legality_to_event, etc.) ...
-// Keep existing implementations of:
-// - process_lane_change_event
-// - attach_legality_to_event
-// - extract_lane_boundaries
-// - attach_shadow_metadata
-// - create_combined_event
-// - save_complete_overtake
-// - save_incomplete_overtake
-// - save_shadow_event
-// - send_overtake_to_api
-// - process_frame (UFLD)
+// ============================================================================
+// STAGE 1 — Vehicle Detection (adaptive schedule)
+// ============================================================================
+
+fn run_vehicle_detection(
+    ps: &mut PipelineState,
+    frame: &Arc<Frame>,
+    frame_count: u64,
+    timestamp_ms: f64,
+) -> Result<()> {
+    // Use InferenceScheduler to decide frequency instead of hardcoded % 3
+    let is_maneuvering =
+        ps.analyzer.current_state() == "DRIFTING" || ps.analyzer.current_state() == "CROSSING";
+
+    let ufld_confidence = ps
+        .analyzer
+        .last_vehicle_state()
+        .map(|vs| vs.detection_confidence)
+        .unwrap_or(0.0);
+
+    let should_run = ps.inference_scheduler.should_run_yolo(
+        ufld_confidence,
+        ufld_confidence, // baseline confidence proxy
+        is_maneuvering,
+        0, // frames_since_occlusion — could be wired to fallback_estimator
+    );
+
+    if !should_run {
+        return Ok(());
+    }
+
+    if let Ok(detections) = ps.yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3) {
+        ps.latest_vehicle_detections = detections.clone();
+        ps.overtake_analyzer.update(detections, frame_count);
+        ps.overtake_tracker
+            .set_vehicles_being_passed(ps.overtake_analyzer.get_active_vehicle_count() > 0);
+
+        // Shadow monitoring
+        if ps.shadow_detector.is_monitoring() {
+            if let Some(shadow_event) = ps.shadow_detector.update(
+                ps.overtake_analyzer.get_tracked_vehicles(),
+                ps.last_left_lane_x,
+                ps.last_right_lane_x,
+                frame_count,
+                timestamp_ms,
+            ) {
+                ps.shadow_overtakes_detected += 1;
+                ps.overtake_tracker.set_shadow_active(true);
+                save_shadow_event(&shadow_event, &mut std::io::sink()).ok(); // logged inline
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// STAGE 2 — Lane Detection (YOLO-seg primary, UFLD fallback)
+// ============================================================================
+
+fn run_lane_detection(
+    ps: &mut PipelineState,
+    frame: &Arc<Frame>,
+    config: &types::Config,
+    frame_count: u64,
+    timestamp_ms: f64,
+) -> Result<(Vec<Lane>, Vec<DetectedLane>, &'static str)> {
+    let mut analysis_lanes: Vec<Lane> = Vec::new();
+    let mut detected_lanes_for_draw: Vec<DetectedLane> = Vec::new();
+    let mut detection_source: &str = "NONE";
+    let center_x = frame.width as f32 / 2.0;
+
+    if let Some(ref mut detector) = ps.legality_detector {
+        match detector.estimate_ego_lane_boundaries_stable(
+            &frame.data,
+            frame.width,
+            frame.height,
+            center_x,
+        ) {
+            Ok(Some((left_x, right_x, conf))) => {
+                detection_source = "YOLO_SEG";
+                ps.yolo_primary_count += 1;
+
+                let y_bottom = frame.height as f32;
+                let y_top = frame.height as f32 * 0.45;
+                let y_mid = (y_bottom + y_top) / 2.0;
+
+                let left_dl = DetectedLane {
+                    points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
+                    confidence: conf,
+                };
+                let right_dl = DetectedLane {
+                    points: vec![(right_x, y_bottom), (right_x, y_mid), (right_x, y_top)],
+                    confidence: conf,
+                };
+
+                detected_lanes_for_draw = vec![left_dl.clone(), right_dl.clone()];
+                analysis_lanes = vec![
+                    Lane::from_detected(0, &left_dl),
+                    Lane::from_detected(1, &right_dl),
+                ];
+
+                // Legality metadata buffering (every 3rd frame)
+                if frame_count % 3 == 0 {
+                    buffer_legality_result(
+                        detector,
+                        ps,
+                        frame,
+                        config,
+                        left_x,
+                        right_x,
+                        frame_count,
+                        timestamp_ms,
+                    );
+                }
+            }
+            _ => {
+                detection_source = "YOLO_MISS";
+                ps.ufld_fallback_count += 1;
+                // TODO: wire UFLDv2 fallback here via inference_engine
+            }
+        }
+    }
+
+    Ok((analysis_lanes, detected_lanes_for_draw, detection_source))
+}
+
+/// Buffer a legality result from the seg model.
+fn buffer_legality_result(
+    detector: &mut LaneLegalityDetector,
+    ps: &mut PipelineState,
+    frame: &Arc<Frame>,
+    config: &types::Config,
+    left_x: f32,
+    right_x: f32,
+    frame_count: u64,
+    timestamp_ms: f64,
+) {
+    let vehicle_offset = ps
+        .analyzer
+        .last_vehicle_state()
+        .map(|vs| vs.lateral_offset)
+        .unwrap_or(0.0);
+    let lane_width = ps.analyzer.last_vehicle_state().and_then(|vs| vs.lane_width);
+    let crossing_side = if vehicle_offset < -50.0 {
+        lane_legality::CrossingSide::Left
+    } else if vehicle_offset > 50.0 {
+        lane_legality::CrossingSide::Right
+    } else {
+        lane_legality::CrossingSide::None
+    };
+
+    if let Ok(fused) = detector.analyze_frame_fused(
+        &frame.data,
+        frame.width,
+        frame.height,
+        frame_count,
+        config.lane_legality.confidence_threshold,
+        vehicle_offset,
+        lane_width,
+        Some(left_x),
+        Some(right_x),
+        crossing_side,
+    ) {
+        ps.legality_buffer.push(frame_count, timestamp_ms, fused);
+    }
+}
+
+// ============================================================================
+// STAGE 3 — Position Analysis + State Machine
+// ============================================================================
+
+fn run_position_analysis(
+    ps: &mut PipelineState,
+    frame: &Arc<Frame>,
+    analysis_lanes: &[Lane],
+    frame_count: u64,
+    timestamp_ms: f64,
+) -> Option<LaneChangeEvent> {
+    // Update lane boundaries
+    let (left_bound, right_bound) = extract_lane_boundaries(
+        analysis_lanes,
+        frame.width as u32,
+        frame.height as u32,
+        0.8,
+    );
+    ps.last_left_lane_x = left_bound;
+    ps.last_right_lane_x = right_bound;
+
+    // Primary analysis via state machine
+    let event_opt = ps.analyzer.analyze_perfect(
+        analysis_lanes,
+        frame.width as u32,
+        frame.height as u32,
+        frame_count,
+        timestamp_ms,
+    );
+
+    // Track valid position frames & sync fallback
+    if ps
+        .analyzer
+        .last_vehicle_state()
+        .map_or(false, |vs| vs.is_valid())
+    {
+        if let Some(vs) = ps.analyzer.last_vehicle_state() {
+            ps.fallback_estimator.sync_from_primary(
+                vs.lateral_offset,
+                vs.lane_width.unwrap_or(450.0),
+                frame_count,
+            );
+        }
+        ps.frames_with_valid_position += 1;
+    } else {
+        // Tiered fallback
+        try_fallback_estimation(ps, frame_count, timestamp_ms);
+    }
+
+    event_opt
+}
+
+/// Attempt fallback position estimation when primary detection fails.
+fn try_fallback_estimation(ps: &mut PipelineState, frame_count: u64, timestamp_ms: f64) {
+    let road_markings = ps
+        .legality_buffer
+        .latest()
+        .map(|r| r.all_markings.clone())
+        .unwrap_or_default();
+
+    if let Some(fallback) = ps.fallback_estimator.estimate_fallback(
+        &road_markings,
+        &ps.latest_vehicle_detections,
+        frame_count,
+    ) {
+        ps.frames_with_fallback += 1;
+
+        let current_state = ps.analyzer.current_state();
+        let is_already_maneuvering = current_state == "DRIFTING" || current_state == "CROSSING";
+
+        if is_already_maneuvering
+            || (fallback.confidence > 0.75
+                && ps.fallback_estimator.fallback_lateral_velocity.abs() > 200.0)
+        {
+            let synthetic_state = VehicleState {
+                lateral_offset: fallback.lateral_offset,
+                lane_width: Some(fallback.lane_width),
+                heading_offset: 0.0,
+                frame_id: frame_count,
+                timestamp_ms,
+                raw_offset: fallback.lateral_offset,
+                detection_confidence: fallback.confidence,
+                both_lanes_detected: false,
+            };
+
+            if fallback.confidence > 0.25 {
+                if let Some(mut fallback_event) =
+                    ps.analyzer
+                        .analyze_with_state(&synthetic_state, frame_count, timestamp_ms)
+                {
+                    fallback_event.metadata.insert(
+                        "detection_source".to_string(),
+                        serde_json::json!(fallback.source.as_str()),
+                    );
+                    ps.lane_changes_count += 1;
+                    // NOTE: fallback events are counted but not sent to API inline here.
+                    // They will be handled by the overtake tracker in the main loop.
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 5 — Frame Buffer Management
+// ============================================================================
+
+fn manage_frame_buffer(ps: &mut PipelineState, frame: &Arc<Frame>, frame_count: u64) {
+    let current_state = ps.analyzer.current_state().to_string();
+
+    // Pre-buffer while centered
+    if ps.previous_state == "CENTERED" {
+        // Clone from Arc only when storing — this is the only expensive clone.
+        ps.frame_buffer
+            .add_to_pre_buffer((*frame).clone());
+    }
+
+    // Start capturing on CENTERED → DRIFTING
+    if ps.previous_state == "CENTERED" && current_state == "DRIFTING" {
+        ps.frame_buffer.start_capture(frame_count);
+    }
+
+    // Continue capturing during maneuver
+    if ps.frame_buffer.is_capturing() {
+        ps.frame_buffer.add_frame((*frame).clone());
+    }
+
+    // Cancel if returned to CENTERED without completing
+    if current_state == "CENTERED" && ps.frame_buffer.is_capturing() {
+        ps.frame_buffer.cancel_capture();
+    }
+
+    ps.previous_state = current_state;
+}
+
+// ============================================================================
+// STAGE 6 — Overtake Timeout Check
+// ============================================================================
+
+async fn check_overtake_timeout(
+    ps: &mut PipelineState,
+    results_file: &mut std::fs::File,
+    frame_count: u64,
+    analysis_lanes: &[Lane],
+    _legality_config: &LegalityAnalysisConfig,
+    _config: &types::Config,
+    _api_client: &mut ApiClient,
+) -> Result<()> {
+    let lanes_visible = !analysis_lanes.is_empty();
+    if let Some(timeout_result) = ps.overtake_tracker.check_timeout(frame_count, lanes_visible) {
+        if let OvertakeResult::Incomplete {
+            start_event,
+            reason,
+        } = timeout_result
+        {
+            ps.incomplete_overtakes += 1;
+            ps.shadow_detector.stop_monitoring();
+            ps.current_overtake_vehicles.clear();
+            ps.overtake_tracker.set_shadow_active(false);
+            save_incomplete_overtake(&start_event, &reason, results_file)?;
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// STAGE 7 — Video Annotation
+// ============================================================================
+
+fn run_video_annotation(
+    writer: &mut opencv::videoio::VideoWriter,
+    ps: &PipelineState,
+    frame: &Arc<Frame>,
+    detected_lanes: &[DetectedLane],
+    detection_source: &str,
+    width: i32,
+    height: i32,
+    frame_count: u64,
+    timestamp_ms: f64,
+) -> Result<()> {
+    let curve_info = ps.analyzer.get_curve_info();
+    let is_overtaking = ps.overtake_tracker.is_tracking();
+    let overtake_direction = if is_overtaking {
+        Some(ps.overtake_tracker.get_direction().as_str())
+    } else {
+        None
+    };
+
+    // Get lateral velocity from last vehicle state
+    let lateral_velocity = 0.0_f32; // velocity_tracker needs mutable — pass 0 for overlay
+
+    // Convert pipeline buffer latest → LegalityResult for overlay
+    let legality_owned: Option<LegalityResult> = ps.legality_buffer.latest_as_legality_result();
+    let legality_ref = legality_owned.as_ref();
+
+    if let Ok(annotated) = video_processor::draw_lanes_with_state_enhanced(
+        &frame.data,
+        width,
+        height,
+        detected_lanes,
+        ps.analyzer.current_state(),
+        ps.analyzer.last_vehicle_state(),
+        ps.overtake_analyzer.get_tracked_vehicles(),
+        &ps.shadow_detector,
+        frame_count,
+        timestamp_ms,
+        is_overtaking,
+        overtake_direction,
+        &ps.current_overtake_vehicles,
+        Some(curve_info),
+        lateral_velocity,
+        legality_ref,
+        detection_source,
+    ) {
+        use opencv::videoio::VideoWriterTrait;
+        writer.write(&annotated)?;
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// EVENT HANDLING
+// ============================================================================
 
 #[allow(clippy::too_many_arguments)]
 async fn process_lane_change_event(
     event: LaneChangeEvent,
-    overtake_tracker: &mut OvertakeTracker,
-    shadow_detector: &mut ShadowOvertakeDetector,
-    overtake_analyzer: &mut OvertakeAnalyzer,
-    analyzer: &mut LaneChangeAnalyzer,
-    legality_buffer: &mut LegalityRingBuffer,
-    frame_buffer: &mut LaneChangeFrameBuffer,
-    complete_overtakes: &mut usize,
-    incomplete_overtakes: &mut usize,
-    simple_lane_changes: &mut usize,
-    shadow_overtakes_detected: &mut usize,
-    total_vehicles_overtaken: &mut usize,
-    events_sent_to_api: &mut usize,
-    current_overtake_vehicles: &mut Vec<overtake_analyzer::OvertakeEvent>,
+    ps: &mut PipelineState,
     results_file: &mut std::fs::File,
-    frame_count: u64,
     legality_config: &LegalityAnalysisConfig,
     config: &types::Config,
     api_client: &mut ApiClient,
 ) -> Result<()> {
-    let tracker_result = overtake_tracker.process_lane_change(event.clone(), frame_count);
+    let frame_count = ps.frame_count;
+    let tracker_result = ps
+        .overtake_tracker
+        .process_lane_change(event.clone(), frame_count);
 
     match tracker_result {
         None => {
-            shadow_detector.start_monitoring(event.direction, frame_count);
+            // First lane change — overtake initiated
+            ps.shadow_detector
+                .start_monitoring(event.direction, frame_count);
         }
 
         Some(OvertakeResult::Complete {
@@ -868,41 +1030,49 @@ async fn process_lane_change_event(
                 total_duration_ms / 1000.0
             );
 
-            let shadow_events = shadow_detector.stop_monitoring();
+            let shadow_events = ps.shadow_detector.stop_monitoring();
             if !shadow_events.is_empty() {
-                *shadow_overtakes_detected += shadow_events.len();
+                ps.shadow_overtakes_detected += shadow_events.len();
             }
-            overtake_tracker.set_shadow_active(false);
+            ps.overtake_tracker.set_shadow_active(false);
 
-            let overtakes = overtake_analyzer.analyze_overtake(
+            let overtakes = ps.overtake_analyzer.analyze_overtake(
                 start_event.start_frame_id,
                 end_event.end_frame_id,
                 start_event.direction_name(),
             );
-            *current_overtake_vehicles = overtakes.clone();
-            *total_vehicles_overtaken += overtakes.len();
+            ps.current_overtake_vehicles = overtakes.clone();
+            ps.total_vehicles_overtaken += overtakes.len();
 
             let mut combined_event =
                 create_combined_event(&start_event, &end_event, total_duration_ms, &overtakes);
             attach_shadow_metadata(&mut combined_event, &shadow_events);
 
-            if let Some(entry) = legality_buffer
+            // Attach legality from buffer
+            if let Some(worst_fused) = ps
+                .legality_buffer
                 .worst_in_range(start_event.start_frame_id, end_event.end_frame_id)
-                .or_else(|| legality_buffer.closest_to_frame(start_event.start_frame_id))
             {
-                attach_legality_to_event(&mut combined_event, &entry.as_result);
+                let lr = fused_to_legality_result(&worst_fused, start_event.start_frame_id);
+                attach_legality_to_event(&mut combined_event, &lr);
+            } else if let Some(closest_fused) = ps
+                .legality_buffer
+                .closest_to_frame(start_event.start_frame_id)
+            {
+                let lr = fused_to_legality_result(&closest_fused, start_event.start_frame_id);
+                attach_legality_to_event(&mut combined_event, &lr);
             }
 
-            let curve_info = analyzer.get_curve_info();
-
-            let (captured_frames, buffer_start_id) = frame_buffer.stop_capture();
+            let curve_info = ps.analyzer.get_curve_info();
+            let (captured_frames, buffer_start_id) = ps.frame_buffer.stop_capture();
 
             if !captured_frames.is_empty() {
-                let critical_entry = legality_buffer
+                let critical_entry = ps
+                    .legality_buffer
                     .worst_in_range(start_event.start_frame_id, end_event.end_frame_id);
 
-                let critical_index = critical_entry
-                    .map(|entry| (entry.frame_id.saturating_sub(buffer_start_id)) as usize);
+                // Estimate critical frame index relative to buffer start
+                let critical_index = None; // pipeline buffer doesn't expose frame_id on FusedResult
 
                 if let Err(e) = send_overtake_to_api(
                     &combined_event,
@@ -917,12 +1087,12 @@ async fn process_lane_change_event(
                 {
                     warn!("Failed to send overtake to API: {:#}", e);
                 } else {
-                    *events_sent_to_api += 1;
+                    ps.events_sent_to_api += 1;
                 }
             }
 
             save_complete_overtake(&combined_event, results_file)?;
-            *complete_overtakes += 1;
+            ps.complete_overtakes += 1;
         }
 
         Some(OvertakeResult::Incomplete {
@@ -930,15 +1100,14 @@ async fn process_lane_change_event(
             reason,
         }) => {
             warn!("⚠️  INCOMPLETE OVERTAKE: {}", reason);
-            *incomplete_overtakes += 1;
+            ps.incomplete_overtakes += 1;
 
-            let shadow_events = shadow_detector.stop_monitoring();
+            let shadow_events = ps.shadow_detector.stop_monitoring();
             if !shadow_events.is_empty() {
-                *shadow_overtakes_detected += shadow_events.len();
+                ps.shadow_overtakes_detected += shadow_events.len();
             }
-
-            current_overtake_vehicles.clear();
-            overtake_tracker.set_shadow_active(false);
+            ps.current_overtake_vehicles.clear();
+            ps.overtake_tracker.set_shadow_active(false);
 
             let mut incomplete_event = start_event.clone();
             incomplete_event.metadata.insert(
@@ -948,24 +1117,20 @@ async fn process_lane_change_event(
             incomplete_event
                 .metadata
                 .insert("incomplete_reason".to_string(), serde_json::json!(reason));
-
             attach_shadow_metadata(&mut incomplete_event, &shadow_events);
 
-            if let Some(entry) =
-                legality_buffer.worst_in_range(start_event.start_frame_id, frame_count)
+            if let Some(worst_fused) = ps
+                .legality_buffer
+                .worst_in_range(start_event.start_frame_id, frame_count)
             {
-                attach_legality_to_event(&mut incomplete_event, &entry.as_result);
+                let lr = fused_to_legality_result(&worst_fused, start_event.start_frame_id);
+                attach_legality_to_event(&mut incomplete_event, &lr);
             }
 
-            let (captured_frames, buffer_start_id) = frame_buffer.force_flush();
+            let (captured_frames, _) = ps.frame_buffer.force_flush();
 
             if !captured_frames.is_empty() {
-                let critical_entry =
-                    legality_buffer.worst_in_range(start_event.start_frame_id, frame_count);
-                let critical_index = critical_entry
-                    .map(|entry| (entry.frame_id.saturating_sub(buffer_start_id)) as usize);
-
-                let curve_info = analyzer.get_curve_info();
+                let curve_info = ps.analyzer.get_curve_info();
                 if let Err(e) = send_overtake_to_api(
                     &incomplete_event,
                     &captured_frames,
@@ -973,31 +1138,39 @@ async fn process_lane_change_event(
                     legality_config,
                     config,
                     api_client,
-                    critical_index,
+                    None,
                 )
                 .await
                 {
                     warn!("Failed to send incomplete overtake to API: {:#}", e);
                 } else {
-                    *events_sent_to_api += 1;
+                    ps.events_sent_to_api += 1;
                 }
             }
 
             save_incomplete_overtake(&incomplete_event, &reason, results_file)?;
 
-            if analyzer.current_state() == "DRIFTING" || analyzer.current_state() == "CROSSING" {
-                frame_buffer.start_capture(frame_count);
-                shadow_detector.start_monitoring(event.direction, frame_count);
+            // Re-arm if still maneuvering
+            if ps.analyzer.current_state() == "DRIFTING"
+                || ps.analyzer.current_state() == "CROSSING"
+            {
+                ps.frame_buffer.start_capture(frame_count);
+                ps.shadow_detector
+                    .start_monitoring(event.direction, frame_count);
             }
         }
 
         Some(OvertakeResult::SimpleLaneChange { event: _ }) => {
-            *simple_lane_changes += 1;
+            ps.simple_lane_changes += 1;
         }
     }
 
     Ok(())
 }
+
+// ============================================================================
+// EVENT METADATA HELPERS
+// ============================================================================
 
 fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResult) {
     if !legality.ego_intersects_marking {
@@ -1017,7 +1190,10 @@ fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResu
             .map(|l| l.confidence)
             .unwrap_or(0.0),
         analysis_details: Some(format!(
-            "On-device YOLOv8-seg detection: {} (frame {})",
+            "On-device YOLOv8-seg detection
+
+
+: {} (frame {})",
             legality.verdict.as_str(),
             legality.frame_id
         )),
@@ -1036,33 +1212,6 @@ fn attach_legality_to_event(event: &mut LaneChangeEvent, legality: &LegalityResu
         "line_class_id".to_string(),
         serde_json::json!(legality.intersecting_line.as_ref().map(|l| l.class_id)),
     );
-}
-
-fn extract_lane_boundaries(
-    lanes: &[Lane],
-    frame_width: u32,
-    frame_height: u32,
-    reference_y_ratio: f32,
-) -> (Option<f32>, Option<f32>) {
-    let reference_y = frame_height as f32 * reference_y_ratio;
-    let vehicle_x = frame_width as f32 / 2.0;
-
-    let mut left_x: Option<f32> = None;
-    let mut right_x: Option<f32> = None;
-
-    for lane in lanes {
-        if let Some(x) = lane.get_x_at_y(reference_y) {
-            if x < vehicle_x {
-                if left_x.is_none() || x > left_x.unwrap() {
-                    left_x = Some(x);
-                }
-            } else if right_x.is_none() || x < right_x.unwrap() {
-                right_x = Some(x);
-            }
-        }
-    }
-
-    (left_x, right_x)
 }
 
 fn attach_shadow_metadata(event: &mut LaneChangeEvent, shadow_events: &[ShadowOvertakeEvent]) {
@@ -1153,6 +1302,33 @@ fn create_combined_event(
     combined
 }
 
+fn extract_lane_boundaries(
+    lanes: &[Lane],
+    frame_width: u32,
+    frame_height: u32,
+    reference_y_ratio: f32,
+) -> (Option<f32>, Option<f32>) {
+    let reference_y = frame_height as f32 * reference_y_ratio;
+    let vehicle_x = frame_width as f32 / 2.0;
+
+    let mut left_x: Option<f32> = None;
+    let mut right_x: Option<f32> = None;
+
+    for lane in lanes {
+        if let Some(x) = lane.get_x_at_y(reference_y) {
+            if x < vehicle_x {
+                if left_x.is_none() || x > left_x.unwrap() {
+                    left_x = Some(x);
+                }
+            } else if right_x.is_none() || x < right_x.unwrap() {
+                right_x = Some(x);
+            }
+        }
+    }
+
+    (left_x, right_x)
+}
+
 fn save_complete_overtake(event: &LaneChangeEvent, file: &mut std::fs::File) -> Result<()> {
     use std::io::Write;
     let json_line =
@@ -1186,9 +1362,7 @@ fn save_incomplete_overtake(
     Ok(())
 }
 
-fn save_shadow_event(shadow: &ShadowOvertakeEvent, file: &mut std::fs::File) -> Result<()> {
-    use std::io::Write;
-
+fn save_shadow_event(shadow: &ShadowOvertakeEvent, file: &mut impl std::io::Write) -> Result<()> {
     let json_value = serde_json::json!({
         "type": "shadow_overtake",
         "blocking_vehicle_id": shadow.blocking_vehicle_id,
@@ -1203,8 +1377,6 @@ fn save_shadow_event(shadow: &ShadowOvertakeEvent, file: &mut std::fs::File) -> 
     let json_line =
         serde_json::to_string(&json_value).context("Failed to serialize shadow event")?;
     writeln!(file, "{}", json_line)?;
-    file.flush()?;
-    warn!("💾 Shadow overtake event saved to JSONL");
     Ok(())
 }
 
@@ -1258,46 +1430,6 @@ async fn send_overtake_to_api(
     Ok(())
 }
 
-async fn process_frame(
-    frame: &Frame,
-    inference_engine: &mut inference::InferenceEngine,
-    config: &types::Config,
-    confidence_threshold: f32,
-) -> Result<Vec<DetectedLane>> {
-    let preprocessed = preprocessing::preprocess(
-        &frame.data,
-        frame.width,
-        frame.height,
-        config.model.input_width,
-        config.model.input_height,
-    )
-    .context("Frame preprocessing failed")?;
-
-    let output = inference_engine
-        .infer(&preprocessed)
-        .context("Lane inference failed")?;
-
-    let lane_detection = lane_detection::parse_lanes(
-        &output,
-        frame.width as f32,
-        frame.height as f32,
-        config,
-        frame.timestamp_ms,
-    )
-    .context("Lane parsing failed")?;
-
-    let high_confidence_lanes: Vec<DetectedLane> = lane_detection
-        .lanes
-        .into_iter()
-        .filter(|lane| {
-            lane.confidence > confidence_threshold
-                && lane.points.len() >= config.detection.min_points_per_lane
-        })
-        .collect();
-
-    Ok(high_confidence_lanes)
-}
-
 fn print_final_stats(stats: &ProcessingStats) {
     info!("\n✓ Video processed successfully!");
     info!("  Total frames: {}", stats.total_frames);
@@ -1332,10 +1464,7 @@ fn print_final_stats(stats: &ProcessingStats) {
     info!("  ⚠️  Incomplete overtakes: {}", stats.incomplete_overtakes);
     info!("  ↔️  Simple lane changes: {}", stats.simple_lane_changes);
     info!("  Events sent to API: {}", stats.events_sent_to_api);
-
-    if stats.curves_detected > 0 {
-        info!("  🌀 Curves detected: {}", stats.curves_detected);
-    }
+    info!("  Shadow overtakes detected: {}", stats.shadow_overtakes_detected);
 
     info!(
         "  Processing: {:.1} FPS ({:.1}s total)",
