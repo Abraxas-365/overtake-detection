@@ -124,11 +124,92 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+// Add this impl block to Config in types.rs
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let contents = std::fs::read_to_string(path)?;
-        let config: Config = serde_yaml::from_str(&contents)?;
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path))?;
+        let config: Config = serde_yaml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config YAML: {}", path))?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Validate configuration at startup — fail fast on bad values
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Model file must exist
+        if !std::path::Path::new(&self.model.path).exists() {
+            anyhow::bail!(
+                "Lane model not found: {}. Download it first.",
+                self.model.path
+            );
+        }
+
+        // Lane legality model (if enabled)
+        if self.lane_legality.enabled
+            && !std::path::Path::new(&self.lane_legality.model_path).exists()
+        {
+            anyhow::bail!(
+                "Lane legality model not found: {}. \
+                 Set lane_legality.enabled=false to disable.",
+                self.lane_legality.model_path
+            );
+        }
+
+        // Detection thresholds must make sense
+        if self.detection.drift_threshold >= self.detection.crossing_threshold {
+            anyhow::bail!(
+                "drift_threshold ({}) must be < crossing_threshold ({})",
+                self.detection.drift_threshold,
+                self.detection.crossing_threshold
+            );
+        }
+
+        if self.detection.drift_threshold <= 0.0 || self.detection.drift_threshold >= 1.0 {
+            anyhow::bail!(
+                "drift_threshold must be in (0, 1), got {}",
+                self.detection.drift_threshold
+            );
+        }
+
+        if self.detection.crossing_threshold <= 0.0 || self.detection.crossing_threshold >= 1.0 {
+            anyhow::bail!(
+                "crossing_threshold must be in (0, 1), got {}",
+                self.detection.crossing_threshold
+            );
+        }
+
+        // Duration sanity
+        if self.detection.min_lane_change_duration_ms >= self.detection.max_lane_change_duration_ms
+        {
+            anyhow::bail!(
+                "min_duration ({}) must be < max_duration ({})",
+                self.detection.min_lane_change_duration_ms,
+                self.detection.max_lane_change_duration_ms
+            );
+        }
+
+        // Video directory
+        if !std::path::Path::new(&self.video.input_dir).exists() {
+            anyhow::bail!("Video input directory not found: {}", self.video.input_dir);
+        }
+
+        // Ego bbox ratios
+        let bbox = &self.lane_legality.ego_bbox_ratio;
+        if bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
+            anyhow::bail!(
+                "ego_bbox_ratio invalid: x1 < x2 and y1 < y2 required, got {:?}",
+                bbox
+            );
+        }
+        for &v in bbox.iter() {
+            if !(0.0..=1.0).contains(&v) {
+                anyhow::bail!("ego_bbox_ratio values must be in [0, 1], got {:?}", bbox);
+            }
+        }
+
+        Ok(())
     }
 }
 
