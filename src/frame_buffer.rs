@@ -744,7 +744,7 @@ pub fn build_legality_request(
     if vehicles_overtaken_count > 0 {
         info!(
             "🎯 Vehicles overtaken: {} ({:?})",
-            vehicles_overtaken_count, overtaken_vehicle_types
+            vehicles_overtaken_count, metadata.overtaken_vehicle_types
         );
     }
 
@@ -766,15 +766,14 @@ pub fn build_legality_request(
 
     info!(
         "📐 Trajectory: shape={:.2}, smooth={:.2}, reversal={}",
-        trajectory_info.shape_score,
-        trajectory_info.smoothness,
-        trajectory_info.has_direction_reversal
+        metadata.trajectory_info.shape_score,
+        metadata.trajectory_info.smoothness,
+        metadata.trajectory_info.has_direction_reversal
     );
 
-    if let Some(ref path) = detection_path {
+    if let Some(ref path) = metadata.detection_path {
         info!("🔍 Detected via: {}", path);
     }
-
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // BUILD AND RETURN REQUEST
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

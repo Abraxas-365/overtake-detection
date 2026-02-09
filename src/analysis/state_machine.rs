@@ -1127,7 +1127,7 @@ impl LaneChangeStateMachine {
         (last - first).abs().max(swing)
     }
 
-    fn calculate_window_metrics(&self, _current_time_ms: f64, lane_width: f32) -> WindowMetrics {
+    fn calculate_window_metrics(&self, _current_time_ms: f64, _lane_width: f32) -> WindowMetrics {
         let mut metrics = WindowMetrics::default();
 
         if self.offset_samples.len() < 10 {
