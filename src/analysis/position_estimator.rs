@@ -67,7 +67,7 @@ impl PositionEstimator {
 
         let confident_lanes: Vec<&Lane> = lanes
             .iter()
-            .filter(|l| l.confidence > 0.2 && l.points.len() >= 3)
+            .filter(|l| l.confidence > 0.2 && l.points.len() >= 2)
             .collect();
 
         let left_lane = self.find_ego_lane(&confident_lanes, vehicle_x, true);

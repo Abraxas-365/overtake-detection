@@ -549,14 +549,13 @@ async fn process_video(
                     let y_top = frame.height as f32 * 0.45; // Horizon area
 
                     // Construct Left Lane
+                    let y_mid = (y_bottom + y_top) / 2.0;
                     let left_dl = DetectedLane {
-                        points: vec![(left_x, y_bottom), (left_x, y_top)],
+                        points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
                         confidence: conf,
                     };
-
-                    // Construct Right Lane
                     let right_dl = DetectedLane {
-                        points: vec![(right_x, y_bottom), (right_x, y_top)],
+                        points: vec![(right_x, y_bottom), (right_x, y_mid), (right_x, y_top)],
                         confidence: conf,
                     };
 

@@ -466,31 +466,57 @@ impl LaneLegalityDetector {
         }
 
         // 4. Validate and Return
-        if let (Some((left, _)), Some((right, _))) = (left_candidate, right_candidate) {
-            let left_x = (left.bbox[0] + left.bbox[2]) / 2.0;
-            let right_x = (right.bbox[0] + right.bbox[2]) / 2.0;
-
-            // Sanity Check: Lane width
-            let lane_width = right_x - left_x;
-            if lane_width < 250.0 || lane_width > 900.0 {
+        match (left_candidate, right_candidate) {
+            (Some((left, _)), Some((right, _))) => {
+                let left_x = (left.bbox[0] + left.bbox[2]) / 2.0;
+                let right_x = (right.bbox[0] + right.bbox[2]) / 2.0;
+                let lane_width = right_x - left_x;
+                if lane_width < 250.0 || lane_width > 900.0 {
+                    debug!(
+                        "⚠️ YOLO-Primary: Rejected unreasonable lane width: {:.1}px",
+                        lane_width
+                    );
+                    return Ok(None);
+                }
+                let avg_conf = (left.confidence + right.confidence) / 2.0;
                 debug!(
-                    "⚠️ YOLO-Primary: Rejected unreasonable lane width: {:.1}px",
-                    lane_width
+                    "✅ YOLO-Primary: L={:.0} ({}), R={:.0} ({}), Width={:.0}, Conf={:.2}",
+                    left_x, left.class_name, right_x, right.class_name, lane_width, avg_conf
                 );
-                return Ok(None);
+                Ok(Some((left_x, right_x, avg_conf)))
             }
-
-            let avg_conf = (left.confidence + right.confidence) / 2.0;
-
-            // Debug log to confirm it's working
-            debug!(
-                "✅ YOLO-Primary: L={:.0} ({}), R={:.0} ({}), Width={:.0}, Conf={:.2}",
-                left_x, left.class_name, right_x, right.class_name, lane_width, avg_conf
-            );
-
-            Ok(Some((left_x, right_x, avg_conf)))
-        } else {
-            Ok(None) // Only found one side or neither
+            (Some((left, _)), None) => {
+                // Single left boundary — estimate right from default width
+                let left_x = (left.bbox[0] + left.bbox[2]) / 2.0;
+                let est_width = 500.0; // reasonable default for desert roads
+                let right_x = left_x + est_width;
+                if right_x > width as f32 * 0.95 {
+                    return Ok(None);
+                }
+                debug!(
+                    "⚠️ YOLO-Primary (LEFT only): L={:.0}, est_R={:.0}, Conf={:.2}",
+                    left_x,
+                    right_x,
+                    left.confidence * 0.7
+                );
+                Ok(Some((left_x, right_x, left.confidence * 0.7)))
+            }
+            (None, Some((right, _))) => {
+                let right_x = (right.bbox[0] + right.bbox[2]) / 2.0;
+                let est_width = 500.0;
+                let left_x = right_x - est_width;
+                if left_x < width as f32 * 0.05 {
+                    return Ok(None);
+                }
+                debug!(
+                    "⚠️ YOLO-Primary (RIGHT only): est_L={:.0}, R={:.0}, Conf={:.2}",
+                    left_x,
+                    right_x,
+                    right.confidence * 0.7
+                );
+                Ok(Some((left_x, right_x, right.confidence * 0.7)))
+            }
+            (None, None) => Ok(None),
         }
     }
 
