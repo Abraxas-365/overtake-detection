@@ -352,58 +352,45 @@ impl AdaptiveBaseline {
     }
 
     fn update_guarded(&mut self, measurement: f32, confidence: f32) -> f32 {
+        // PRODUCTION FIX: If YOLO confidence is low, don't move the baseline.
         if confidence < 0.4 {
             self.frames_without_lanes += 1;
             return self.value;
         }
 
         self.sample_count += 1;
-
-        if self.frames_without_lanes > OCCLUSION_SHORT_THRESHOLD {
-            info!(
-                "🚨 Fast recovery mode after {}s occlusion",
-                self.frames_without_lanes as f32 / 30.0
-            );
-            self.is_adapting = true;
-            self.stable_frames = 0;
-            self.just_recovered_from_occlusion = true;
-            self.fast_recovery_frames = 30;
-        }
-
         self.frames_without_lanes = 0;
 
         if self.is_frozen {
             return self.frozen_value;
         }
 
+        // FIX: First sample after reset should SNAP to measurement,
+        // not blend with stale 0.0
         if self.sample_count == 1 {
             self.value = measurement;
             return self.value;
         }
 
-        let alpha = if self.fast_recovery_frames > 0 {
-            self.fast_recovery_frames -= 1;
-            if self.fast_recovery_frames == 0 {
-                self.just_recovered_from_occlusion = false;
-                info!("✅ Fast recovery complete");
-            }
-            EWMA_ALPHA_FAST_RECOVER
-        } else if !self.is_valid {
-            EWMA_ALPHA_ADAPTING
+        // FIX: Use faster alpha during initial establishment phase,
+        // then slow down once baseline is stable.
+        // NO fast recovery here — that only belongs in update(), not update_guarded()
+        let alpha = if !self.is_valid {
+            EWMA_ALPHA_ADAPTING // 0.015 — 5x faster during establishment
         } else if self.is_adapting {
-            EWMA_ALPHA_ADAPTING
+            EWMA_ALPHA_ADAPTING // 0.015
         } else {
-            EWMA_ALPHA_STABLE
+            EWMA_ALPHA_STABLE // 0.003 — slow once locked in
         };
 
         self.value = alpha * measurement + (1.0 - alpha) * self.value;
         self.is_valid = self.sample_count >= EWMA_MIN_SAMPLES;
 
+        // Track variance for adapting/stable transition
         self.recent_samples.push_back(measurement);
         if self.recent_samples.len() > 30 {
             self.recent_samples.pop_front();
         }
-
         if self.recent_samples.len() >= 10 {
             let samples: Vec<f32> = self.recent_samples.iter().copied().collect();
             let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
