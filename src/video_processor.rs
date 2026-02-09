@@ -1,5 +1,5 @@
 // src/video_processor.rs
-use crate::lane_legality::LegalityResult; // 🆕 NEW IMPORT
+use crate::lane_legality::LegalityResult;
 use crate::overtake_analyzer::{OvertakeEvent, TrackedVehicle};
 use crate::shadow_overtake::{ShadowOvertakeDetector, ShadowSeverity};
 use crate::types::CurveInfo;
@@ -112,7 +112,6 @@ impl VideoProcessor {
         let mut bgr_mat = Mat::default();
         imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
 
-        // Use imgcodecs::imwrite
         let params = Vector::new();
         imgcodecs::imwrite(file_path.to_str().unwrap(), &bgr_mat, &params)?;
 
@@ -159,12 +158,11 @@ impl VideoReader {
     }
 }
 
-/// Ultra-rich visualization with complete telemetry overlay + LEGALITY
-// src/video_processor.rs
+// ══════════════════════════════════════════════════════════════════════════
+// YOLO-PRIMARY VISUALIZATION - Full telemetry overlay
+// ══════════════════════════════════════════════════════════════════════════
 
-// ... existing imports ...
-
-/// Ultra-rich visualization with complete telemetry overlay + LEGALITY + SOURCE
+/// YOLO-seg primary visualization with full telemetry overlay + LEGALITY
 pub fn draw_lanes_with_state_enhanced(
     frame: &[u8],
     width: i32,
@@ -182,7 +180,7 @@ pub fn draw_lanes_with_state_enhanced(
     curve_info: Option<CurveInfo>,
     lateral_velocity: f32,
     legality_result: Option<&LegalityResult>,
-    detection_source: &str, // 🆕 ADDED: Source parameter
+    detection_source: &str,
 ) -> Result<Mat> {
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
@@ -191,20 +189,33 @@ pub fn draw_lanes_with_state_enhanced(
     let mut output = bgr_mat.try_clone()?;
 
     // ══════════════════════════════════════════════════════════════════════
-    // 1. DRAW LANE MARKINGS
+    // 1. DRAW LANE MARKINGS (YOLO-seg detected boundaries)
     // ══════════════════════════════════════════════════════════════════════
     let lane_colors = vec![
-        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red
-        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green
-        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0), // Red - left boundary
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0), // Green - right boundary
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0), // Blue
         core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
     ];
 
     for (i, lane) in lanes.iter().enumerate() {
         let color = lane_colors[i % lane_colors.len()];
+        let thickness = if i < 2 { 4 } else { 2 }; // Thicker for primary ego boundaries
+
+        // Draw lane points
         for point in &lane.points {
             let pt = core::Point::new(point.0 as i32, point.1 as i32);
-            imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
+            imgproc::circle(&mut output, pt, thickness, color, -1, imgproc::LINE_8, 0)?;
+        }
+
+        // Connect lane points with lines for better visibility
+        if lane.points.len() >= 2 {
+            for j in 0..lane.points.len() - 1 {
+                let pt1 = core::Point::new(lane.points[j].0 as i32, lane.points[j].1 as i32);
+                let pt2 =
+                    core::Point::new(lane.points[j + 1].0 as i32, lane.points[j + 1].1 as i32);
+                imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
+            }
         }
     }
 
@@ -235,10 +246,6 @@ pub fn draw_lanes_with_state_enhanced(
                 let is_shadow_blocker = shadow_vehicle_ids.contains(vehicle_id);
                 let was_overtaken = overtaken_vehicle_ids.contains(vehicle_id);
 
-                // Color coding:
-                // RED = shadow blocker (danger!)
-                // CYAN = overtaken vehicle
-                // GREEN = normal tracked vehicle
                 let box_color = if is_shadow_blocker {
                     core::Scalar::new(0.0, 0.0, 255.0, 0.0) // RED
                 } else if was_overtaken {
@@ -261,18 +268,17 @@ pub fn draw_lanes_with_state_enhanced(
                     0,
                 )?;
 
-                // Label with status icons
+                // Label with YOLO class + confidence
                 let label = if is_shadow_blocker {
-                    format!("⚠ BLOCKING {} #{}", vehicle.class_name, vehicle_id)
+                    format!("! BLOCKING {} #{}", vehicle.class_name, vehicle_id)
                 } else if was_overtaken {
-                    format!("✓ {} #{}", vehicle.class_name, vehicle_id)
+                    format!("v {} #{}", vehicle.class_name, vehicle_id)
                 } else {
                     format!("{} #{}", vehicle.class_name, vehicle_id)
                 };
 
                 let label_pos = core::Point::new(bbox[0] as i32, (bbox[1] as i32) - 5);
 
-                // Background for label
                 let label_size =
                     imgproc::get_text_size(&label, imgproc::FONT_HERSHEY_SIMPLEX, 0.5, 1, &mut 0)?;
 
@@ -347,20 +353,20 @@ pub fn draw_lanes_with_state_enhanced(
     // ══════════════════════════════════════════════════════════════════════
     let mut banner_active = false;
     let mut banner_text = String::new();
-    let mut banner_color = core::Scalar::new(0.0, 0.0, 200.0, 0.0); // Default red
+    let mut banner_color = core::Scalar::new(0.0, 0.0, 200.0, 0.0);
 
     if shadow_detector.is_monitoring() && shadow_detector.active_shadow_count() > 0 {
         banner_active = true;
         banner_text = format!(
-            "⚠ SHADOW OVERTAKE: {} vehicle(s) blocking visibility! DANGER!",
+            "! SHADOW OVERTAKE: {} vehicle(s) blocking visibility! DANGER!",
             shadow_detector.active_shadow_count()
         );
-        banner_color = core::Scalar::new(0.0, 0.0, 255.0, 0.0); // Bright red
+        banner_color = core::Scalar::new(0.0, 0.0, 255.0, 0.0);
     } else if let Some(curve) = curve_info {
         if curve.is_curve && is_overtaking {
             banner_active = true;
             banner_text = format!(
-                "⚠ OVERTAKING IN {} CURVE ({:.1}°) - ILLEGAL!",
+                "! OVERTAKING IN {} CURVE ({:.1}) - ILLEGAL!",
                 match curve.curve_type {
                     crate::types::CurveType::Sharp => "SHARP",
                     crate::types::CurveType::Moderate => "MODERATE",
@@ -368,7 +374,7 @@ pub fn draw_lanes_with_state_enhanced(
                 },
                 curve.angle_degrees
             );
-            banner_color = core::Scalar::new(0.0, 100.0, 255.0, 0.0); // Orange-red
+            banner_color = core::Scalar::new(0.0, 100.0, 255.0, 0.0);
         }
     }
 
@@ -407,11 +413,11 @@ pub fn draw_lanes_with_state_enhanced(
             let color = match legality.verdict {
                 crate::lane_legality::LineLegality::CriticalIllegal => {
                     core::Scalar::new(0.0, 0.0, 255.0, 0.0)
-                } // Bright red
+                }
                 crate::lane_legality::LineLegality::Illegal => {
                     core::Scalar::new(0.0, 50.0, 200.0, 0.0)
-                } // Dark red
-                _ => core::Scalar::new(0.0, 200.0, 255.0, 0.0), // Yellow
+                }
+                _ => core::Scalar::new(0.0, 200.0, 255.0, 0.0),
             };
 
             imgproc::rectangle(
@@ -430,7 +436,7 @@ pub fn draw_lanes_with_state_enhanced(
                 .unwrap_or("SOLID LINE");
 
             let text = format!(
-                "⚠ ILLEGAL CROSSING: {} — VIOLATION DS 016-2009-MTC",
+                "! ILLEGAL CROSSING: {} - VIOLATION DS 016-2009-MTC",
                 line_name.to_uppercase()
             );
 
@@ -444,7 +450,7 @@ pub fn draw_lanes_with_state_enhanced(
                 2,
             )?;
 
-            banner_active = true; // Mark banner as active for panel positioning
+            banner_active = true;
         }
 
         // Draw detected road markings with color-coded bboxes
@@ -452,10 +458,10 @@ pub fn draw_lanes_with_state_enhanced(
             use crate::lane_legality::LineLegality;
 
             let box_color = match marking.legality {
-                LineLegality::CriticalIllegal => core::Scalar::new(0.0, 0.0, 255.0, 0.0), // RED
-                LineLegality::Illegal => core::Scalar::new(0.0, 100.0, 255.0, 0.0), // ORANGE-RED
-                LineLegality::Legal => core::Scalar::new(0.0, 255.0, 0.0, 0.0),     // GREEN
-                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),                   // GRAY
+                LineLegality::CriticalIllegal => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                LineLegality::Illegal => core::Scalar::new(0.0, 100.0, 255.0, 0.0),
+                LineLegality::Legal => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),
             };
 
             let pt1 = core::Point::new(marking.bbox[0] as i32, marking.bbox[1] as i32);
@@ -487,23 +493,22 @@ pub fn draw_lanes_with_state_enhanced(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 5. LEFT PANEL: VEHICLE STATE & POSITIONING
+    // 5. LEFT PANEL: YOLO-SEG DETECTION & VEHICLE STATE
     // ══════════════════════════════════════════════════════════════════════
     let panel_x = 15;
     let mut panel_y = if banner_active { 80 } else { 30 };
     let line_height = 26;
 
-    // Semi-transparent background
-    draw_panel_background(&mut output, 5, panel_y - 10, 450, 310)?;
+    draw_panel_background(&mut output, 5, panel_y - 10, 460, 340)?;
 
-    // Title
+    // Title — YOLO-primary branding
     draw_text_with_shadow(
         &mut output,
-        "VEHICLE STATUS",
+        "YOLO-SEG LANE DETECTION",
         panel_x,
         panel_y,
         0.7,
-        core::Scalar::new(100.0, 200.0, 255.0, 0.0),
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Cyan title
         2,
     )?;
     panel_y += line_height;
@@ -520,16 +525,29 @@ pub fn draw_lanes_with_state_enhanced(
     )?;
     panel_y += line_height;
 
-    // 🆕 DETECTION SOURCE (YOLO vs UFLD)
-    let source_color = if detection_source.contains("YOLO") {
-        core::Scalar::new(0.0, 255.0, 255.0, 0.0) // Yellow for YOLO
-    } else {
-        core::Scalar::new(200.0, 200.0, 200.0, 0.0) // Gray for UFLD/Fallback
+    // Detection source — color-coded by detector
+    let (source_label, source_color) = match detection_source {
+        s if s.contains("YOLO_SEG") => (
+            "YOLO-seg (Primary)",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0), // Green — primary hit
+        ),
+        s if s.contains("YOLO_MISS") => (
+            "YOLO-seg MISS",
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0), // Red — no detection
+        ),
+        s if s.contains("UFLD") || s.contains("FALLBACK") => (
+            "Fallback (UFLDv2)",
+            core::Scalar::new(0.0, 165.0, 255.0, 0.0), // Orange — fallback
+        ),
+        _ => (
+            detection_source,
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        ),
     };
 
     draw_text_with_shadow(
         &mut output,
-        &format!("Source: {}", detection_source),
+        &format!("Detector: {}", source_label),
         panel_x,
         panel_y,
         0.6,
@@ -538,11 +556,48 @@ pub fn draw_lanes_with_state_enhanced(
     )?;
     panel_y += line_height;
 
+    // Boundary count indicator
+    let boundary_count = lanes.len();
+    let (boundary_label, boundary_color) = match boundary_count {
+        0 => ("Boundaries: NONE", core::Scalar::new(0.0, 0.0, 255.0, 0.0)),
+        1 => (
+            "Boundaries: 1 (estimated)",
+            core::Scalar::new(0.0, 200.0, 255.0, 0.0),
+        ),
+        2 => (
+            "Boundaries: 2 (L+R)",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        ),
+        n => (
+            "Boundaries: MULTI",
+            core::Scalar::new(0.0, 255.0, 200.0, 0.0),
+        ),
+    };
+
+    // We need to format dynamically for the multi case
+    let boundary_text = if boundary_count > 2 {
+        format!("Boundaries: {} detected", boundary_count)
+    } else {
+        boundary_label.to_string()
+    };
+
+    draw_text_with_shadow(
+        &mut output,
+        &boundary_text,
+        panel_x,
+        panel_y,
+        0.55,
+        boundary_color,
+        1,
+    )?;
+    panel_y += line_height;
+
     // Lane change state with color coding
     let state_color = match state {
         "CENTERED" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         "DRIFTING" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
         "CROSSING" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        "COMPLETED" => core::Scalar::new(255.0, 255.0, 0.0, 0.0),
         _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
     };
 
@@ -577,25 +632,32 @@ pub fn draw_lanes_with_state_enhanced(
             )?;
             panel_y += line_height;
 
+            // Velocity with color ramp
+            let vel_color = if lateral_velocity.abs() > 200.0 {
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0) // Red — spike
+            } else if lateral_velocity.abs() > 100.0 {
+                core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange — high
+            } else if lateral_velocity.abs() > 60.0 {
+                core::Scalar::new(0.0, 255.0, 255.0, 0.0) // Yellow — medium
+            } else {
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0) // White — normal
+            };
+
             draw_text_with_shadow(
                 &mut output,
                 &format!("Lateral Velocity: {:.1} px/s", lateral_velocity),
                 panel_x,
                 panel_y,
                 0.55,
-                if lateral_velocity.abs() > 100.0 {
-                    core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange for high velocity
-                } else {
-                    core::Scalar::new(255.0, 255.0, 255.0, 0.0)
-                },
+                vel_color,
                 1,
             )?;
             panel_y += line_height;
 
-            if let Some(width) = vs.lane_width {
+            if let Some(lw) = vs.lane_width {
                 draw_text_with_shadow(
                     &mut output,
-                    &format!("Lane Width: {:.0}px", width),
+                    &format!("Lane Width: {:.0}px", lw),
                     panel_x,
                     panel_y,
                     0.55,
@@ -604,20 +666,20 @@ pub fn draw_lanes_with_state_enhanced(
                 )?;
                 panel_y += line_height;
             }
+        } else {
+            // Invalid state — show occlusion indicator
+            draw_text_with_shadow(
+                &mut output,
+                "Position: NO VALID LANES",
+                panel_x,
+                panel_y,
+                0.55,
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                1,
+            )?;
+            panel_y += line_height;
         }
     }
-
-    // Lane detection quality
-    draw_text_with_shadow(
-        &mut output,
-        &format!("Lanes Detected: {}", lanes.len()),
-        panel_x,
-        panel_y,
-        0.55,
-        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-        1,
-    )?;
-    panel_y += line_height;
 
     // Tracked vehicles
     let active_vehicles = tracked_vehicles
@@ -632,7 +694,7 @@ pub fn draw_lanes_with_state_enhanced(
 
     draw_text_with_shadow(
         &mut output,
-        &format!("Vehicles Tracked: {}", active_vehicles),
+        &format!("YOLO Vehicles: {}", active_vehicles),
         panel_x,
         panel_y,
         0.55,
@@ -670,7 +732,7 @@ pub fn draw_lanes_with_state_enhanced(
         if let Some(direction) = overtake_direction {
             draw_text_with_shadow(
                 &mut output,
-                &format!("🚀 OVERTAKING {} ➜", direction),
+                &format!(">> OVERTAKING {} >>", direction),
                 right_panel_x,
                 right_panel_y,
                 0.7,
@@ -697,7 +759,7 @@ pub fn draw_lanes_with_state_enhanced(
         draw_text_with_shadow(
             &mut output,
             &format!(
-                "✓ Overtaken: {} vehicle(s)",
+                "Overtaken: {} vehicle(s)",
                 vehicles_overtaken_this_maneuver.len()
             ),
             right_panel_x,
@@ -708,12 +770,11 @@ pub fn draw_lanes_with_state_enhanced(
         )?;
         right_panel_y += line_height;
 
-        // List overtaken vehicles
-        for (i, overtaken) in vehicles_overtaken_this_maneuver.iter().take(5).enumerate() {
+        for overtaken in vehicles_overtaken_this_maneuver.iter().take(5) {
             draw_text_with_shadow(
                 &mut output,
                 &format!(
-                    "  • {} (ID #{})",
+                    "  * {} (ID #{})",
                     overtaken.class_name, overtaken.vehicle_id
                 ),
                 right_panel_x + 10,
@@ -753,7 +814,7 @@ pub fn draw_lanes_with_state_enhanced(
         right_panel_y += line_height;
     }
 
-    right_panel_y += 10; // Spacing
+    right_panel_y += 10;
 
     // Shadow overtake status
     if shadow_detector.is_monitoring() {
@@ -762,7 +823,7 @@ pub fn draw_lanes_with_state_enhanced(
         if shadow_count > 0 {
             draw_text_with_shadow(
                 &mut output,
-                &format!("⚠ SHADOW: {} vehicle(s)", shadow_count),
+                &format!("! SHADOW: {} vehicle(s)", shadow_count),
                 right_panel_x,
                 right_panel_y,
                 0.65,
@@ -790,12 +851,11 @@ pub fn draw_lanes_with_state_enhanced(
                 right_panel_y += line_height;
             }
 
-            // List shadow blockers
             for shadow in shadow_detector.get_current_shadows().iter().take(3) {
                 draw_text_with_shadow(
                     &mut output,
                     &format!(
-                        "  • {} ID #{} blocking",
+                        "  * {} ID #{} blocking",
                         shadow.blocking_vehicle_class, shadow.blocking_vehicle_id
                     ),
                     right_panel_x + 10,
@@ -826,7 +886,7 @@ pub fn draw_lanes_with_state_enhanced(
             draw_text_with_shadow(
                 &mut output,
                 &format!(
-                    "🌀 Curve: {} ({:.1}°)",
+                    "Curve: {} ({:.1} deg)",
                     match curve.curve_type {
                         crate::types::CurveType::Sharp => "SHARP",
                         crate::types::CurveType::Moderate => "MODERATE",
@@ -846,57 +906,55 @@ pub fn draw_lanes_with_state_enhanced(
     // ══════════════════════════════════════════════════════════════════════
     // 7. LEGEND (Bottom Right)
     // ══════════════════════════════════════════════════════════════════════
-    let legend_y = height - 140; // Extended to fit legality colors
-    draw_panel_background(&mut output, width - 250, legend_y - 10, 240, 130)?;
+    let legend_y = height - 160;
+    draw_panel_background(&mut output, width - 280, legend_y - 10, 270, 155)?;
 
     draw_text_with_shadow(
         &mut output,
         "LEGEND",
-        width - 240,
+        width - 270,
         legend_y,
         0.5,
         core::Scalar::new(200.0, 200.0, 200.0, 0.0),
         1,
     )?;
 
-    let legend_items = vec![
+    let legend_items: Vec<(&str, core::Scalar)> = vec![
         (
-            "🟢 Green box:",
-            "Tracked vehicle",
+            "[GREEN] YOLO-seg primary hit",
             core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         ),
         (
-            "🔵 Cyan box:",
-            "Overtaken vehicle",
+            "[ORANGE] UFLDv2 fallback",
+            core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        ),
+        (
+            "[RED] No lane detection",
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+        ),
+        (
+            "[GREEN box] Tracked vehicle",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            "[CYAN box] Overtaken vehicle",
             core::Scalar::new(255.0, 255.0, 0.0, 0.0),
         ),
         (
-            "🔴 Red box:",
-            "Shadow blocker!",
+            "[RED box] Shadow blocker!",
             core::Scalar::new(0.0, 0.0, 255.0, 0.0),
         ),
         (
-            "🟡 Yellow:",
-            "Your vehicle",
+            "[YELLOW] Ego vehicle",
             core::Scalar::new(0.0, 255.0, 255.0, 0.0),
-        ),
-        (
-            "🟢 Green line:",
-            "LEGAL crossing",
-            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-        ),
-        (
-            "🔴 Red line:",
-            "ILLEGAL crossing",
-            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
         ),
     ];
 
-    for (i, (label, desc, color)) in legend_items.iter().enumerate() {
+    for (i, (label, color)) in legend_items.iter().enumerate() {
         draw_text_with_shadow(
             &mut output,
-            &format!("{} {}", label, desc),
-            width - 235,
+            label,
+            width - 265,
             legend_y + 20 + (i as i32 * 18),
             0.38,
             *color,
@@ -912,7 +970,6 @@ pub fn draw_lanes_with_state_enhanced(
 // ══════════════════════════════════════════════════════════════════════════
 
 fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32) -> Result<()> {
-    // Create overlay on a clone to avoid borrow conflict
     let mut overlay = img.clone();
     imgproc::rectangle(
         &mut overlay,
@@ -923,14 +980,10 @@ fn draw_panel_background(img: &mut Mat, x: i32, y: i32, width: i32, height: i32)
         0,
     )?;
 
-    // Blend with original (70% overlay, 30% original)
     let mut result = Mat::default();
     core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, &mut result, -1)?;
-
-    // Copy result back to img
     result.copy_to(img)?;
 
-    // Border
     imgproc::rectangle(
         img,
         core::Rect::new(x, y, width, height),
@@ -981,6 +1034,7 @@ fn draw_text_with_shadow(
     Ok(())
 }
 
+/// Simple visualization fallback (minimal overlay)
 pub fn draw_lanes_with_state(
     frame: &[u8],
     width: i32,
@@ -1007,6 +1061,16 @@ pub fn draw_lanes_with_state(
         for point in &lane.points {
             let pt = core::Point::new(point.0 as i32, point.1 as i32);
             imgproc::circle(&mut output, pt, 3, color, -1, imgproc::LINE_8, 0)?;
+        }
+
+        // Connect points
+        if lane.points.len() >= 2 {
+            for j in 0..lane.points.len() - 1 {
+                let pt1 = core::Point::new(lane.points[j].0 as i32, lane.points[j].1 as i32);
+                let pt2 =
+                    core::Point::new(lane.points[j + 1].0 as i32, lane.points[j + 1].1 as i32);
+                imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
+            }
         }
     }
 
