@@ -839,7 +839,7 @@ async fn process_video(
                 &frame.data,
                 reader.width,
                 reader.height,
-                &detected_lanes_for_draw, // Use the detected lanes for drawing
+                &final_analysis_lanes, // Make sure you are passing the FINAL lanes here!
                 analyzer.current_state(),
                 analyzer.last_vehicle_state(),
                 overtake_analyzer.get_tracked_vehicles(),
@@ -851,7 +851,8 @@ async fn process_video(
                 &current_overtake_vehicles,
                 Some(curve_info),
                 lateral_velocity,
-                legality_for_overlay,
+                legality_buffer.latest_as_legality_result().as_ref(),
+                detection_source, // 👈 ADD THIS ARGUMENT (passed from the loop
             ) {
                 use opencv::videoio::VideoWriterTrait;
                 w.write(&annotated)?;

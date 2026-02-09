@@ -160,6 +160,11 @@ impl VideoReader {
 }
 
 /// Ultra-rich visualization with complete telemetry overlay + LEGALITY
+// src/video_processor.rs
+
+// ... existing imports ...
+
+/// Ultra-rich visualization with complete telemetry overlay + LEGALITY + SOURCE
 pub fn draw_lanes_with_state_enhanced(
     frame: &[u8],
     width: i32,
@@ -176,7 +181,8 @@ pub fn draw_lanes_with_state_enhanced(
     vehicles_overtaken_this_maneuver: &[OvertakeEvent],
     curve_info: Option<CurveInfo>,
     lateral_velocity: f32,
-    legality_result: Option<&LegalityResult>, // 🆕 NEW PARAMETER
+    legality_result: Option<&LegalityResult>,
+    detection_source: &str, // 🆕 ADDED: Source parameter
 ) -> Result<Mat> {
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
@@ -391,7 +397,7 @@ pub fn draw_lanes_with_state_enhanced(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 4.5 🆕 LEGALITY BANNER (Overrides normal banner if illegal)
+    // 4.5 LEGALITY BANNER (Overrides normal banner if illegal)
     // ══════════════════════════════════════════════════════════════════════
     if let Some(legality) = legality_result {
         if legality.ego_intersects_marking && legality.verdict.is_illegal() {
@@ -441,7 +447,7 @@ pub fn draw_lanes_with_state_enhanced(
             banner_active = true; // Mark banner as active for panel positioning
         }
 
-        // 🆕 Draw detected road markings with color-coded bboxes
+        // Draw detected road markings with color-coded bboxes
         for marking in &legality.all_markings {
             use crate::lane_legality::LineLegality;
 
@@ -488,7 +494,7 @@ pub fn draw_lanes_with_state_enhanced(
     let line_height = 26;
 
     // Semi-transparent background
-    draw_panel_background(&mut output, 5, panel_y - 10, 450, 280)?;
+    draw_panel_background(&mut output, 5, panel_y - 10, 450, 310)?;
 
     // Title
     draw_text_with_shadow(
@@ -511,6 +517,24 @@ pub fn draw_lanes_with_state_enhanced(
         0.5,
         core::Scalar::new(200.0, 200.0, 200.0, 0.0),
         1,
+    )?;
+    panel_y += line_height;
+
+    // 🆕 DETECTION SOURCE (YOLO vs UFLD)
+    let source_color = if detection_source.contains("YOLO") {
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0) // Yellow for YOLO
+    } else {
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0) // Gray for UFLD/Fallback
+    };
+
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Source: {}", detection_source),
+        panel_x,
+        panel_y,
+        0.6,
+        source_color,
+        2,
     )?;
     panel_y += line_height;
 
@@ -822,7 +846,7 @@ pub fn draw_lanes_with_state_enhanced(
     // ══════════════════════════════════════════════════════════════════════
     // 7. LEGEND (Bottom Right)
     // ══════════════════════════════════════════════════════════════════════
-    let legend_y = height - 140; // 🆕 Extended to fit legality colors
+    let legend_y = height - 140; // Extended to fit legality colors
     draw_panel_background(&mut output, width - 250, legend_y - 10, 240, 130)?;
 
     draw_text_with_shadow(
@@ -857,13 +881,11 @@ pub fn draw_lanes_with_state_enhanced(
             core::Scalar::new(0.0, 255.0, 255.0, 0.0),
         ),
         (
-            // 🆕 NEW
             "🟢 Green line:",
             "LEGAL crossing",
             core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         ),
         (
-            // 🆕 NEW
             "🔴 Red line:",
             "ILLEGAL crossing",
             core::Scalar::new(0.0, 0.0, 255.0, 0.0),
