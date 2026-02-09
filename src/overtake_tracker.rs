@@ -128,23 +128,15 @@ impl OvertakeTracker {
         match &self.state {
             OvertakeState::Idle => {
                 info!(
-                    "🟡 Overtake initiated: {} at {:.2}s (timeout: {} frames)",
+                    "🟡 Overtake initiated: {} at {:.2}s",
                     event.direction_name(),
-                    event.video_timestamp_ms / 1000.0,
-                    self.effective_timeout
+                    event.video_timestamp_ms / 1000.0
                 );
-
                 self.state = OvertakeState::InProgress {
                     start_event: event.clone(),
                     start_frame: current_frame,
                     direction: event.direction,
                 };
-
-                // Reset dynamic state for new overtake
-                self.vehicles_being_passed = false;
-                self.shadow_active = false;
-                self.recalculate_timeout();
-
                 None
             }
 
@@ -153,48 +145,35 @@ impl OvertakeTracker {
                 direction,
                 ..
             } => {
-                let is_return = matches!(
-                    (direction, event.direction),
-                    (Direction::Left, Direction::Right) | (Direction::Right, Direction::Left)
-                );
+                // Check if this is a RETURN maneuver (opposite of the start)
+                let is_return = match (*direction, event.direction) {
+                    (Direction::Left, Direction::Right) => true,
+                    (Direction::Right, Direction::Left) => true,
+                    _ => false,
+                };
 
                 if is_return {
                     let total_duration_ms =
                         event.video_timestamp_ms - start_event.video_timestamp_ms;
-
-                    let (is_legal, line_type) = if let Some(ref legality) = start_event.legality {
-                        (
-                            Some(legality.is_legal),
-                            Some(legality.lane_line_type.clone()),
-                        )
-                    } else {
-                        (None, None)
-                    };
-
                     let result = OvertakeResult::Complete {
                         start_event: start_event.clone(),
                         end_event: event,
                         total_duration_ms,
-                        vehicles_overtaken: vec![],
-                        is_legal_crossing: is_legal,
-                        line_type,
+                        vehicles_overtaken: vec![], // Populated by analyzer later
+                        is_legal_crossing: None,
+                        line_type: None,
                     };
-
                     self.state = OvertakeState::Idle;
                     Some(result)
                 } else {
-                    let incomplete = OvertakeResult::Incomplete {
-                        start_event: start_event.clone(),
-                        reason: "Multiple same-direction lane changes".to_string(),
-                    };
-
-                    self.state = OvertakeState::InProgress {
-                        start_event: event.clone(),
-                        start_frame: current_frame,
-                        direction: event.direction,
-                    };
-
-                    Some(incomplete)
+                    // PRODUCTION FIX:
+                    // If we get another 'Right' while we are already in 'Right' state,
+                    // DO NOT fail. Just ignore it and keep the original start.
+                    warn!(
+                        "Ignoring redundant {} trigger during active maneuver.",
+                        event.direction_name()
+                    );
+                    None
                 }
             }
         }

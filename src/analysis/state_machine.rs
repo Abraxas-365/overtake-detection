@@ -346,6 +346,29 @@ impl AdaptiveBaseline {
         self.just_recovered_from_occlusion = false;
         self.fast_recovery_frames = 0;
     }
+
+    fn update_guarded(&mut self, measurement: f32, confidence: f32) -> f32 {
+        // PRODUCTION FIX: If YOLO confidence is low, don't move the baseline.
+        // This stops the "baseline drift" that creates false velocity spikes.
+        if confidence < 0.4 {
+            self.frames_without_lanes += 1;
+            return self.value;
+        }
+
+        self.sample_count += 1;
+        self.frames_without_lanes = 0;
+
+        // Sticky Alpha: Adjust baseline slower if we are currently "frozen" or "maneuvering"
+        let alpha = if self.is_frozen {
+            0.0
+        } else {
+            EWMA_ALPHA_STABLE
+        };
+
+        self.value = alpha * measurement + (1.0 - alpha) * self.value;
+        self.is_valid = self.sample_count >= EWMA_MIN_SAMPLES;
+        self.value
+    }
 }
 
 // ============================================================================
@@ -1854,3 +1877,123 @@ impl LaneChangeStateMachine {
     }
 }
 
+// src/analysis/state_machine.rs
+
+impl LaneChangeStateMachine {
+    pub fn update_perfect(
+        &mut self,
+        vehicle_state: &VehicleState,
+        frame_id: u64,
+        timestamp_ms: f64,
+        crossing_type: CrossingType,
+    ) -> Option<LaneChangeEvent> {
+        self.total_frames_processed += 1;
+
+        // 1. Initial skip logic to allow buffers to warm up
+        if self.total_frames_processed < self.config.skip_initial_frames {
+            return None;
+        }
+
+        // 2. Manage Cooldowns
+        if self.cooldown_remaining > 0 {
+            self.cooldown_remaining -= 1;
+            if self.cooldown_remaining == 0 {
+                self.state = LaneChangeState::Centered;
+                self.frames_in_state = 0;
+            }
+            return None;
+        }
+
+        if self.post_lane_change_grace > 0 {
+            self.post_lane_change_grace -= 1;
+        }
+
+        // 3. Handle Timeouts (Long drifts)
+        if let Some(event) = self.handle_timeouts(frame_id, timestamp_ms) {
+            return Some(event);
+        }
+
+        // 4. Mark Occlusion/Invalid Frames
+        if !vehicle_state.is_valid() {
+            self.adaptive_baseline.mark_no_lanes();
+            return None;
+        }
+
+        // 5. Position Normalization & Kalman Filtering
+        let lane_width = vehicle_state.lane_width.unwrap_or(450.0);
+        let raw_offset = vehicle_state.lateral_offset / lane_width;
+        let normalized_offset = self.position_filter.update(raw_offset);
+
+        // 6. PRODUCTION GUARD: Calculate Velocity only on High Confidence
+        // This prevents YOLO "box jumps" from creating fake high-velocity triggers.
+        let lateral_velocity = if vehicle_state.detection_confidence > 0.5 {
+            self.velocity_tracker
+                .get_velocity(vehicle_state.lateral_offset, timestamp_ms)
+        } else {
+            0.0 // Hold velocity at zero if YOLO is flickering
+        };
+
+        self.update_histories(normalized_offset, lateral_velocity);
+
+        // 7. PRODUCTION GUARD: Guarded Baseline Update
+        // Prevents "Baseline Poisoning" during turns or noisy stretches.
+        self.adaptive_baseline
+            .update_guarded(normalized_offset, vehicle_state.detection_confidence);
+
+        if !self.adaptive_baseline.is_valid {
+            return None;
+        }
+
+        // 8. Calculate Deviations from the "Sticky" Baseline
+        let baseline = self.adaptive_baseline.effective_value();
+        let signed_deviation = normalized_offset - baseline;
+        let deviation = signed_deviation.abs();
+        let current_direction = Direction::from_offset(signed_deviation);
+
+        // 9. Update Analyzers
+        self.trajectory_analyzer
+            .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
+        self.track_max_offset(deviation);
+        self.update_samples(
+            normalized_offset,
+            deviation,
+            timestamp_ms,
+            lateral_velocity,
+            current_direction,
+        );
+
+        // 10. Logic Windows
+        let window_metrics = self.calculate_window_metrics(timestamp_ms, lane_width);
+
+        // 11. State Transition Decision
+        let target_state = self.determine_target_state(
+            deviation,
+            crossing_type,
+            lateral_velocity,
+            current_direction,
+            &window_metrics,
+        );
+
+        // Debug log for production monitoring
+        if frame_id % 30 == 0 {
+            debug!(
+                "F{}: dev={:.1}%, state={:?}->{:?}, conf={:.2}",
+                frame_id,
+                deviation * 100.0,
+                self.state,
+                target_state,
+                vehicle_state.detection_confidence
+            );
+        }
+
+        // 12. Execute Transition
+        self.check_transition(
+            target_state,
+            current_direction,
+            frame_id,
+            timestamp_ms,
+            deviation,
+            normalized_offset,
+        )
+    }
+}

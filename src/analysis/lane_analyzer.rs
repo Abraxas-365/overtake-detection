@@ -171,3 +171,40 @@ impl LaneChangeAnalyzer {
         (self.frame_count, self.valid_estimates, valid_ratio)
     }
 }
+
+// src/analysis/lane_analyzer.rs
+
+impl LaneChangeAnalyzer {
+    pub fn analyze_perfect(
+        &mut self,
+        lanes: &[Lane],
+        frame_width: u32,
+        frame_height: u32,
+        frame_id: u64,
+        timestamp_ms: f64,
+    ) -> Option<LaneChangeEvent> {
+        self.frame_count += 1;
+
+        // Get raw position
+        let mut raw_state = self
+            .position_estimator
+            .estimate(lanes, frame_width, frame_height);
+        raw_state.frame_id = frame_id;
+        raw_state.timestamp_ms = timestamp_ms;
+
+        // Apply smoothing
+        let smoothed_state = self.smoother.smooth(raw_state);
+        self.last_state = Some(smoothed_state);
+
+        // Detect crossing
+        let (left_x, right_x) = self.get_lane_boundaries(lanes, frame_height);
+        let vehicle_x = frame_width as f32 / 2.0;
+        let crossing_type = self
+            .boundary_detector
+            .detect_crossing(left_x, right_x, vehicle_x);
+
+        // PRODUCTION CALL: Uses the guarded update logic to prevent baseline poisoning
+        self.state_machine
+            .update_perfect(&smoothed_state, frame_id, timestamp_ms, crossing_type)
+    }
+}

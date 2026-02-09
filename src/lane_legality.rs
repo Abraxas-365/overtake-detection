@@ -508,6 +508,35 @@ impl LaneLegalityDetector {
             .unwrap_or(DEFAULT_SINGLE_MARKING_WIDTH)
     }
 
+    pub fn estimate_ego_lane_boundaries_stable(
+        &mut self,
+        frame: &[u8],
+        width: usize,
+        height: usize,
+        vehicle_center_x: f32,
+    ) -> Result<Option<(f32, f32, f32)>> {
+        let raw_estimate =
+            self.estimate_ego_lane_boundaries(frame, width, height, vehicle_center_x)?;
+
+        if let Some((l, r, c)) = raw_estimate {
+            // PRODUCTION FIX: Temporal dampening of the YOLO box jump
+            // Prevents the false 'HighVelocity' triggers in the state machine
+            let smooth_l = match self.last_left_lane_x {
+                Some(prev) => prev * 0.7 + l * 0.3, // 70% history weight
+                None => l,
+            };
+            let smooth_r = match self.last_right_lane_x {
+                Some(prev) => prev * 0.7 + r * 0.3,
+                None => r,
+            };
+
+            self.last_left_lane_x = Some(smooth_l);
+            self.last_right_lane_x = Some(smooth_r);
+            return Ok(Some((smooth_l, smooth_r, c)));
+        }
+        Ok(None)
+    }
+
     // -----------------------------------------------------------------------
     // EGO LANE BOUNDARY ESTIMATION  v2
     // -----------------------------------------------------------------------
@@ -1107,4 +1136,3 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
-

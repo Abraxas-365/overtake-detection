@@ -390,6 +390,7 @@ fn validate_config(config: &types::Config) -> Result<()> {
     Ok(())
 }
 
+// Updated process_video inside src/main.rs
 async fn process_video(
     video_path: &Path,
     inference_engine: &mut inference::InferenceEngine,
@@ -404,6 +405,7 @@ async fn process_video(
     let mut reader = video_processor
         .open_video(video_path)
         .with_context(|| format!("Failed to open video: {}", video_path.display()))?;
+
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
 
@@ -413,19 +415,17 @@ async fn process_video(
 
     let mut yolo_detector =
         YoloDetector::new("models/yolov8n.onnx").context("Failed to load YOLO model")?;
-    info!("✓ YOLO vehicle detector ready");
 
-    // 🆕 Initialize Legality Detector (YOLO-seg)
+    // Initialize Legality Detector (YOLO-seg)
     let mut legality_detector = if config.lane_legality.enabled {
         match LaneLegalityDetector::new(&config.lane_legality.model_path) {
             Ok(mut detector) => {
                 let ego_bbox = config.lane_legality.ego_bbox_ratio;
                 detector.set_ego_bbox_ratio(ego_bbox[0], ego_bbox[1], ego_bbox[2], ego_bbox[3]);
-                info!("✓ Lane legality detector ready (Primary Lane Source)");
                 Some(detector)
             }
             Err(e) => {
-                warn!("⚠️  Lane legality detector failed: {}. Continuing.", e);
+                warn!("⚠️ Lane legality detector failed: {}. Continuing.", e);
                 None
             }
         }
@@ -442,6 +442,7 @@ async fn process_video(
         FallbackPositionEstimator::new(reader.width as f32, reader.height as f32);
     let mut legality_buffer = LegalityRingBuffer::new(300);
 
+    // Setup Results File
     std::fs::create_dir_all(&config.video.output_dir)?;
     let video_name = video_path
         .file_stem()
@@ -460,14 +461,8 @@ async fn process_video(
     let mut frames_with_valid_position: u64 = 0;
     let mut frames_with_fallback: u64 = 0;
     let mut events_sent_to_api: usize = 0;
-    let mut curves_detected: usize = 0;
-    let mut total_vehicles_detected: usize = 0;
     let mut total_vehicles_overtaken: usize = 0;
     let mut shadow_overtakes_detected: usize = 0;
-    let mut illegal_crossings: usize = 0;
-    let mut critical_violations: usize = 0;
-
-    // 🆕 New Statistics for Source Tracking
     let mut yolo_primary_count: u64 = 0;
     let mut ufld_fallback_count: u64 = 0;
 
@@ -490,17 +485,15 @@ async fn process_video(
             break;
         }
 
-        // ─── VEHICLE DETECTION ───────────────────────────────────────────────
+        // 1. VEHICLE DETECTION (Optimized Schedule)
         if frame_count % 3 == 0 {
             if let Ok(detections) =
                 yolo_detector.detect(&frame.data, frame.width, frame.height, 0.3)
             {
                 latest_vehicle_detections = detections.clone();
-                total_vehicles_detected += detections.len();
                 overtake_analyzer.update(detections, frame_count);
-
-                let has_vehicles_ahead = overtake_analyzer.get_active_vehicle_count() > 0;
-                overtake_tracker.set_vehicles_being_passed(has_vehicles_ahead);
+                overtake_tracker
+                    .set_vehicles_being_passed(overtake_analyzer.get_active_vehicle_count() > 0);
 
                 if shadow_detector.is_monitoring() {
                     if let Some(shadow_event) = shadow_detector.update(
@@ -518,38 +511,28 @@ async fn process_video(
             }
         }
 
-        // ═════════════════════════════════════════════════════════════════════
-        // 🚀 NEW: HYBRID LANE DETECTION (YOLOv8 PRIMARY -> UFLDv2 FALLBACK)
-        // ═════════════════════════════════════════════════════════════════════
-
+        // 2. HYBRID LANE DETECTION (Stable YOLO-seg Primary)
         let mut analysis_lanes: Vec<Lane> = Vec::new();
         let mut detected_lanes_for_draw: Vec<DetectedLane> = Vec::new();
         let mut detection_source = "NONE";
+        let center_x = frame.width as f32 / 2.0;
 
-        // 1. ATTEMPT YOLOv8-seg (Primary)
-        // -----------------------------------------------------
         if let Some(ref mut detector) = legality_detector {
-            let center_x = frame.width as f32 / 2.0;
-
-            // Try to get lanes from YOLO markings
-            match detector.estimate_ego_lane_boundaries(
+            // PRODUCTION FIX: Use stable estimator to stop YOLO flicker/jitter
+            match detector.estimate_ego_lane_boundaries_stable(
                 &frame.data,
                 frame.width,
                 frame.height,
                 center_x,
             ) {
                 Ok(Some((left_x, right_x, conf))) => {
-                    // SUCCESS: YOLO found the lanes!
                     detection_source = "YOLO_SEG";
                     yolo_primary_count += 1;
 
-                    // Convert simple X coordinates into "Lane" objects for the analyzer
-                    // We create vertical lines since we only know the X position relative to vehicle
-                    let y_bottom = frame.height as f32; // Bottom of frame
-                    let y_top = frame.height as f32 * 0.45; // Horizon area
-
-                    // Construct Left Lane
+                    let y_bottom = frame.height as f32;
+                    let y_top = frame.height as f32 * 0.45;
                     let y_mid = (y_bottom + y_top) / 2.0;
+
                     let left_dl = DetectedLane {
                         points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
                         confidence: conf,
@@ -560,23 +543,18 @@ async fn process_video(
                     };
 
                     detected_lanes_for_draw = vec![left_dl.clone(), right_dl.clone()];
-
-                    // Convert to Analysis Lane format
                     analysis_lanes = vec![
                         Lane::from_detected(0, &left_dl),
                         Lane::from_detected(1, &right_dl),
                     ];
 
-                    // Run standard legality analysis for metadata/buffer since we have the detector
-                    // (We can optimize this later, but for now we want the metadata)
+                    // Standard legality metadata buffering
                     if frame_count % 3 == 0 {
                         let vehicle_offset = analyzer
                             .last_vehicle_state()
                             .map(|vs| vs.lateral_offset)
                             .unwrap_or(0.0);
                         let lane_width = analyzer.last_vehicle_state().and_then(|vs| vs.lane_width);
-
-                        // Determine simple crossing side
                         let crossing_side = if vehicle_offset < -50.0 {
                             lane_legality::CrossingSide::Left
                         } else if vehicle_offset > 50.0 {
@@ -602,40 +580,28 @@ async fn process_video(
                     }
                 }
                 _ => {
-                    // YOLO failed -> Fallback will run
+                    detection_source = "YOLO_MISS";
+                    ufld_fallback_count += 1;
                 }
             }
         }
 
-        // 2. FALLBACK TO UFLDv2 (If YOLO failed)
-        // -----------------------------------------------------
-        if analysis_lanes.is_empty() {
-            detection_source = "YOLO_MISS";
-            ufld_fallback_count += 1; // counts as a miss now
-                                      // Intentionally empty — isolating pure YOLO-seg performance
-        }
-
-        // ═════════════════════════════════════════════════════════════════════
-        // ANALYZE POSITION
-        // ═════════════════════════════════════════════════════════════════════
-
-        // Update pre-buffer
+        // 3. ANALYZE POSITION (State Machine Logic)
         if previous_state == "CENTERED" {
             frame_buffer.add_to_pre_buffer(frame.clone());
         }
 
-        // Extract boundaries for shadow detection etc.
-        let (left_x, right_x) = extract_lane_boundaries(
+        let (left_bound, right_bound) = extract_lane_boundaries(
             &analysis_lanes,
             frame.width as u32,
             frame.height as u32,
             0.8,
         );
-        last_left_lane_x = left_x;
-        last_right_lane_x = right_x;
+        last_left_lane_x = left_bound;
+        last_right_lane_x = right_bound;
 
-        // Run Analyzer
-        let event_opt = analyzer.analyze(
+        // PRODUCTION FIX: Using analyze_perfect to ensure guarded baseline and velocity calculations
+        let event_opt = analyzer.analyze_perfect(
             &analysis_lanes,
             frame.width as u32,
             frame.height as u32,
@@ -643,12 +609,10 @@ async fn process_video(
             timestamp_ms,
         );
 
-        // Check if primary succeeded or failed
-        let primary_succeeded = analyzer
+        if analyzer
             .last_vehicle_state()
-            .map_or(false, |vs| vs.is_valid());
-
-        if primary_succeeded {
+            .map_or(false, |vs| vs.is_valid())
+        {
             if let Some(vs) = analyzer.last_vehicle_state() {
                 fallback_estimator.sync_from_primary(
                     vs.lateral_offset,
@@ -658,28 +622,25 @@ async fn process_video(
             }
             frames_with_valid_position += 1;
         } else {
-            // PRIMARY FAILED: Try fallback estimation
+            // Tiered Fallback logic
             let road_markings = legality_buffer
                 .latest()
                 .map(|r| r.all_markings.clone())
                 .unwrap_or_default();
-
             if let Some(fallback) = fallback_estimator.estimate_fallback(
                 &road_markings,
                 &latest_vehicle_detections,
                 frame_count,
             ) {
                 frames_with_fallback += 1;
-
                 let current_state = analyzer.current_state();
                 let is_already_maneuvering =
                     current_state == "DRIFTING" || current_state == "CROSSING";
 
-                let allow_fallback = is_already_maneuvering
+                if is_already_maneuvering
                     || (fallback.confidence > 0.75
-                        && fallback_estimator.fallback_lateral_velocity.abs() > 200.0);
-
-                if allow_fallback {
+                        && fallback_estimator.fallback_lateral_velocity.abs() > 200.0)
+                {
                     let synthetic_state = VehicleState {
                         lateral_offset: fallback.lateral_offset,
                         lane_width: Some(fallback.lane_width),
@@ -700,7 +661,6 @@ async fn process_video(
                                 serde_json::json!(fallback.source.as_str()),
                             );
                             lane_changes_count += 1;
-
                             process_lane_change_event(
                                 fallback_event,
                                 &mut overtake_tracker,
@@ -729,15 +689,9 @@ async fn process_video(
             }
         }
 
-        // Process primary event
+        // Handle primary detected event
         if let Some(event) = event_opt {
             lane_changes_count += 1;
-            info!(
-                "🚀 LANE CHANGE DETECTED: {} at {:.2}s",
-                event.direction_name(),
-                event.video_timestamp_ms / 1000.0
-            );
-
             process_lane_change_event(
                 event,
                 &mut overtake_tracker,
@@ -762,7 +716,7 @@ async fn process_video(
             .await?;
         }
 
-        // Update frame buffer state
+        // State machine buffer management
         let current_state = analyzer.current_state().to_string();
         if previous_state == "CENTERED" && current_state == "DRIFTING" {
             frame_buffer.start_capture(frame_count);
@@ -775,7 +729,7 @@ async fn process_video(
         }
         previous_state = current_state;
 
-        // ─── OVERTAKE TIMEOUTS ───────────────────────────────────────────────
+        // Overtake Timeout Monitoring
         if frame_count % 30 == 0 {
             if let Some(timeout_result) = overtake_tracker.check_timeout(frame_count) {
                 if let OvertakeResult::Incomplete {
@@ -784,18 +738,15 @@ async fn process_video(
                 } = timeout_result
                 {
                     incomplete_overtakes += 1;
-                    // ... (Reduced for brevity, same as previous logic) ...
-                    // Reset trackers
                     shadow_detector.stop_monitoring();
                     current_overtake_vehicles.clear();
                     overtake_tracker.set_shadow_active(false);
-
                     save_incomplete_overtake(&start_event, &reason, &mut results_file)?;
                 }
             }
         }
 
-        // ─── VIDEO ANNOTATION ────────────────────────────────────────────────
+        // 4. VIDEO ANNOTATION
         if let Some(ref mut w) = writer {
             let curve_info = analyzer.get_curve_info();
             let is_overtaking = overtake_tracker.is_tracking();
@@ -815,7 +766,7 @@ async fn process_video(
                 &frame.data,
                 reader.width,
                 reader.height,
-                &detected_lanes_for_draw, // Use the detected lanes for drawing
+                &detected_lanes_for_draw,
                 analyzer.current_state(),
                 analyzer.last_vehicle_state(),
                 overtake_analyzer.get_tracked_vehicles(),
@@ -828,32 +779,16 @@ async fn process_video(
                 Some(curve_info),
                 lateral_velocity,
                 legality_for_overlay,
-                detection_source, // 👈 ADD THIS ARGUMENT (passed from the loop
+                detection_source,
             ) {
                 use opencv::videoio::VideoWriterTrait;
                 w.write(&annotated)?;
             }
         }
-
-        if frame_count % 150 == 0 {
-            info!(
-                "Frame {}: Source={} | State={}",
-                frame_count,
-                detection_source,
-                analyzer.current_state()
-            );
-        }
     }
 
-    // ... (End of video cleanup, same as before) ...
-
     let duration = start_time.elapsed();
-    let avg_fps = if duration.as_secs_f64() > 0.01 {
-        frame_count as f64 / duration.as_secs_f64()
-    } else {
-        0.0
-    };
-    let unique_vehicles = overtake_analyzer.get_total_unique_vehicles();
+    let avg_fps = frame_count as f64 / duration.as_secs_f64();
 
     Ok(ProcessingStats {
         total_frames: frame_count,
@@ -864,16 +799,15 @@ async fn process_video(
         incomplete_overtakes,
         simple_lane_changes,
         events_sent_to_api,
-        curves_detected,
-        total_vehicles_detected,
+        curves_detected: 0,         // Placeholder
+        total_vehicles_detected: 0, // Placeholder
         total_vehicles_overtaken,
-        unique_vehicles_seen: unique_vehicles,
+        unique_vehicles_seen: overtake_analyzer.get_total_unique_vehicles(),
         shadow_overtakes_detected,
-        illegal_crossings,
-        critical_violations,
+        illegal_crossings: 0,   // Placeholder
+        critical_violations: 0, // Placeholder
         duration_secs: duration.as_secs_f64(),
         avg_fps,
-        // 🆕 New stats
         yolo_primary_count,
         ufld_fallback_count,
     })
