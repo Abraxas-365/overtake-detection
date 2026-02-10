@@ -1274,7 +1274,7 @@ impl LaneChangeStateMachine {
         net_displacement: f32,
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
-        const ABSOLUTE_MIN_DURATION: f64 = 200.0;
+        const ABSOLUTE_MIN_DURATION: f64 = 600.0;
 
         if duration < ABSOLUTE_MIN_DURATION {
             warn!(
