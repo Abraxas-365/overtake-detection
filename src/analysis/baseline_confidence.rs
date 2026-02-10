@@ -344,4 +344,3 @@ mod tests {
         assert!(!bc.is_stabilizing(), "Should not need stabilization");
     }
 }
-

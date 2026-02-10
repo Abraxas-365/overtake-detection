@@ -1651,7 +1651,7 @@ impl LaneChangeStateMachine {
                     // 🚨 CRITICAL: Reject curves to avoid false positives
                     if self.is_in_curve {
                         if metrics.is_sustained_movement && metrics.time_span_ms >= 3000.0 {
-                            debug!(
+                            info!(
                     "🌀 Curve rejection [SUSTAINED]: dev={:.1}%, span={:.1}s (following curve)",
                     deviation * 100.0,
                     metrics.time_span_ms / 1000.0
@@ -1681,7 +1681,7 @@ impl LaneChangeStateMachine {
                 // PATH 5: GRADUAL CHANGE (with curve rejection)
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
                     if self.is_in_curve {
-                        debug!(
+                        info!(
                 "🌀 Curve rejection [GRADUAL]: max={:.1}%, span={:.1}s (following curve)",
                 metrics.max_deviation * 100.0,
                 metrics.time_span_ms / 1000.0

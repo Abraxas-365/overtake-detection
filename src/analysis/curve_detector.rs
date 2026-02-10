@@ -80,7 +80,7 @@ impl CurveDetector {
         let is_curve = avg_score.abs() > self.moderate_threshold;
 
         if is_curve {
-            debug!(
+            info!(
                 "🌀 Curve logic: raw={:.1}, avg={:.1} (thresh: {:.1})",
                 score, avg_score, self.moderate_threshold
             );

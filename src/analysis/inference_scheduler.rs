@@ -110,7 +110,7 @@ impl InferenceScheduler {
         if should_run {
             self.frames_since_last_yolo = 0;
             self.yolo_invocations += 1;
-            debug!(
+            info!(
                 "🔍 YOLOv8-seg scheduled (strategy={:?}, UFLD_conf={:.2}, baseline_conf={:.2})",
                 strategy, ufld_confidence, baseline_confidence
             );

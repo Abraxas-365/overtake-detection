@@ -70,7 +70,7 @@ impl LaneBoundaryCrossingDetector {
                         };
 
                         if crossing_type != CrossingType::None {
-                            debug!(
+                            info!(
                                 "🚨 Boundary crossing detected: {:?} | Vehicle: {:.1} | Left: {:.1} | Right: {:.1}",
                                 crossing_type, vehicle_x, lx, rx
                             );
