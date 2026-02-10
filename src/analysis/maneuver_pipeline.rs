@@ -76,18 +76,17 @@ impl Default for ManeuverPipelineConfig {
 }
 
 impl ManeuverPipelineConfig {
-    /// Preset for Peru mining routes: handles dust, slow trucks, long occlusions
     pub fn mining_route() -> Self {
         Self {
             tracker: TrackerConfig {
-                max_coast_frames: 60, // 2s coast through dust bursts
+                max_coast_frames: 60,
                 min_confidence: 0.20,
                 min_iou: 0.10,
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
                 min_beside_duration_ms: 800.0,
-                max_pass_duration_ms: 45000.0, // Slow trucks, long passes
+                max_pass_duration_ms: 45000.0,
                 min_beside_frames: 12,
                 disappearance_grace_frames: 45,
                 ..PassDetectorConfig::default()
@@ -101,6 +100,7 @@ impl ManeuverPipelineConfig {
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
+                // ADD THIS FIELD
                 min_displacement: 2.0,
                 min_consensus: 0.45,
                 ..EgoMotionConfig::default()
@@ -108,30 +108,6 @@ impl ManeuverPipelineConfig {
             classifier: ClassifierConfig {
                 max_correlation_gap_ms: 8000.0,
                 min_single_source_confidence: 0.60,
-                ..ClassifierConfig::default()
-            },
-            enable_ego_motion: true,
-        }
-    }
-
-    /// Preset for highway: faster detection, shorter windows
-    pub fn highway() -> Self {
-        Self {
-            tracker: TrackerConfig::default(),
-            pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 300.0,
-                max_pass_duration_ms: 20000.0,
-                min_beside_frames: 6,
-                ..PassDetectorConfig::default()
-            },
-            lateral_detector: LateralDetectorConfig {
-                shift_start_threshold: 0.18,
-                shift_confirm_threshold: 0.25,
-                min_shift_frames: 8,
-                ..LateralDetectorConfig::default()
-            },
-            classifier: ClassifierConfig {
-                max_correlation_gap_ms: 3000.0,
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,
@@ -174,20 +150,18 @@ impl ManeuverPipeline {
     pub fn process_frame(&mut self, input: ManeuverFrameInput) -> ManeuverFrameOutput {
         self.frame_count += 1;
 
-        // 1. VEHICLE TRACKING
+        // 1. VEHICLE TRACKING - capture the return value first
         let tracks =
             self.tracker
                 .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
         let tracked_count = self.tracker.confirmed_count();
 
-        // 2. PASS DETECTION
-        let pass_events = self
-            .pass_detector
-            .update(tracks, input.timestamp_ms, input.frame_id);
-        for pass in &pass_events {
-            self.classifier.feed_pass(pass.clone());
-        }
-
+        // 2. PASS DETECTION - use the captured `tracks` variable
+        let pass_events = self.pass_detector.update(
+            &tracks, // Pass reference to tracks
+            input.timestamp_ms,
+            input.frame_id,
+        );
         // 3. LATERAL SHIFT DETECTION
         let shift_event = self.lateral_detector.update(
             input.lane_measurement,

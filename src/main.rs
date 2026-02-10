@@ -243,7 +243,7 @@ impl PipelineState {
         video_path: &Path,
         frame_width: f32,
         frame_height: f32,
-        fps: f64,
+        _fps: f64,
         max_buffer_frames: usize,
     ) -> Result<Self> {
         let lane_change_config = LaneChangeConfig::from_detection_config(&config.detection);
@@ -282,7 +282,7 @@ impl PipelineState {
             yolo_detector,
             legality_detector,
             overtake_analyzer: OvertakeAnalyzer::new(frame_width, frame_height),
-            overtake_tracker: OvertakeTracker::new(30.0, fps),
+            overtake_tracker: OvertakeTracker::new(30.0, _fps),
             shadow_detector: ShadowOvertakeDetector::new(frame_width, frame_height),
             velocity_tracker: analysis::velocity_tracker::LateralVelocityTracker::new(),
             fallback_estimator: FallbackPositionEstimator::new(frame_width, frame_height),
@@ -512,6 +512,7 @@ fn validate_config(config: &types::Config) -> Result<()> {
 // VIDEO PROCESSING — orchestrator
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn process_video(
     video_path: &Path,
     _inference_engine: &mut inference::InferenceEngine,
@@ -770,7 +771,7 @@ fn buffer_legality_result(
     left_x: f32,
     right_x: f32,
     frame_count: u64,
-    _timestamp_ms: f64,
+    timestamp_ms: f64,
     vehicle_offset: f32,
     lane_width: Option<f32>,
 ) {
@@ -794,7 +795,7 @@ fn buffer_legality_result(
         Some(right_x),
         crossing_side,
     ) {
-        buffer.push(frame_count, _timestamp_ms, fused);
+        buffer.push(frame_count, timestamp_ms, fused);
     }
 }
 
@@ -820,7 +821,7 @@ fn run_position_analysis(
     if ps
         .analyzer
         .last_vehicle_state()
-        .map_or(false, |vs| vs.is_valid())
+        .map_or(false, |vs: &VehicleState| vs.is_valid())
     {
         if let Some(vs) = ps.analyzer.last_vehicle_state() {
             ps.fallback_estimator.sync_from_primary(
@@ -900,7 +901,7 @@ fn try_fallback_estimation(ps: &mut PipelineState, frame_count: u64, timestamp_m
 fn run_maneuver_pipeline_v2(
     ps: &mut PipelineState,
     frame: &Arc<Frame>,
-    analysis_lanes: &[Lane],
+    _analysis_lanes: &[Lane],
     timestamp_ms: f64,
 ) {
     let pipeline_v2 = match ps.maneuver_pipeline_v2.as_mut() {
@@ -914,7 +915,7 @@ fn run_maneuver_pipeline_v2(
     let lane_meas: Option<LaneMeasurement> = ps
         .analyzer
         .last_vehicle_state()
-        .filter(|vs| vs.is_valid() && vs.detection_confidence > 0.2)
+        .filter(|vs: &&VehicleState| vs.is_valid() && vs.detection_confidence > 0.2)
         .map(|vs| LaneMeasurement {
             lateral_offset_px: vs.lateral_offset,
             lane_width_px: vs.lane_width.unwrap_or(450.0),
@@ -927,8 +928,8 @@ fn run_maneuver_pipeline_v2(
         .latest_vehicle_detections
         .iter()
         .map(|d| DetectionInput {
-            bbox: [d.x1, d.y1, d.x2, d.y2],
-            class_id: (d.class_id as u32),
+            bbox: d.bbox,
+            class_id: d.class_id as u32,
             confidence: d.confidence,
         })
         .collect();
@@ -939,19 +940,43 @@ fn run_maneuver_pipeline_v2(
     let gray = GrayFrame::from_rgb(&frame.data, frame.width as usize, frame.height as usize);
 
     // ── Extract marking names from the legality buffer's latest entry ──
+    // FIXED: Determine side based on bbox position instead of non-existent 'side' field
     let latest_legality = ps.legality_buffer.latest();
+    let frame_center_x = frame.width as f32 / 2.0;
+    
     let left_marking: Option<String> = latest_legality.as_ref().and_then(|fused| {
         fused
             .all_markings
             .iter()
-            .find(|m| m.side == "left")
+            .filter(|m| {
+                // Left marking: bbox center is to the left of frame center
+                let bbox_center_x = (m.bbox[0] + m.bbox[2]) / 2.0;
+                bbox_center_x < frame_center_x
+            })
+            .max_by(|a, b| {
+                // Get the rightmost left marking (closest to ego)
+                let a_x = (a.bbox[0] + a.bbox[2]) / 2.0;
+                let b_x = (b.bbox[0] + b.bbox[2]) / 2.0;
+                a_x.partial_cmp(&b_x).unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|m| m.class_name.clone())
     });
+    
     let right_marking: Option<String> = latest_legality.as_ref().and_then(|fused| {
         fused
             .all_markings
             .iter()
-            .find(|m| m.side == "right")
+            .filter(|m| {
+                // Right marking: bbox center is to the right of frame center
+                let bbox_center_x = (m.bbox[0] + m.bbox[2]) / 2.0;
+                bbox_center_x >= frame_center_x
+            })
+            .min_by(|a, b| {
+                // Get the leftmost right marking (closest to ego)
+                let a_x = (a.bbox[0] + a.bbox[2]) / 2.0;
+                let b_x = (b.bbox[0] + b.bbox[2]) / 2.0;
+                a_x.partial_cmp(&b_x).unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|m| m.class_name.clone())
     });
 
@@ -1184,7 +1209,7 @@ async fn process_lane_change_event(
             }
 
             let curve_info = ps.analyzer.get_curve_info();
-            let (captured_frames, buffer_start_id) = ps.frame_buffer.stop_capture();
+            let (captured_frames, _buffer_start_id) = ps.frame_buffer.stop_capture();
 
             if !captured_frames.is_empty() {
                 let critical_entry = ps
@@ -1495,6 +1520,7 @@ fn save_shadow_event(shadow: &ShadowOvertakeEvent, file: &mut impl std::io::Writ
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_overtake_to_api(
     event: &LaneChangeEvent,
     captured_frames: &[Frame],

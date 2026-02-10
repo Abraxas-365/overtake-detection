@@ -15,7 +15,7 @@
 
 use super::vehicle_tracker::{Track, VehicleZone};
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ============================================================================
 // CONFIGURATION
@@ -190,6 +190,10 @@ impl PassDetector {
 
         let active_ids: HashSet<u32> = tracks.iter().map(|t| t.id).collect();
 
+        // Collect tracks that need pass completion checking
+        let mut tracks_to_check_behind: Vec<(u32, Track)> = Vec::new();
+        let mut tracks_to_check_overtook_ego: Vec<(u32, Track)> = Vec::new();
+
         // Update pending passes for each active confirmed track
         for track in tracks {
             if !track.is_confirmed() {
@@ -217,6 +221,11 @@ impl PassDetector {
                         pending.beside_consecutive = 0;
                     }
                     pending.frames_since_beside += 1;
+
+                    // Check if vehicle overtook us
+                    if pending.beside_confirmed && !pending.had_ahead {
+                        tracks_to_check_overtook_ego.push((track.id, track.clone()));
+                    }
                 }
 
                 VehicleZone::BesideLeft | VehicleZone::BesideRight => {
@@ -250,24 +259,52 @@ impl PassDetector {
                 }
 
                 VehicleZone::Behind => {
-                    // Vehicle moved behind us — check if pass is complete
+                    // Mark for checking if pass is complete
                     if pending.beside_confirmed {
-                        if let Some(event) = self.try_complete_pass(
-                            pending,
-                            track,
-                            PassDirection::EgoOvertook,
-                            timestamp_ms,
-                            frame_id,
-                        ) {
-                            self.recent_events.push(event);
-                            self.completed_ids.insert(track.id);
-                        }
+                        tracks_to_check_behind.push((track.id, track.clone()));
                     }
                     pending.frames_since_beside += 1;
                 }
 
                 VehicleZone::Unknown => {
                     pending.frames_since_beside += 1;
+                }
+            }
+        }
+
+        // Now process tracks that moved to BEHIND (borrow of pending is released)
+        for (track_id, track) in tracks_to_check_behind {
+            if let Some(pending) = self.pending.get(&track_id) {
+                if let Some(event) = self.try_complete_pass(
+                    pending,
+                    &track,
+                    PassDirection::EgoOvertook,
+                    timestamp_ms,
+                    frame_id,
+                ) {
+                    self.recent_events.push(event);
+                    self.completed_ids.insert(track_id);
+                }
+            }
+        }
+
+        // Process tracks that overtook ego
+        for (track_id, track) in tracks_to_check_overtook_ego {
+            if let Some(pending) = self.pending.get(&track_id) {
+                if let Some(event) = self.try_complete_pass(
+                    pending,
+                    &track,
+                    PassDirection::VehicleOvertookEgo,
+                    timestamp_ms,
+                    frame_id,
+                ) {
+                    info!(
+                        "✅ PASS (vehicle overtook ego): Track {} | dur={:.1}s",
+                        track_id,
+                        event.duration_ms / 1000.0
+                    );
+                    self.recent_events.push(event);
+                    self.completed_ids.insert(track_id);
                 }
             }
         }
@@ -307,36 +344,6 @@ impl PassDetector {
                         );
                         self.recent_events.push(event);
                         self.completed_ids.insert(track_id);
-                    }
-                }
-            }
-        }
-
-        // Check for vehicles overtaking US (appeared beside → moved ahead)
-        for track in tracks {
-            if !track.is_confirmed() || self.completed_ids.contains(&track.id) {
-                continue;
-            }
-            if let Some(pending) = self.pending.get(&track.id) {
-                // Vehicle was beside us and is now ahead = it overtook us
-                if pending.beside_confirmed
-                    && !pending.had_ahead
-                    && track.zone == VehicleZone::Ahead
-                {
-                    if let Some(event) = self.try_complete_pass(
-                        pending,
-                        track,
-                        PassDirection::VehicleOvertookEgo,
-                        timestamp_ms,
-                        frame_id,
-                    ) {
-                        info!(
-                            "✅ PASS (vehicle overtook ego): Track {} | dur={:.1}s",
-                            track.id,
-                            event.duration_ms / 1000.0
-                        );
-                        self.recent_events.push(event);
-                        self.completed_ids.insert(track.id);
                     }
                 }
             }
