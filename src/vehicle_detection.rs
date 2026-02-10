@@ -53,9 +53,13 @@ impl YoloDetector {
         let output = self.infer(&input)?;
 
         // 3. Postprocess (parse detections + NMS)
-        let detections = self.postprocess(&output, scale, pad_x, pad_y, confidence_threshold)?;
+        let mut detections =
+            self.postprocess(&output, scale, pad_x, pad_y, confidence_threshold)?;
 
-        debug!("Detected {} vehicles", detections.len());
+        // 4. 🔧 NEW: Merge adjacent vehicles (cab + trailer, convoy fragments)
+        detections = merge_adjacent_vehicles(detections, width as f32);
+
+        debug!("Detected {} vehicles (after merging)", detections.len());
         Ok(detections)
     }
 
@@ -266,5 +270,149 @@ fn calculate_iou(box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
         intersection / union
     } else {
         0.0
+    }
+}
+
+// ============================================================================
+// ADJACENT VEHICLE MERGING (v1.0 — Truck Cab + Trailer Fix)
+// ============================================================================
+
+/// Merge adjacent vehicle detections that are likely part of the same physical vehicle
+/// (e.g., truck cab + trailer detected as separate objects)
+fn merge_adjacent_vehicles(detections: Vec<Detection>, frame_width: f32) -> Vec<Detection> {
+    if detections.is_empty() {
+        return detections;
+    }
+
+    let mut merged = Vec::new();
+    let mut used = vec![false; detections.len()];
+
+    for i in 0..detections.len() {
+        if used[i] {
+            continue;
+        }
+
+        let mut current = detections[i].clone();
+        used[i] = true;
+
+        // Find all detections that should merge with this one
+        for j in (i + 1)..detections.len() {
+            if used[j] {
+                continue;
+            }
+
+            if should_merge(&current, &detections[j], frame_width) {
+                // Merge j into current
+                current = merge_detections(&current, &detections[j]);
+                used[j] = true;
+            }
+        }
+
+        merged.push(current);
+    }
+
+    if merged.len() < detections.len() {
+        debug!(
+            "Merged {} detections into {} vehicles",
+            detections.len(),
+            merged.len()
+        );
+    }
+
+    merged
+}
+
+/// Determine if two detections should be merged (same vehicle split into parts)
+fn should_merge(det1: &Detection, det2: &Detection, frame_width: f32) -> bool {
+    // Only merge vehicles (not mixing car + truck with other classes)
+    if !VEHICLE_CLASSES.contains(&det1.class_id) || !VEHICLE_CLASSES.contains(&det2.class_id) {
+        return false;
+    }
+
+    let [x1_1, y1_1, x2_1, y2_1] = det1.bbox;
+    let [x1_2, y1_2, x2_2, y2_2] = det2.bbox;
+
+    // Calculate centers and dimensions
+    let cy1 = (y1_1 + y2_1) / 2.0;
+    let cy2 = (y1_2 + y2_2) / 2.0;
+    let h1 = y2_1 - y1_1;
+    let h2 = y2_2 - y1_2;
+
+    // 1. Vertical alignment check — must be roughly at same height
+    let vertical_overlap = (cy1 - cy2).abs() < (h1.max(h2) * 0.6);
+    if !vertical_overlap {
+        return false;
+    }
+
+    // 2. Horizontal proximity — gap between boxes must be small
+    let gap = if x1_2 > x2_1 {
+        x1_2 - x2_1 // det2 is to the right
+    } else if x1_1 > x2_2 {
+        x1_1 - x2_2 // det1 is to the right
+    } else {
+        0.0 // They overlap horizontally
+    };
+
+    // Allow gap up to 15% of frame width (handles cab-trailer separation)
+    let max_gap = frame_width * 0.15;
+    if gap > max_gap {
+        return false;
+    }
+
+    // 3. Size similarity — prevent merging distant small car with huge truck
+    let area1 = (x2_1 - x1_1) * h1;
+    let area2 = (x2_2 - x1_2) * h2;
+    let area_ratio = area1.min(area2) / area1.max(area2);
+
+    // If one is >4x bigger, don't merge (unless gap is tiny)
+    if area_ratio < 0.25 && gap > frame_width * 0.05 {
+        return false;
+    }
+
+    true
+}
+
+/// Merge two detections into one (create bounding box that encompasses both)
+fn merge_detections(det1: &Detection, det2: &Detection) -> Detection {
+    let [x1_1, y1_1, x2_1, y2_1] = det1.bbox;
+    let [x1_2, y1_2, x2_2, y2_2] = det2.bbox;
+
+    // Create union bounding box
+    let merged_bbox = [
+        x1_1.min(x1_2),
+        y1_1.min(y1_2),
+        x2_1.max(x2_2),
+        y2_1.max(y2_2),
+    ];
+
+    // Use higher confidence and prioritize truck > bus > car
+    let class_priority = |id: usize| match id {
+        7 => 3, // truck
+        5 => 2, // bus
+        3 => 1, // motorcycle
+        2 => 0, // car
+        _ => -1,
+    };
+
+    let (class_id, class_name, confidence) =
+        if class_priority(det1.class_id) >= class_priority(det2.class_id) {
+            (
+                det1.class_id,
+                det1.class_name.clone(),
+                det1.confidence.max(det2.confidence),
+            )
+        } else {
+            (
+                det2.class_id,
+                det2.class_name.clone(),
+                det1.confidence.max(det2.confidence),
+            )
+        };
+
+    Detection {
+        bbox: merged_bbox,
+        confidence,
+        class_id,
+        class_name,
     }
 }
