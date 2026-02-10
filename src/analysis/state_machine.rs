@@ -873,7 +873,15 @@ impl LaneChangeStateMachine {
             .velocity_tracker
             .get_velocity(vehicle_state.lateral_offset, timestamp_ms);
 
-        self.update_histories(normalized_offset, lateral_velocity);
+        self.velocity_history.push_back(lateral_velocity);
+        if self.velocity_history.len() > 30 {
+            self.velocity_history.pop_front();
+        }
+
+        self.offset_history.push(normalized_offset);
+        if self.offset_history.len() > 60 {
+            self.offset_history.remove(0);
+        }
 
         if self.post_lane_change_grace > 0 {
             self.adaptive_baseline.update(normalized_offset);
@@ -886,40 +894,32 @@ impl LaneChangeStateMachine {
             return None;
         }
 
-        if self.adaptive_baseline.sample_count == EWMA_MIN_SAMPLES {
-            info!(
-                "✅ Adaptive baseline ready: {:.1}% at frame {} ({:.1}s)",
-                self.adaptive_baseline.value * 100.0,
-                frame_id,
-                timestamp_ms / 1000.0
-            );
-        }
-
         let baseline = self.adaptive_baseline.effective_value();
         let signed_deviation = normalized_offset - baseline;
         let deviation = signed_deviation.abs();
 
-        // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping (Polarity Flip)
-        // When swapping lanes, coordinates jump from Positive Edge (+0.4) to Negative Edge (-0.4) or vice versa.
-        // A linear check sees this as a massive Negative change (LEFT), but physically it's a RIGHT move.
-        // Logic:
-        //   +Baseline to -Current => Moving RIGHT (crossed right boundary)
-        //   -Baseline to +Current => Moving LEFT (crossed left boundary)
-        let current_direction = if self.adaptive_baseline.is_frozen
-            && baseline.abs() > 0.10
-            && normalized_offset.abs() > 0.10
-            && baseline.signum() != normalized_offset.signum()
-            && deviation > 0.40
-        {
-            if baseline > 0.0 {
-                // + to - (e.g. 0.3 to -0.3): Wrapped around Right Edge
+        // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping
+        // When returning from an overtake, the coordinates "wrap around".
+        // A move to the RIGHT looks like a massive negative jump (Left) mathematically.
+        // We must invert the logic when this happens.
+        let current_direction = if self.adaptive_baseline.seed_lock_frames > 0 && deviation > 0.35 {
+            // We are locked (mid-maneuver) and see a huge jump.
+            // Check for the "Wrap Around" signature:
+
+            if baseline > 0.10 && signed_deviation < -0.35 {
+                // Signature: We were on the Right side (+), and value dropped massively (-).
+                // Physics: We crossed the Right boundary.
                 Direction::Right
-            } else {
-                // - to + (e.g. -0.3 to 0.3): Wrapped around Left Edge
+            } else if baseline < -0.10 && signed_deviation > 0.35 {
+                // Signature: We were on the Left side (-), and value jumped massively (+).
+                // Physics: We crossed the Left boundary.
                 Direction::Left
+            } else {
+                // Standard movement
+                Direction::from_offset(signed_deviation)
             }
         } else {
-            // Standard linear drift within lane
+            // Standard movement
             Direction::from_offset(signed_deviation)
         };
 
@@ -936,16 +936,40 @@ impl LaneChangeStateMachine {
             }
         }
 
-        self.trajectory_analyzer
-            .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
-        self.track_max_offset(deviation);
-        self.update_samples(
+        self.recent_deviations.push(deviation);
+        if self.recent_deviations.len() > 30 {
+            self.recent_deviations.remove(0);
+        }
+
+        let sample = OffsetSample {
             normalized_offset,
             deviation,
             timestamp_ms,
             lateral_velocity,
-            current_direction,
-        );
+            direction: current_direction,
+        };
+        self.offset_samples.push_back(sample);
+
+        while let Some(oldest) = self.offset_samples.front() {
+            if timestamp_ms - oldest.timestamp_ms > ANALYSIS_WINDOW_MS {
+                self.offset_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.direction_samples.push_back(current_direction);
+        if self.direction_samples.len() > 30 {
+            self.direction_samples.pop_front();
+        }
+
+        if deviation > self.peak_deviation_in_window {
+            self.peak_deviation_in_window = deviation;
+            self.peak_direction = current_direction;
+        }
+        if lateral_velocity.abs() > self.peak_velocity_in_window {
+            self.peak_velocity_in_window = lateral_velocity.abs();
+        }
 
         let window_metrics = self.calculate_window_metrics(timestamp_ms, lane_width);
 
@@ -957,21 +981,16 @@ impl LaneChangeStateMachine {
             &window_metrics,
         );
 
-        debug!(
-            "F{}: off={:.1}%, base={:.1}%{}, dev={:.1}%, max={:.1}%, state={:?}→{:?}",
-            frame_id,
-            normalized_offset * 100.0,
-            baseline * 100.0,
-            if self.adaptive_baseline.is_frozen {
-                "🧊"
-            } else {
-                ""
-            },
-            deviation * 100.0,
-            self.max_offset_in_change * 100.0,
-            self.state,
-            target_state
-        );
+        if frame_id % 30 == 0 {
+            debug!(
+                "F{}: dev={:.1}%, state={:?}->{:?}, dir={}",
+                frame_id,
+                deviation * 100.0,
+                self.state,
+                target_state,
+                current_direction.as_str()
+            );
+        }
 
         self.check_transition(
             target_state,
