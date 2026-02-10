@@ -1,18 +1,18 @@
 // src/analysis/state_machine.rs
 //
-// LANE CHANGE DETECTION v5.1 - ADAPTIVE + FALSE POSITIVE FIX
+// LANE CHANGE DETECTION v5.2 - MINING BASELINE RECOVERY FIX
 //
-// v5.1: Critical bug fixes for Peru mining routes:
+// v5.2: Mining-specific baseline recovery
+//   1. 🆕 Context-aware baseline sanity checking (45% for mining vs 35% default)
+//   2. 🆕 Automatic baseline reset after extended occlusions in mining mode
+//   3. 🆕 Intelligent re-seeding from first valid detection post-occlusion
+//   4. 🆕 Cleared baseline value (not just validity flag) to prevent drift
+//
+// v5.1: Critical bug fixes for Peru mining routes
 //   1. 🚨 FALSE POSITIVE FIX: Baseline sanity check before HIGH-VEL
 //   2. 🚨 Stricter velocity validation (6/8 frames)
 //   3. 🚨 Post-detection movement verification
 //   4. 🚨 Actual-offset-from-center validation
-//
-// v5.0 features:
-//   - Adaptive thresholds based on noise floor
-//   - Context detection (dust/unpaved/paved)
-//   - Mining-specific profiles
-//   - Profile-based validation
 
 use super::boundary_detector::CrossingType;
 use super::curve_detector::CurveDetector;
@@ -77,9 +77,9 @@ const POST_CHANGE_GRACE_FRAMES: u32 = 90;
 const MAX_DRIFTING_MS: f64 = 10000.0;
 
 // 🆕 FALSE POSITIVE PROTECTION
-const MIN_OFFSET_FROM_CENTER_FOR_DETECTION: f32 = 0.12; // Must be >12% from lane center
-const POST_DETECTION_VALIDATION_FRAMES: u32 = 15; // Validate after 15 frames
-const MIN_MOVEMENT_AFTER_DETECTION: f32 = 0.08; // Must move at least 8% after detection
+const MIN_OFFSET_FROM_CENTER_FOR_DETECTION: f32 = 0.12;
+const POST_DETECTION_VALIDATION_FRAMES: u32 = 15;
+const MIN_MOVEMENT_AFTER_DETECTION: f32 = 0.08;
 
 // ============================================================================
 // KALMAN FILTER
@@ -97,7 +97,10 @@ const EWMA_MIN_SAMPLES: u32 = 20;
 const STABILITY_VARIANCE_THRESHOLD: f32 = 0.005;
 const INSTABILITY_VARIANCE_THRESHOLD: f32 = 0.05;
 const BASELINE_MAX_DRIFT: f32 = 0.25;
-const BASELINE_SANITY_CHECK: f32 = 0.35;
+
+// 🆕 MINING BASELINE SANITY THRESHOLDS
+const BASELINE_SANITY_CHECK: f32 = 0.35; // Default: 35%
+const BASELINE_SANITY_CHECK_MINING: f32 = 0.45; // Mining: 45% (more lenient)
 
 const OCCLUSION_SHORT_THRESHOLD: u32 = 30;
 const OCCLUSION_LONG_THRESHOLD: u32 = 60;
@@ -171,7 +174,7 @@ impl SimpleKalmanFilter {
 }
 
 // ============================================================================
-// ADAPTIVE BASELINE (unchanged from your version)
+// ADAPTIVE BASELINE - 🆕 MINING RECOVERY FIXES
 // ============================================================================
 
 #[derive(Clone)]
@@ -191,6 +194,7 @@ struct AdaptiveBaseline {
     just_recovered_from_occlusion: bool,
     fast_recovery_frames: u32,
     seed_lock_frames: u32,
+    is_mining_context: bool, // 🆕 Track if in mining environment
 }
 
 impl AdaptiveBaseline {
@@ -211,6 +215,18 @@ impl AdaptiveBaseline {
             just_recovered_from_occlusion: false,
             fast_recovery_frames: 0,
             seed_lock_frames: 0,
+            is_mining_context: false, // 🆕 Initialize
+        }
+    }
+
+    // 🆕 NEW METHOD: Set mining mode
+    fn set_mining_mode(&mut self, is_mining: bool) {
+        if self.is_mining_context != is_mining {
+            info!(
+                "🏗️  Baseline mining mode: {} → {}",
+                self.is_mining_context, is_mining
+            );
+            self.is_mining_context = is_mining;
         }
     }
 
@@ -353,22 +369,44 @@ impl AdaptiveBaseline {
         }
     }
 
+    // 🆕 MINING FIX: Context-aware sanity checking
     fn is_sane(&self) -> bool {
-        self.value.abs() < BASELINE_SANITY_CHECK
+        let threshold = if self.is_mining_context {
+            BASELINE_SANITY_CHECK_MINING // 45% for mining
+        } else {
+            BASELINE_SANITY_CHECK // 35% default
+        };
+        self.value.abs() < threshold
     }
 
+    // 🆕 MINING FIX: Reset baseline value (not just validity) in mining mode
     fn mark_no_lanes(&mut self) {
         self.frames_without_lanes += 1;
 
         if self.frames_without_lanes > OCCLUSION_LONG_THRESHOLD {
             if self.is_valid {
                 warn!(
-                    "🗑️  Baseline invalidated after {}s occlusion",
+                    "🗑️  Baseline {} after {}s occlusion",
+                    if self.is_mining_context {
+                        "RESET"
+                    } else {
+                        "invalidated"
+                    },
                     self.frames_without_lanes as f32 / 30.0
                 );
             }
             self.is_valid = false;
             self.has_initial = false;
+
+            // 🆕 CRITICAL MINING FIX: Clear the value to prevent drift
+            if self.is_mining_context {
+                self.value = 0.0;
+                self.initial_value = 0.0;
+                self.variance = 1.0;
+                self.sample_count = 0;
+                self.recent_samples.clear();
+                info!("🔄 Mining mode: Baseline value cleared to prevent drift");
+            }
         }
     }
 
@@ -793,9 +831,22 @@ impl LaneChangeStateMachine {
         {
             self.current_profile = MiningRouteProfile::for_context(detected_context);
             self.last_profile_context = detected_context;
+
+            // 🆕 MINING FIX: Set mining mode on baseline
+            let is_mining = matches!(
+                detected_context,
+                RoadContext::MiningRouteDust
+                    | RoadContext::MiningRouteUnpaved
+                    | RoadContext::MiningRoutePaved
+            );
+            self.adaptive_baseline.set_mining_mode(is_mining);
+
             info!(
-                "📋 Profile loaded: {} ({}) | context={:?}",
-                self.current_profile.name, self.current_profile.description, detected_context
+                "📋 Profile loaded: {} ({}) | context={:?} | mining_mode={}",
+                self.current_profile.name,
+                self.current_profile.description,
+                detected_context,
+                is_mining
             );
         }
 
@@ -840,6 +891,28 @@ impl LaneChangeStateMachine {
         if !vehicle_state.is_valid() {
             self.adaptive_baseline.mark_no_lanes();
             return None;
+        }
+
+        // 🆕 MINING FIX: Re-seed baseline after occlusion recovery
+        if !self.adaptive_baseline.is_valid
+            && vehicle_state.is_valid()
+            && self.adaptive_baseline.frames_without_lanes > 60
+        {
+            let lane_width = vehicle_state.lane_width.unwrap_or(450.0);
+            let raw_offset = vehicle_state.lateral_offset / lane_width;
+
+            info!(
+                "🎯 Re-seeding baseline after {}s occlusion at {:.1}%",
+                self.adaptive_baseline.frames_without_lanes as f32 / 30.0,
+                raw_offset * 100.0
+            );
+
+            self.adaptive_baseline.reset_to(raw_offset);
+            self.adaptive_baseline.seed_lock_frames = if self.adaptive_baseline.is_mining_context {
+                60 // Shorter lock in mining (2 seconds)
+            } else {
+                90 // Standard lock (3 seconds)
+            };
         }
 
         let lane_width = vehicle_state.lane_width.unwrap();
@@ -1040,11 +1113,18 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // Baseline sanity check
+                // 🆕 MINING FIX: More lenient baseline sanity check
                 if !self.adaptive_baseline.is_sane() {
+                    let baseline_pct = self.adaptive_baseline.effective_value() * 100.0;
+                    let threshold_pct = if self.adaptive_baseline.is_mining_context {
+                        BASELINE_SANITY_CHECK_MINING * 100.0
+                    } else {
+                        BASELINE_SANITY_CHECK * 100.0
+                    };
+
                     warn!(
-                        "⚠️ Baseline questionable: {:.1}% - blocking new detections",
-                        self.adaptive_baseline.effective_value() * 100.0
+                        "⚠️ Baseline questionable: {:.1}% (threshold: {:.1}%) - blocking new detections",
+                        baseline_pct, threshold_pct
                     );
                     return LaneChangeState::Centered;
                 }
@@ -1078,10 +1158,17 @@ impl LaneChangeStateMachine {
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
                     // FIX #1: Check baseline sanity
                     let baseline = self.adaptive_baseline.effective_value();
-                    if baseline.abs() > 0.20 {
+                    let sanity_threshold = if self.adaptive_baseline.is_mining_context {
+                        0.25 // More lenient in mining (25% vs 20%)
+                    } else {
+                        0.20
+                    };
+
+                    if baseline.abs() > sanity_threshold {
                         warn!(
-                            "⚠️ Rejected HIGH-VEL: suspicious baseline at {:.1}%",
-                            baseline * 100.0
+                            "⚠️ Rejected HIGH-VEL: suspicious baseline at {:.1}% (threshold: {:.1}%)",
+                            baseline * 100.0,
+                            sanity_threshold * 100.0
                         );
                         return LaneChangeState::Centered;
                     }
