@@ -16,6 +16,91 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use walkdir::WalkDir;
 
+use lazy_static::lazy_static;
+use std::sync::Mutex;
+
+// Persistent state for maneuver display
+lazy_static! {
+    static ref MANEUVER_HISTORY: Mutex<ManeuverDisplayState> =
+        Mutex::new(ManeuverDisplayState::new());
+}
+
+#[derive(Clone)]
+struct ManeuverDisplayState {
+    last_maneuver: Option<DisplayManeuver>,
+    total_overtakes: usize,
+    total_lane_changes: usize,
+    total_vehicles_overtaken: usize,
+    total_being_overtaken: usize,
+}
+
+#[derive(Clone)]
+struct DisplayManeuver {
+    maneuver_type: String,
+    side: String,
+    confidence: f32,
+    legality: String,
+    duration_ms: f64,
+    sources: String,
+    frame_detected: u64,
+    vehicle_count: usize, // For overtakes: how many vehicles were passed
+}
+
+impl ManeuverDisplayState {
+    fn new() -> Self {
+        Self {
+            last_maneuver: None,
+            total_overtakes: 0,
+            total_lane_changes: 0,
+            total_vehicles_overtaken: 0,
+            total_being_overtaken: 0,
+        }
+    }
+
+    fn update(
+        &mut self,
+        events: &[crate::analysis::maneuver_classifier::ManeuverEvent],
+        current_frame: u64,
+    ) {
+        for event in events {
+            // Update totals
+            match event.maneuver_type.as_str() {
+                "OVERTAKE" => {
+                    self.total_overtakes += 1;
+                    if event.passed_vehicle_id.is_some() {
+                        self.total_vehicles_overtaken += 1;
+                    }
+                }
+                "LANE_CHANGE" => self.total_lane_changes += 1,
+                "BEING_OVERTAKEN" => self.total_being_overtaken += 1,
+                _ => {}
+            }
+
+            // Update last maneuver
+            self.last_maneuver = Some(DisplayManeuver {
+                maneuver_type: event.maneuver_type.as_str().to_string(),
+                side: event.side.as_str().to_string(),
+                confidence: event.confidence,
+                legality: format!("{:?}", event.legality),
+                duration_ms: event.duration_ms,
+                sources: event.sources.summary(),
+                frame_detected: current_frame,
+                vehicle_count: if event.maneuver_type.as_str() == "OVERTAKE"
+                    && event.passed_vehicle_id.is_some()
+                {
+                    1
+                } else {
+                    0
+                },
+            });
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
 pub struct VideoProcessor {
     config: Config,
 }
@@ -1143,6 +1228,18 @@ pub fn draw_lanes_v2(
     timestamp_ms: f64,
     legality_result: Option<&LegalityResult>,
 ) -> Result<Mat> {
+    // ══════════════════════════════════════════════════════════════════════
+    // UPDATE PERSISTENT MANEUVER STATE
+    // ══════════════════════════════════════════════════════════════════════
+    let mut display_state = MANEUVER_HISTORY.lock().unwrap();
+    display_state.update(maneuver_events, frame_id);
+    let last_maneuver = display_state.last_maneuver.clone();
+    let total_overtakes = display_state.total_overtakes;
+    let total_lane_changes = display_state.total_lane_changes;
+    let total_vehicles_overtaken = display_state.total_vehicles_overtaken;
+    let total_being_overtaken = display_state.total_being_overtaken;
+    drop(display_state); // Release lock
+
     let mat = Mat::from_slice(frame)?;
     let mat = mat.reshape(3, height)?;
     let mut bgr_mat = Mat::default();
@@ -1422,6 +1519,7 @@ pub fn draw_lanes_v2(
         1,
     )?;
     panel_y += line_height;
+
     // Show zone breakdown if vehicles present
     if !tracked_vehicles.is_empty() {
         for (zone, count) in &zone_counts {
@@ -1526,7 +1624,7 @@ pub fn draw_lanes_v2(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 6. RIGHT PANEL: DETECTED MANEUVERS
+    // 6. RIGHT PANEL: PERSISTENT MANEUVER DISPLAY + CUMULATIVE STATS
     // ══════════════════════════════════════════════════════════════════════
     let right_panel_x = width - 480;
     let mut right_panel_y = if banner_active { 70 } else { 30 };
@@ -1536,7 +1634,7 @@ pub fn draw_lanes_v2(
         right_panel_x - 10,
         right_panel_y - 10,
         470,
-        280,
+        350, // Increased height for stats
     )?;
 
     // Title
@@ -1551,100 +1649,225 @@ pub fn draw_lanes_v2(
     )?;
     right_panel_y += line_height;
 
-    if maneuver_events.is_empty() {
+    // ══════════════════════════════════════════════════════════════════════
+    // CUMULATIVE STATISTICS (Always visible)
+    // ══════════════════════════════════════════════════════════════════════
+    draw_text_with_shadow(
+        &mut output,
+        "═══ SESSION TOTALS ═══",
+        right_panel_x,
+        right_panel_y,
+        0.55,
+        core::Scalar::new(255.0, 200.0, 100.0, 0.0),
+        1,
+    )?;
+    right_panel_y += line_height;
+
+    // Total overtakes with vehicle count
+    draw_text_with_shadow(
+        &mut output,
+        &format!(
+            "🚗 Overtakes: {} ({} vehicles)",
+            total_overtakes, total_vehicles_overtaken
+        ),
+        right_panel_x,
+        right_panel_y,
+        0.6,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        2,
+    )?;
+    right_panel_y += line_height;
+
+    // Total lane changes
+    draw_text_with_shadow(
+        &mut output,
+        &format!("🔀 Lane Changes: {}", total_lane_changes),
+        right_panel_x,
+        right_panel_y,
+        0.6,
+        core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        1,
+    )?;
+    right_panel_y += line_height;
+
+    // Being overtaken
+    if total_being_overtaken > 0 {
         draw_text_with_shadow(
             &mut output,
-            "No maneuvers detected this frame",
+            &format!("⚠️ Being Overtaken: {}", total_being_overtaken),
+            right_panel_x,
+            right_panel_y,
+            0.6,
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+            1,
+        )?;
+        right_panel_y += line_height;
+    }
+
+    right_panel_y += 10; // Spacing
+
+    // ══════════════════════════════════════════════════════════════════════
+    // LAST DETECTED MANEUVER (Persists until next maneuver)
+    // ══════════════════════════════════════════════════════════════════════
+    if let Some(ref maneuver) = last_maneuver {
+        let frames_ago = frame_id.saturating_sub(maneuver.frame_detected);
+        let seconds_ago = frames_ago as f64 / 30.0; // Assuming 30 FPS
+
+        draw_text_with_shadow(
+            &mut output,
+            "═══ LAST MANEUVER ═══",
             right_panel_x,
             right_panel_y,
             0.55,
+            core::Scalar::new(255.0, 200.0, 100.0, 0.0),
+            1,
+        )?;
+        right_panel_y += line_height;
+
+        let maneuver_color = match maneuver.maneuver_type.as_str() {
+            "OVERTAKE" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+            "LANE_CHANGE" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+            "BEING_OVERTAKEN" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+            _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+        };
+
+        // Main maneuver info
+        draw_text_with_shadow(
+            &mut output,
+            &format!(
+                ">> {} {} | conf={:.2}",
+                maneuver.maneuver_type, maneuver.side, maneuver.confidence
+            ),
+            right_panel_x,
+            right_panel_y,
+            0.65,
+            maneuver_color,
+            2,
+        )?;
+        right_panel_y += line_height;
+
+        // Time since detection
+        draw_text_with_shadow(
+            &mut output,
+            &format!("  Detected: {:.1}s ago", seconds_ago),
+            right_panel_x + 10,
+            right_panel_y,
+            0.5,
+            core::Scalar::new(180.0, 180.0, 180.0, 0.0),
+            1,
+        )?;
+        right_panel_y += 22;
+
+        // Sources
+        draw_text_with_shadow(
+            &mut output,
+            &format!("  Sources: {}", maneuver.sources),
+            right_panel_x + 10,
+            right_panel_y,
+            0.5,
             core::Scalar::new(200.0, 200.0, 200.0, 0.0),
             1,
         )?;
-    } else {
-        for event in maneuver_events.iter().take(5) {
-            let maneuver_color = match event.maneuver_type.as_str() {
-                "OVERTAKE" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
-                "LANE_CHANGE" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
-                "BEING_OVERTAKEN" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
-                _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
-            };
+        right_panel_y += 22;
 
+        // Legality
+        let legality_color = if maneuver.legality.contains("Legal") {
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0)
+        } else if maneuver.legality.contains("CriticalIllegal") {
+            core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+        } else if maneuver.legality.contains("Illegal") {
+            core::Scalar::new(0.0, 100.0, 255.0, 0.0)
+        } else {
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0)
+        };
+
+        draw_text_with_shadow(
+            &mut output,
+            &format!("  Legality: {}", maneuver.legality),
+            right_panel_x + 10,
+            right_panel_y,
+            0.5,
+            legality_color,
+            1,
+        )?;
+        right_panel_y += 22;
+
+        // Duration
+        draw_text_with_shadow(
+            &mut output,
+            &format!("  Duration: {:.1}s", maneuver.duration_ms / 1000.0),
+            right_panel_x + 10,
+            right_panel_y,
+            0.5,
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            1,
+        )?;
+        right_panel_y += 22;
+
+        // Vehicle count for overtakes
+        if maneuver.maneuver_type == "OVERTAKE" && maneuver.vehicle_count > 0 {
             draw_text_with_shadow(
                 &mut output,
-                &format!(
-                    ">> {} {} | conf={:.2}",
-                    event.maneuver_type.as_str(),
-                    event.side.as_str(),
-                    event.confidence
-                ),
-                right_panel_x,
+                &format!("  🚗 Vehicles Passed: {}", maneuver.vehicle_count),
+                right_panel_x + 10,
                 right_panel_y,
-                0.6,
-                maneuver_color,
+                0.5,
+                core::Scalar::new(0.0, 255.0, 100.0, 0.0),
                 2,
             )?;
-            right_panel_y += line_height;
-
-            // Sources
-            draw_text_with_shadow(
-                &mut output,
-                &format!("  Sources: {}", event.sources.summary()),
-                right_panel_x + 10,
-                right_panel_y,
-                0.5,
-                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-                1,
-            )?;
             right_panel_y += 22;
+        }
+    } else {
+        draw_text_with_shadow(
+            &mut output,
+            "No maneuvers detected yet",
+            right_panel_x,
+            right_panel_y,
+            0.55,
+            core::Scalar::new(150.0, 150.0, 150.0, 0.0),
+            1,
+        )?;
+    }
 
-            // Legality
-            let legality_text = format!("  Legality: {:?}", event.legality);
-            let legality_color = match event.legality {
-                crate::lane_legality::LineLegality::Legal => {
-                    core::Scalar::new(0.0, 255.0, 0.0, 0.0)
-                }
-                crate::lane_legality::LineLegality::Illegal => {
-                    core::Scalar::new(0.0, 100.0, 255.0, 0.0)
-                }
-                crate::lane_legality::LineLegality::CriticalIllegal => {
-                    core::Scalar::new(0.0, 0.0, 255.0, 0.0)
-                }
-                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-            };
+    // ══════════════════════════════════════════════════════════════════════
+    // NEW EVENTS THIS FRAME (If any)
+    // ══════════════════════════════════════════════════════════════════════
+    if !maneuver_events.is_empty() {
+        right_panel_y += 15;
 
+        draw_text_with_shadow(
+            &mut output,
+            &format!("🆕 NEW THIS FRAME ({})", maneuver_events.len()),
+            right_panel_x,
+            right_panel_y,
+            0.55,
+            core::Scalar::new(255.0, 255.0, 0.0, 0.0),
+            2,
+        )?;
+        right_panel_y += 22;
+
+        for event in maneuver_events.iter().take(2) {
+            let event_type = event.maneuver_type.as_str();
             draw_text_with_shadow(
                 &mut output,
-                &legality_text,
+                &format!("  • {} {}", event_type, event.side.as_str()),
                 right_panel_x + 10,
                 right_panel_y,
-                0.5,
-                legality_color,
+                0.45,
+                core::Scalar::new(200.0, 255.0, 200.0, 0.0),
                 1,
             )?;
-            right_panel_y += 22;
-
-            // Duration
-            draw_text_with_shadow(
-                &mut output,
-                &format!("  Duration: {:.1}s", event.duration_ms / 1000.0),
-                right_panel_x + 10,
-                right_panel_y,
-                0.5,
-                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
-                1,
-            )?;
-            right_panel_y += 24;
+            right_panel_y += 20;
         }
 
-        if maneuver_events.len() > 5 {
+        if maneuver_events.len() > 2 {
             draw_text_with_shadow(
                 &mut output,
-                &format!("... and {} more", maneuver_events.len() - 5),
-                right_panel_x,
+                &format!("  ... and {} more", maneuver_events.len() - 2),
+                right_panel_x + 10,
                 right_panel_y,
-                0.5,
-                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                0.45,
+                core::Scalar::new(150.0, 150.0, 150.0, 0.0),
                 1,
             )?;
         }
@@ -1710,4 +1933,12 @@ pub fn draw_lanes_v2(
     }
 
     Ok(output)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// PUBLIC FUNCTION TO RESET STATE (Call when starting a new video)
+// ══════════════════════════════════════════════════════════════════════════
+pub fn reset_maneuver_display() {
+    let mut state = MANEUVER_HISTORY.lock().unwrap();
+    state.reset();
 }

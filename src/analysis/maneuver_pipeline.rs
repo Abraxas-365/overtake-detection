@@ -79,36 +79,40 @@ impl ManeuverPipelineConfig {
     pub fn mining_route() -> Self {
         Self {
             tracker: TrackerConfig {
-                max_coast_frames: 120, // 4 seconds coast
-                min_confidence: 0.12,  // Very lenient
-                min_iou: 0.05,         // Very lenient
+                max_coast_frames: 120,
+                min_confidence: 0.12,
+                min_iou: 0.05,
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 400.0,  // Lower threshold
-                max_pass_duration_ms: 90000.0,  // 90 seconds max
-                min_beside_frames: 6,           // Lower threshold
-                disappearance_grace_frames: 90, // 3 second grace
+                min_beside_duration_ms: 400.0,
+                max_pass_duration_ms: 90000.0,
+                min_beside_frames: 6,
+                disappearance_grace_frames: 90,
                 ..PassDetectorConfig::default()
             },
             lateral_detector: LateralDetectorConfig {
-                min_lane_confidence: 0.20,
-                shift_start_threshold: 0.18,
-                shift_confirm_threshold: 0.25,
-                occlusion_reset_frames: 60,
-                post_reset_freeze_frames: 75,
+                min_lane_confidence: 0.25,     // ✅ Increased from 0.20
+                shift_start_threshold: 0.28,   // ✅ Increased from 0.18
+                shift_confirm_threshold: 0.38, // ✅ Increased from 0.25
+                shift_end_threshold: 0.18,     // ✅ Increased from 0.12
+                min_shift_frames: 20,          // ✅ Increased from 10
+                baseline_alpha_stable: 0.002,  // ✅ Slower baseline drift (was 0.005)
+                baseline_warmup_frames: 30,    // ✅ More warmup (was 20)
+                occlusion_reset_frames: 60,    // ✅ Increased from 45
+                post_reset_freeze_frames: 75,  // ✅ Longer freeze after reset
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
-                min_displacement: 1.0,
-                min_consensus: 0.35,
+                min_displacement: 1.5, // ✅ Increased from 1.0
+                min_consensus: 0.40,   // ✅ Increased from 0.35
                 ..EgoMotionConfig::default()
             },
             classifier: ClassifierConfig {
-                max_correlation_gap_ms: 25000.0, // 25 second window!
-                min_single_source_confidence: 0.45,
-                correlation_window_ms: 35000.0, // 35 second buffer!
-                min_combined_confidence: 0.40,  // Lower threshold
+                max_correlation_gap_ms: 25000.0,
+                min_single_source_confidence: 0.50, // ✅ Increased from 0.45
+                correlation_window_ms: 35000.0,
+                min_combined_confidence: 0.45, // ✅ Increased from 0.40
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,
