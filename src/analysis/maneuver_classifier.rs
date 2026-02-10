@@ -223,6 +223,38 @@ impl ManeuverClassifier {
         self.shift_buffer
             .retain(|s| timestamp_ms - s.event.end_ms < window);
 
+        // ✅✅✅ ADD THIS IMMEDIATELY AFTER BUFFER RETENTION ✅✅✅
+        info!(
+            "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
+            timestamp_ms / 1000.0,
+            self.pass_buffer.len(),
+            self.shift_buffer.len()
+        );
+
+        for (i, p) in self.pass_buffer.iter().enumerate() {
+            info!(
+            "  Pass[{}]: track={} side={:?} direction={:?} conf={:.2} correlated={} beside_end={:.1}s",
+            i,
+            p.event.vehicle_track_id,
+            p.event.side,
+            p.event.direction,
+            p.event.confidence,
+            p.correlated,
+            p.event.beside_end_ms / 1000.0
+        );
+        }
+
+        for (i, s) in self.shift_buffer.iter().enumerate() {
+            info!(
+                "  Shift[{}]: dir={:?} conf={:.2} correlated={} end={:.1}s",
+                i,
+                s.event.direction,
+                s.event.confidence,
+                s.correlated,
+                s.event.end_ms / 1000.0
+            );
+        }
+
         // ── CORRELATE PASS + SHIFT → OVERTAKE ───────────────────
         let gap = self.config.max_correlation_gap_ms;
 
