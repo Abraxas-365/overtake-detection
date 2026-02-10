@@ -1646,17 +1646,30 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // 🔧 NEW PATH 4.5: SUSTAINED DEVIATION (SLOW LANE CHANGES)
-                // Triggers for 25-35% deviation with low/no velocity
-                // Requires long sustained movement to avoid false positives
+                // 🔧 PATH 4.5: SUSTAINED DEVIATION (with curve rejection)
                 if deviation >= DEVIATION_DRIFT_START && deviation < MEDIUM_OFFSET_THRESHOLD {
+                    // 🚨 CRITICAL: Reject curves to avoid false positives
+                    if self.is_in_curve {
+                        if metrics.is_sustained_movement && metrics.time_span_ms >= 3000.0 {
+                            debug!(
+                    "🌀 Curve rejection [SUSTAINED]: dev={:.1}%, span={:.1}s (following curve)",
+                    deviation * 100.0,
+                    metrics.time_span_ms / 1000.0
+                );
+                        }
+                        return LaneChangeState::Centered;
+                    }
+
                     if self.is_deviation_sustained_long(DEVIATION_DRIFT_START)
                         && metrics.time_span_ms >= 3000.0
                         && metrics.is_sustained_movement
+                        && metrics.direction_consistency >= 0.70
+                        && metrics.direction_consistency <= 0.95
+                    // Reject perfect consistency
                     {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
                         info!(
-                            "🚨 [SUSTAINED] dev={:.1}%, span={:.1}s, dir_consistency={:.1}%",
+                            "🚨 [SUSTAINED] dev={:.1}%, span={:.1}s, consistency={:.1}%",
                             deviation * 100.0,
                             metrics.time_span_ms / 1000.0,
                             metrics.direction_consistency * 100.0
@@ -1665,8 +1678,17 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 5: GRADUAL CHANGE (VERY SLOW)
+                // PATH 5: GRADUAL CHANGE (with curve rejection)
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
+                    if self.is_in_curve {
+                        debug!(
+                "🌀 Curve rejection [GRADUAL]: max={:.1}%, span={:.1}s (following curve)",
+                metrics.max_deviation * 100.0,
+                metrics.time_span_ms / 1000.0
+            );
+                        return LaneChangeState::Centered;
+                    }
+
                     if self.is_deviation_sustained_long(DEVIATION_DRIFT_START)
                         && metrics.time_span_ms >= 5000.0
                     {
@@ -1691,7 +1713,7 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                LaneChangeState::Centered
+                return LaneChangeState::Centered;
             }
 
             LaneChangeState::Drifting => {
