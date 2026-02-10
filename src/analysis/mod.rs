@@ -21,9 +21,6 @@ pub mod vehicle_tracker;
 pub use ego_motion::{EgoMotionEstimate, GrayFrame};
 pub use lateral_detector::{LaneMeasurement, LateralShiftEvent, ShiftDirection};
 pub use maneuver_classifier::{DetectionSources, ManeuverEvent, ManeuverSide, ManeuverType};
-pub use maneuver_pipeline::{
-    ManeuverFrameInput, ManeuverFrameResult, ManeuverPipeline, ManeuverPipelineConfig,
-};
+pub use maneuver_pipeline::{ManeuverFrameInput, ManeuverPipeline, ManeuverPipelineConfig};
 pub use pass_detector::{PassDirection, PassEvent, PassSide};
 pub use vehicle_tracker::{DetectionInput, Track, TrackState, VehicleZone};
-

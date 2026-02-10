@@ -158,7 +158,7 @@ impl ManeuverPipeline {
         // 2. PASS DETECTION
         let pass_events = self
             .pass_detector
-            .update(tracks, input.timestamp_ms, input.frame_id);
+            .update(&tracks, input.timestamp_ms, input.frame_id);
 
         // 3. LATERAL SHIFT DETECTION
         let shift_event = self.lateral_detector.update(
