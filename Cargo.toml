@@ -19,6 +19,7 @@ tokio = { version = "1.35", features = ["full"] }
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+lazy_static = "1.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
