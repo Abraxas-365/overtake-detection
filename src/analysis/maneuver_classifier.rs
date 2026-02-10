@@ -2,16 +2,6 @@
 //
 // Fusion layer: combines vehicle tracking, lateral shift detection,
 // and ego-motion estimation to classify maneuvers.
-//
-// Classification logic:
-//   OVERTAKE     = vehicle passed (from pass_detector) + lateral shift
-//   LANE_CHANGE  = lateral shift + NO vehicle passed
-//   BEING_OVERTAKEN = vehicle overtook ego (appeared beside → moved ahead)
-//
-// Integration with existing pipeline:
-//   - Uses `LineLegality` from `lane_legality` (no parallel legality enum)
-//   - Uses `LegalityRingBuffer` for temporally-correct legality lookups
-//   - Output `ManeuverEvent` maps directly to `PipelineEvent` variants
 
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
@@ -20,7 +10,7 @@ use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use tracing::{debug, info};
+use tracing::info;
 
 // ============================================================================
 // CONFIGURATION
@@ -28,22 +18,13 @@ use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
-    /// Maximum time gap (ms) between a pass event and a lateral shift
-    /// for them to be correlated as the same maneuver
     pub max_correlation_gap_ms: f64,
-    /// Minimum confidence from any single source to trigger a maneuver
     pub min_single_source_confidence: f32,
-    /// Minimum combined confidence to report a maneuver
     pub min_combined_confidence: f32,
-    /// Ego-motion velocity threshold (px/frame) to confirm lateral motion
     pub ego_motion_threshold: f32,
-    /// Weight for pass detector signal in fusion
     pub weight_pass: f32,
-    /// Weight for lateral detector signal in fusion
     pub weight_lateral: f32,
-    /// Weight for ego-motion signal in fusion
     pub weight_ego_motion: f32,
-    /// How long (ms) to keep events in the correlation buffer
     pub correlation_window_ms: f64,
 }
 
@@ -125,8 +106,6 @@ impl DetectionSources {
     }
 }
 
-/// Snapshot of road markings visible at a given frame.
-/// Used for legality context even when the classifier doesn't own the legality buffer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MarkingSnapshot {
     pub left_name: Option<String>,
@@ -134,16 +113,13 @@ pub struct MarkingSnapshot {
     pub frame_id: u64,
 }
 
-/// Final output event. Uses `LineLegality` and `FusedLegalityResult` from
-/// the existing `lane_legality` crate — no parallel enum.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Final output event - uses serde(skip) for non-serializable nested types
+#[derive(Debug, Clone, Serialize)]
 pub struct ManeuverEvent {
     pub maneuver_type: ManeuverType,
     pub side: ManeuverSide,
-    /// Verdict from `LegalityRingBuffer::worst_in_range` at crossing time
     pub legality: LineLegality,
-    /// Full fused result for downstream (API payload, video overlay)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub legality_at_crossing: Option<FusedLegalityResult>,
     pub confidence: f32,
     pub sources: DetectionSources,
@@ -152,16 +128,12 @@ pub struct ManeuverEvent {
     pub start_frame: u64,
     pub end_frame: u64,
     pub duration_ms: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub passed_vehicle_id: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub passed_vehicle_class: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub pass_event: Option<PassEvent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub lateral_event: Option<LateralShiftEvent>,
-    /// Road marking context at the time of the maneuver
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub marking_context: Option<MarkingSnapshot>,
 }
 
@@ -193,7 +165,6 @@ pub struct ManeuverClassifier {
     ego_motion_during_window: VecDeque<f32>,
     recent_events: Vec<ManeuverEvent>,
     total_maneuvers: u64,
-    /// Latest road marking context from YOLO-seg
     latest_markings: MarkingSnapshot,
 }
 
@@ -234,18 +205,10 @@ impl ManeuverClassifier {
         }
     }
 
-    /// Update the latest road marking snapshot from YOLO-seg results.
-    /// Called every frame — cheap to update, used when building events.
     pub fn update_markings(&mut self, snapshot: MarkingSnapshot) {
         self.latest_markings = snapshot;
     }
 
-    /// Run classification using the existing `LegalityRingBuffer` for
-    /// temporally-correct legality lookup at the actual crossing frame range.
-    ///
-    /// `legality_buffer` is optional — when None (legality model disabled or
-    /// buffer not yet populated), maneuvers are still detected but legality
-    /// defaults to `LineLegality::Unknown`.
     pub fn classify(
         &mut self,
         timestamp_ms: f64,
@@ -412,8 +375,6 @@ impl ManeuverClassifier {
 
         let (start_frame, end_frame) = self.compute_frame_range(pass, shift);
 
-        // Lookup from the existing ring buffer — gets the worst legality
-        // during the actual frame range of the maneuver
         let legality_at_crossing =
             legality_buffer.and_then(|buf| buf.worst_in_range(start_frame, end_frame));
         let legality = legality_at_crossing
@@ -538,7 +499,7 @@ impl ManeuverClassifier {
         ManeuverEvent {
             maneuver_type: ManeuverType::BeingOvertaken,
             side,
-            legality: LineLegality::Unknown, // Not our crossing to judge
+            legality: LineLegality::Unknown,
             legality_at_crossing: None,
             confidence: pass.confidence * 0.85,
             sources: DetectionSources {
@@ -626,7 +587,7 @@ fn temporal_gap(start_a: f64, end_a: f64, start_b: f64, end_b: f64) -> f64 {
     } else if end_b < start_a {
         start_a - end_b
     } else {
-        0.0 // Overlapping
+        0.0
     }
 }
 
@@ -636,4 +597,3 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
         (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
     )
 }
-

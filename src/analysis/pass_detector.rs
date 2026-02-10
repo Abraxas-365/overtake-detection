@@ -14,6 +14,7 @@
 // It works in dust, at night, in rain — whenever vehicles are detectable.
 
 use super::vehicle_tracker::{Track, VehicleZone};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
@@ -56,7 +57,7 @@ impl Default for PassDetectorConfig {
 // ============================================================================
 
 /// Direction of the pass from the ego vehicle's perspective
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PassDirection {
     /// Ego overtook the vehicle (vehicle went AHEAD → BESIDE → BEHIND)
     EgoOvertook,
@@ -74,7 +75,7 @@ impl PassDirection {
 }
 
 /// Which side the overtake happened on (from ego's perspective)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PassSide {
     Left,  // Ego passed on the left (vehicle was on right during BESIDE)
     Right, // Ego passed on the right
@@ -90,7 +91,7 @@ impl PassSide {
 }
 
 /// A completed pass event
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassEvent {
     /// ID of the tracked vehicle that was passed
     pub vehicle_track_id: u32,
@@ -229,7 +230,7 @@ impl PassDetector {
 
                     // Check if vehicle overtook us
                     if pending.beside_confirmed && !pending.had_ahead {
-                        tracks_to_check_overtook_ego.push((track.id, track.clone()));
+                        tracks_to_check_overtook_ego.push((track.id, (*track).clone()));
                     }
                 }
 
@@ -266,7 +267,7 @@ impl PassDetector {
                 VehicleZone::Behind => {
                     // Mark for checking if pass is complete
                     if pending.beside_confirmed {
-                        tracks_to_check_behind.push((track.id, track.clone()));
+                        tracks_to_check_behind.push((track.id, (*track).clone()));
                     }
                     pending.frames_since_beside += 1;
                 }
@@ -521,8 +522,9 @@ mod tests {
         for i in 0..60 {
             let t = i as f64 * (1000.0 / fps);
             let dets = vec![det(580.0, 180.0, 700.0, 280.0)];
-            let tracks = tracker.update(&dets, t, i);
-            let e = pass_det.update(tracks, t, i);
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
             events.extend(e);
         }
         assert!(events.is_empty(), "No pass should be detected yet");
@@ -531,8 +533,9 @@ mod tests {
         for i in 60..150 {
             let t = i as f64 * (1000.0 / fps);
             let dets = vec![det(880.0, 300.0, 1250.0, 680.0)];
-            let tracks = tracker.update(&dets, t, i);
-            let e = pass_det.update(tracks, t, i);
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
             events.extend(e);
         }
         assert!(events.is_empty(), "Pass not complete yet (still beside)");
@@ -541,8 +544,9 @@ mod tests {
         for i in 150..180 {
             let t = i as f64 * (1000.0 / fps);
             let dets = vec![det(200.0, 550.0, 1080.0, 720.0)];
-            let tracks = tracker.update(&dets, t, i);
-            let e = pass_det.update(tracks, t, i);
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
             events.extend(e);
         }
 
