@@ -150,18 +150,16 @@ impl ManeuverPipeline {
     pub fn process_frame(&mut self, input: ManeuverFrameInput) -> ManeuverFrameOutput {
         self.frame_count += 1;
 
-        // 1. VEHICLE TRACKING - capture the return value first
-        let tracks =
-            self.tracker
-                .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
+        self.tracker
+            .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
         let tracked_count = self.tracker.confirmed_count();
+        let tracks = self.tracker.confirmed_tracks();
 
-        // 2. PASS DETECTION - use the captured `tracks` variable
-        let pass_events = self.pass_detector.update(
-            &tracks, // Pass reference to tracks
-            input.timestamp_ms,
-            input.frame_id,
-        );
+        // 2. PASS DETECTION
+        let pass_events = self
+            .pass_detector
+            .update(tracks, input.timestamp_ms, input.frame_id);
+
         // 3. LATERAL SHIFT DETECTION
         let shift_event = self.lateral_detector.update(
             input.lane_measurement,

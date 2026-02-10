@@ -24,10 +24,6 @@ mod types;
 mod vehicle_detection;
 mod video_processor;
 
-use analysis::fallback_estimator::FallbackPositionEstimator;
-use analysis::InferenceScheduler;
-use analysis::LaneChangeAnalyzer;
-
 // ── NEW v2 imports ──
 use analysis::ego_motion::GrayFrame;
 use analysis::lateral_detector::LaneMeasurement;
@@ -943,7 +939,7 @@ fn run_maneuver_pipeline_v2(
     // FIXED: Determine side based on bbox position instead of non-existent 'side' field
     let latest_legality = ps.legality_buffer.latest();
     let frame_center_x = frame.width as f32 / 2.0;
-    
+
     let left_marking: Option<String> = latest_legality.as_ref().and_then(|fused| {
         fused
             .all_markings
@@ -961,7 +957,7 @@ fn run_maneuver_pipeline_v2(
             })
             .map(|m| m.class_name.clone())
     });
-    
+
     let right_marking: Option<String> = latest_legality.as_ref().and_then(|fused| {
         fused
             .all_markings
