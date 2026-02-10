@@ -67,8 +67,9 @@ impl MiningRouteProfile {
             name: "MiningUnpaved",
             description: "Unpaved route, relying on road edges/YOLOv8",
             min_lane_confidence: 0.45,
-            min_duration_ms: 3500.0, // Trucks are slow
-            drift_threshold: 0.30,   // More permissive
+            min_duration_ms: 1800.0,
+            // Trucks are slow
+            drift_threshold: 0.30, // More permissive
             crossing_threshold: 0.40,
             consistency_threshold: 0.80,
             require_yolo_validation: true, // Critical on unpaved
