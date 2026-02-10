@@ -79,35 +79,35 @@ impl ManeuverPipelineConfig {
     pub fn mining_route() -> Self {
         Self {
             tracker: TrackerConfig {
-                max_coast_frames: 60,
-                min_confidence: 0.20,
-                min_iou: 0.10,
+                max_coast_frames: 90, // Increased from 60 - allow 3s coast
+                min_confidence: 0.15, // Lowered from 0.20 - detect fainter vehicles
+                min_iou: 0.08,        // Lowered from 0.10 - more lenient tracking
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 800.0,
-                max_pass_duration_ms: 45000.0,
-                min_beside_frames: 12,
-                disappearance_grace_frames: 45,
+                min_beside_duration_ms: 600.0,  // Lowered from 800
+                max_pass_duration_ms: 60000.0,  // Increased from 45000 - allow 1 minute
+                min_beside_frames: 8,           // Lowered from 12
+                disappearance_grace_frames: 60, // Increased from 45 - 2s grace
                 ..PassDetectorConfig::default()
             },
             lateral_detector: LateralDetectorConfig {
-                min_lane_confidence: 0.30,
-                shift_start_threshold: 0.25,
-                shift_confirm_threshold: 0.35,
-                occlusion_reset_frames: 30,
-                post_reset_freeze_frames: 45,
+                min_lane_confidence: 0.25,     // Lowered from 0.30
+                shift_start_threshold: 0.20,   // Lowered from 0.25
+                shift_confirm_threshold: 0.30, // Lowered from 0.35
+                occlusion_reset_frames: 45,    // Increased from 30
+                post_reset_freeze_frames: 60,  // Increased from 45
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
-                // ADD THIS FIELD
-                min_displacement: 2.0,
-                min_consensus: 0.45,
+                min_displacement: 1.5, // Lowered from 2.0
+                min_consensus: 0.40,   // Lowered from 0.45
                 ..EgoMotionConfig::default()
             },
             classifier: ClassifierConfig {
-                max_correlation_gap_ms: 8000.0,
-                min_single_source_confidence: 0.60,
+                max_correlation_gap_ms: 15000.0, // Increased from 8000 - 15 second window
+                min_single_source_confidence: 0.50, // Lowered from 0.60
+                correlation_window_ms: 20000.0,  // Increased from 10000 - 20 second buffer
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,

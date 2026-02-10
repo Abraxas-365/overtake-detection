@@ -301,12 +301,15 @@ async fn process_video(
 
         // ── STAGE 5: Video annotation ──
         if let Some(ref mut w) = writer {
+            let tracked_vehicles = ps.maneuver_pipeline_v2.tracked_vehicles();
+
             run_video_annotation(
                 w,
                 &ps,
                 &arc_frame,
                 &detected_lanes,
                 &v2_output,
+                &tracked_vehicles,
                 reader.width,
                 reader.height,
                 timestamp_ms,
@@ -578,6 +581,7 @@ fn run_video_annotation(
     frame: &Arc<Frame>,
     detected_lanes: &[DetectedLane],
     v2_output: &ManeuverFrameOutput,
+    tracked_vehicles: &[&analysis::vehicle_tracker::Track],
     width: i32,
     height: i32,
     timestamp_ms: f64,
@@ -594,7 +598,7 @@ fn run_video_annotation(
         detected_lanes,
         ps.last_vehicle_state.as_ref(),
         &v2_output.maneuver_events,
-        v2_output.tracked_vehicle_count,
+        tracked_vehicles,
         v2_output.ego_lateral_velocity,
         &v2_output.lateral_state,
         frame_count,
@@ -647,4 +651,3 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.avg_fps, stats.duration_secs
     );
 }
-

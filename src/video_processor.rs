@@ -1128,6 +1128,7 @@ pub fn draw_lanes_with_state(
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Visualization for v2 maneuver detection pipeline
+/// Visualization for v2 maneuver detection pipeline with vehicle tracking
 pub fn draw_lanes_v2(
     frame: &[u8],
     width: i32,
@@ -1135,7 +1136,7 @@ pub fn draw_lanes_v2(
     lanes: &[DetectedLane],
     vehicle_state: Option<&VehicleState>,
     maneuver_events: &[crate::analysis::maneuver_classifier::ManeuverEvent],
-    tracked_vehicle_count: usize,
+    tracked_vehicles: &[&crate::analysis::vehicle_tracker::Track],
     ego_lateral_velocity: f32,
     lateral_state: &str,
     frame_id: u64,
@@ -1178,7 +1179,112 @@ pub fn draw_lanes_v2(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 2. DRAW EGO VEHICLE MARKER
+    // 2. DRAW TRACKED VEHICLES WITH IDs
+    // ══════════════════════════════════════════════════════════════════════
+    for track in tracked_vehicles {
+        if !track.is_confirmed() {
+            continue;
+        }
+
+        let bbox = &track.bbox;
+        
+        // Color based on zone
+        let box_color = match track.zone {
+            crate::analysis::vehicle_tracker::VehicleZone::Ahead => {
+                core::Scalar::new(255.0, 255.0, 0.0, 0.0) // Cyan - ahead
+            }
+            crate::analysis::vehicle_tracker::VehicleZone::BesideLeft => {
+                core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange - beside left
+            }
+            crate::analysis::vehicle_tracker::VehicleZone::BesideRight => {
+                core::Scalar::new(255.0, 0.0, 255.0, 0.0) // Magenta - beside right
+            }
+            crate::analysis::vehicle_tracker::VehicleZone::Behind => {
+                core::Scalar::new(0.0, 255.0, 0.0, 0.0) // Green - behind (passed)
+            }
+            crate::analysis::vehicle_tracker::VehicleZone::Unknown => {
+                core::Scalar::new(128.0, 128.0, 128.0, 0.0) // Gray - unknown
+            }
+        };
+
+        // Draw bounding box
+        let pt1 = core::Point::new(bbox[0] as i32, bbox[1] as i32);
+        let pt2 = core::Point::new(bbox[2] as i32, bbox[3] as i32);
+        imgproc::rectangle(
+            &mut output,
+            core::Rect::from_points(pt1, pt2),
+            box_color,
+            3,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        // Label with ID, zone, and confidence
+        let zone_str = match track.zone {
+            crate::analysis::vehicle_tracker::VehicleZone::Ahead => "AHEAD",
+            crate::analysis::vehicle_tracker::VehicleZone::BesideLeft => "BESIDE-L",
+            crate::analysis::vehicle_tracker::VehicleZone::BesideRight => "BESIDE-R",
+            crate::analysis::vehicle_tracker::VehicleZone::Behind => "BEHIND",
+            crate::analysis::vehicle_tracker::VehicleZone::Unknown => "UNKNOWN",
+        };
+
+        let label = format!(
+            "ID:{} {} ({:.0}%)",
+            track.id,
+            zone_str,
+            track.last_confidence * 100.0
+        );
+
+        let label_pos = core::Point::new(bbox[0] as i32, (bbox[1] as i32) - 8);
+
+        // Background for label
+        let label_size =
+            imgproc::get_text_size(&label, imgproc::FONT_HERSHEY_SIMPLEX, 0.6, 2, &mut 0)?;
+
+        let label_bg_pt1 =
+            core::Point::new(label_pos.x - 2, label_pos.y - label_size.height - 4);
+        let label_bg_pt2 =
+            core::Point::new(label_pos.x + label_size.width + 4, label_pos.y + 4);
+
+        imgproc::rectangle(
+            &mut output,
+            core::Rect::from_points(label_bg_pt1, label_bg_pt2),
+            core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+
+        // Label text
+        imgproc::put_text(
+            &mut output,
+            &label,
+            label_pos,
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.6,
+            core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+
+        // Draw track age indicator
+        let age_text = format!("Age:{}", track.age);
+        let age_pos = core::Point::new(bbox[0] as i32, (bbox[2] as i32) + 20);
+        
+        draw_text_with_shadow(
+            &mut output,
+            &age_text,
+            age_pos.x,
+            age_pos.y,
+            0.4,
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            1,
+        )?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 3. DRAW EGO VEHICLE MARKER
     // ══════════════════════════════════════════════════════════════════════
     let vehicle_x = width / 2;
     let vehicle_y = (height as f32 * 0.85) as i32;
@@ -1193,10 +1299,10 @@ pub fn draw_lanes_v2(
     )?;
 
     // ══════════════════════════════════════════════════════════════════════
-    // 3. LEGALITY BANNER (if illegal crossing detected)
+    // 4. LEGALITY BANNER (if illegal crossing detected)
     // ══════════════════════════════════════════════════════════════════════
     let mut banner_active = false;
-
+    
     if let Some(legality) = legality_result {
         if legality.ego_intersects_marking && legality.verdict.is_illegal() {
             let banner_h = 50;
@@ -1268,13 +1374,13 @@ pub fn draw_lanes_v2(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 4. LEFT PANEL: V2 PIPELINE STATUS
+    // 5. LEFT PANEL: V2 PIPELINE STATUS
     // ══════════════════════════════════════════════════════════════════════
     let panel_x = 15;
     let mut panel_y = if banner_active { 70 } else { 30 };
     let line_height = 26;
 
-    draw_panel_background(&mut output, 5, panel_y - 10, 480, 280)?;
+    draw_panel_background(&mut output, 5, panel_y - 10, 480, 300)?;
 
     // Title
     draw_text_with_shadow(
@@ -1300,10 +1406,17 @@ pub fn draw_lanes_v2(
     )?;
     panel_y += line_height;
 
-    // Tracked vehicles
+    // Tracked vehicles with zone breakdown
+    let mut zone_counts = std::collections::HashMap::new();
+    for track in tracked_vehicles {
+        if track.is_confirmed() {
+            *zone_counts.entry(format!("{:?}", track.zone)).or_insert(0) += 1;
+        }
+    }
+
     draw_text_with_shadow(
         &mut output,
-        &format!("Tracked Vehicles: {}", tracked_vehicle_count),
+        &format!("Tracked Vehicles: {}", tracked_vehicles.len()),
         panel_x,
         panel_y,
         0.55,
@@ -1312,10 +1425,29 @@ pub fn draw_lanes_v2(
     )?;
     panel_y += line_height;
 
+    // Show zone breakdown if vehicles present
+    if !tracked_vehicles.is_empty() {
+        for (zone, count) in &zone_counts {
+            draw_
+
+text_with_shadow(
+            &mut output,
+            &format!("  {}: {}", zone, count),
+            panel_x + 10,
+            panel_y,
+            0.45,
+            core::Scalar::new(180.0, 180.0, 180.0, 0.0),
+            1,
+        )?;
+        panel_y += 20;
+    }
+}
+
     // Lateral state
     let state_color = match lateral_state {
-        s if s.contains("CENTERED") => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        s if s.contains("CENTERED") || s.contains("STABLE") => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
         s if s.contains("SHIFT") => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        s if s.contains("RECOVER") => core::Scalar::new(0.0, 255.0, 255.0, 0.0),
         _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
     };
 
@@ -1379,13 +1511,12 @@ pub fn draw_lanes_v2(
                     core::Scalar::new(200.0, 200.0, 200.0, 0.0),
                     1,
                 )?;
-                panel_y += line_height;
             }
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 5. RIGHT PANEL: DETECTED MANEUVERS
+    // 6. RIGHT PANEL: DETECTED MANEUVERS
     // ══════════════════════════════════════════════════════════════════════
     let right_panel_x = width - 480;
     let mut right_panel_y = if banner_active { 70 } else { 30 };
@@ -1509,5 +1640,61 @@ pub fn draw_lanes_v2(
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 7. LEGEND (Bottom Right)
+    // ══════════════════════════════════════════════════════════════════════
+    let legend_y = height - 180;
+    draw_panel_background(&mut output, width - 300, legend_y - 10, 290, 175)?;
+
+    draw_text_with_shadow(
+        &mut output,
+        "VEHICLE TRACKING LEGEND",
+        width - 290,
+        legend_y,
+        0.5,
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        1,
+    )?;
+
+    let legend_items: Vec<(&str, core::Scalar)> = vec![
+        (
+            "[CYAN] AHEAD - in front",
+            core::Scalar::new(255.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            "[ORANGE] BESIDE-L - left side",
+            core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        ),
+        (
+            "[MAGENTA] BESIDE-R - right side",
+            core::Scalar::new(255.0, 0.0, 255.0, 0.0),
+        ),
+        (
+            "[GREEN] BEHIND - passed",
+            core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        ),
+        (
+            "[GRAY] UNKNOWN zone",
+            core::Scalar::new(128.0, 128.0, 128.0, 0.0),
+        ),
+        (
+            "[YELLOW] Ego vehicle",
+            core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+        ),
+    ];
+
+    for (i, (label, color)) in legend_items.iter().enumerate() {
+        draw_text_with_shadow(
+            &mut output,
+            label,
+            width - 285,
+            legend_y + 20 + (i as i32 * 20),
+            0.4,
+            *color,
+            1,
+        )?;
+    }
+
     Ok(output)
 }
+
