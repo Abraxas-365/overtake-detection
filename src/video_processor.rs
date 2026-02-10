@@ -1122,3 +1122,392 @@ pub fn draw_lanes_with_state(
 
     Ok(output)
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// V2 PIPELINE VISUALIZATION - Maneuver Detection v2
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Visualization for v2 maneuver detection pipeline
+pub fn draw_lanes_v2(
+    frame: &[u8],
+    width: i32,
+    height: i32,
+    lanes: &[DetectedLane],
+    vehicle_state: Option<&VehicleState>,
+    maneuver_events: &[crate::analysis::maneuver_classifier::ManeuverEvent],
+    tracked_vehicle_count: usize,
+    ego_lateral_velocity: f32,
+    lateral_state: &str,
+    frame_id: u64,
+    timestamp_ms: f64,
+    legality_result: Option<&LegalityResult>,
+) -> Result<Mat> {
+    let mat = Mat::from_slice(frame)?;
+    let mat = mat.reshape(3, height)?;
+    let mut bgr_mat = Mat::default();
+    imgproc::cvt_color(&mat, &mut bgr_mat, imgproc::COLOR_RGB2BGR, 0)?;
+    let mut output = bgr_mat.try_clone()?;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 1. DRAW LANE MARKINGS
+    // ══════════════════════════════════════════════════════════════════════
+    let lane_colors = vec![
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0),   // Red - left
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),   // Green - right
+        core::Scalar::new(255.0, 0.0, 0.0, 0.0),   // Blue
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0), // Yellow
+    ];
+
+    for (i, lane) in lanes.iter().enumerate() {
+        let color = lane_colors[i % lane_colors.len()];
+        let thickness = if i < 2 { 4 } else { 2 };
+
+        for point in &lane.points {
+            let pt = core::Point::new(point.0 as i32, point.1 as i32);
+            imgproc::circle(&mut output, pt, thickness, color, -1, imgproc::LINE_8, 0)?;
+        }
+
+        if lane.points.len() >= 2 {
+            for j in 0..lane.points.len() - 1 {
+                let pt1 = core::Point::new(lane.points[j].0 as i32, lane.points[j].1 as i32);
+                let pt2 =
+                    core::Point::new(lane.points[j + 1].0 as i32, lane.points[j + 1].1 as i32);
+                imgproc::line(&mut output, pt1, pt2, color, 2, imgproc::LINE_AA, 0)?;
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 2. DRAW EGO VEHICLE MARKER
+    // ══════════════════════════════════════════════════════════════════════
+    let vehicle_x = width / 2;
+    let vehicle_y = (height as f32 * 0.85) as i32;
+    imgproc::circle(
+        &mut output,
+        core::Point::new(vehicle_x, vehicle_y),
+        12,
+        core::Scalar::new(0.0, 255.0, 255.0, 0.0),
+        -1,
+        imgproc::LINE_8,
+        0,
+    )?;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 3. LEGALITY BANNER (if illegal crossing detected)
+    // ══════════════════════════════════════════════════════════════════════
+    let mut banner_active = false;
+
+    if let Some(legality) = legality_result {
+        if legality.ego_intersects_marking && legality.verdict.is_illegal() {
+            let banner_h = 50;
+            let color = match legality.verdict {
+                crate::lane_legality::LineLegality::CriticalIllegal => {
+                    core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+                }
+                crate::lane_legality::LineLegality::Illegal => {
+                    core::Scalar::new(0.0, 50.0, 200.0, 0.0)
+                }
+                _ => core::Scalar::new(0.0, 200.0, 255.0, 0.0),
+            };
+
+            imgproc::rectangle(
+                &mut output,
+                core::Rect::new(0, 0, width, banner_h),
+                color,
+                -1,
+                imgproc::LINE_8,
+                0,
+            )?;
+
+            let line_name = legality
+                .intersecting_line
+                .as_ref()
+                .map(|l| l.class_name.as_str())
+                .unwrap_or("SOLID LINE");
+
+            let text = format!(
+                "! ILLEGAL CROSSING: {} - VIOLATION",
+                line_name.to_uppercase()
+            );
+
+            draw_text_with_shadow(
+                &mut output,
+                &text,
+                20,
+                35,
+                0.8,
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+                2,
+            )?;
+
+            banner_active = true;
+        }
+
+        // Draw detected road markings
+        for marking in &legality.all_markings {
+            use crate::lane_legality::LineLegality;
+
+            let box_color = match marking.legality {
+                LineLegality::CriticalIllegal => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                LineLegality::Illegal => core::Scalar::new(0.0, 100.0, 255.0, 0.0),
+                LineLegality::Legal => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            };
+
+            let pt1 = core::Point::new(marking.bbox[0] as i32, marking.bbox[1] as i32);
+            let pt2 = core::Point::new(marking.bbox[2] as i32, marking.bbox[3] as i32);
+            imgproc::rectangle(
+                &mut output,
+                core::Rect::from_points(pt1, pt2),
+                box_color,
+                2,
+                imgproc::LINE_8,
+                0,
+            )?;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 4. LEFT PANEL: V2 PIPELINE STATUS
+    // ══════════════════════════════════════════════════════════════════════
+    let panel_x = 15;
+    let mut panel_y = if banner_active { 70 } else { 30 };
+    let line_height = 26;
+
+    draw_panel_background(&mut output, 5, panel_y - 10, 480, 280)?;
+
+    // Title
+    draw_text_with_shadow(
+        &mut output,
+        "MANEUVER DETECTION v2",
+        panel_x,
+        panel_y,
+        0.7,
+        core::Scalar::new(100.0, 200.0, 255.0, 0.0),
+        2,
+    )?;
+    panel_y += line_height;
+
+    // Frame info
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Frame: {} | Time: {:.2}s", frame_id, timestamp_ms / 1000.0),
+        panel_x,
+        panel_y,
+        0.5,
+        core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Tracked vehicles
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Tracked Vehicles: {}", tracked_vehicle_count),
+        panel_x,
+        panel_y,
+        0.55,
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Lateral state
+    let state_color = match lateral_state {
+        s if s.contains("CENTERED") => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+        s if s.contains("SHIFT") => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+        _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+    };
+
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Lateral State: {}", lateral_state),
+        panel_x,
+        panel_y,
+        0.6,
+        state_color,
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Ego lateral velocity
+    let vel_color = if ego_lateral_velocity.abs() > 3.0 {
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0) // Red - high
+    } else if ego_lateral_velocity.abs() > 1.5 {
+        core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange - medium
+    } else {
+        core::Scalar::new(255.0, 255.0, 255.0, 0.0) // White - low
+    };
+
+    draw_text_with_shadow(
+        &mut output,
+        &format!("Ego Lateral: {:.2} px/frame", ego_lateral_velocity),
+        panel_x,
+        panel_y,
+        0.55,
+        vel_color,
+        1,
+    )?;
+    panel_y += line_height;
+
+    // Vehicle position
+    if let Some(vs) = vehicle_state {
+        if vs.is_valid() {
+            let normalized = vs.normalized_offset().unwrap_or(0.0);
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    "Lateral Offset: {:.1}px ({:+.1}%)",
+                    vs.lateral_offset,
+                    normalized * 100.0
+                ),
+                panel_x,
+                panel_y,
+                0.55,
+                core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+                1,
+            )?;
+            panel_y += line_height;
+
+            if let Some(lw) = vs.lane_width {
+                draw_text_with_shadow(
+                    &mut output,
+                    &format!("Lane Width: {:.0}px", lw),
+                    panel_x,
+                    panel_y,
+                    0.55,
+                    core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                    1,
+                )?;
+                panel_y += line_height;
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 5. RIGHT PANEL: DETECTED MANEUVERS
+    // ══════════════════════════════════════════════════════════════════════
+    let right_panel_x = width - 480;
+    let mut right_panel_y = if banner_active { 70 } else { 30 };
+
+    draw_panel_background(
+        &mut output,
+        right_panel_x - 10,
+        right_panel_y - 10,
+        470,
+        280,
+    )?;
+
+    // Title
+    draw_text_with_shadow(
+        &mut output,
+        "DETECTED MANEUVERS",
+        right_panel_x,
+        right_panel_y,
+        0.7,
+        core::Scalar::new(100.0, 255.0, 100.0, 0.0),
+        2,
+    )?;
+    right_panel_y += line_height;
+
+    if maneuver_events.is_empty() {
+        draw_text_with_shadow(
+            &mut output,
+            "No maneuvers detected this frame",
+            right_panel_x,
+            right_panel_y,
+            0.55,
+            core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            1,
+        )?;
+    } else {
+        for event in maneuver_events.iter().take(5) {
+            let maneuver_color = match event.maneuver_type.as_str() {
+                "OVERTAKE" => core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                "LANE_CHANGE" => core::Scalar::new(0.0, 165.0, 255.0, 0.0),
+                "BEING_OVERTAKEN" => core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                _ => core::Scalar::new(255.0, 255.0, 255.0, 0.0),
+            };
+
+            draw_text_with_shadow(
+                &mut output,
+                &format!(
+                    ">> {} {} | conf={:.2}",
+                    event.maneuver_type.as_str(),
+                    event.side.as_str(),
+                    event.confidence
+                ),
+                right_panel_x,
+                right_panel_y,
+                0.6,
+                maneuver_color,
+                2,
+            )?;
+            right_panel_y += line_height;
+
+            // Sources
+            draw_text_with_shadow(
+                &mut output,
+                &format!("  Sources: {}", event.sources.summary()),
+                right_panel_x + 10,
+                right_panel_y,
+                0.5,
+                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                1,
+            )?;
+            right_panel_y += 22;
+
+            // Legality
+            let legality_text = format!("  Legality: {:?}", event.legality);
+            let legality_color = match event.legality {
+                crate::lane_legality::LineLegality::Legal => {
+                    core::Scalar::new(0.0, 255.0, 0.0, 0.0)
+                }
+                crate::lane_legality::LineLegality::Illegal => {
+                    core::Scalar::new(0.0, 100.0, 255.0, 0.0)
+                }
+                crate::lane_legality::LineLegality::CriticalIllegal => {
+                    core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+                }
+                _ => core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+            };
+
+            draw_text_with_shadow(
+                &mut output,
+                &legality_text,
+                right_panel_x + 10,
+                right_panel_y,
+                0.5,
+                legality_color,
+                1,
+            )?;
+            right_panel_y += 22;
+
+            // Duration
+            draw_text_with_shadow(
+                &mut output,
+                &format!("  Duration: {:.1}s", event.duration_ms / 1000.0),
+                right_panel_x + 10,
+                right_panel_y,
+                0.5,
+                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                1,
+            )?;
+            right_panel_y += 24;
+        }
+
+        if maneuver_events.len() > 5 {
+            draw_text_with_shadow(
+                &mut output,
+                &format!("... and {} more", maneuver_events.len() - 5),
+                right_panel_x,
+                right_panel_y,
+                0.5,
+                core::Scalar::new(200.0, 200.0, 200.0, 0.0),
+                1,
+            )?;
+        }
+    }
+
+    Ok(output)
+}
