@@ -2039,17 +2039,35 @@ impl LaneChangeStateMachine {
             self.pending_frames = 1;
         }
 
+        // ✅ FIX: Use detection-path-specific confirmation requirements
+        let required_frames = if target_state == LaneChangeState::Drifting {
+            match self.change_detection_path {
+                Some(DetectionPath::HighVelocity)
+                | Some(DetectionPath::VelocitySpike)
+                | Some(DetectionPath::BoundaryCrossing) => {
+                    2 // ✅ Only need 2 frames for fast detections
+                }
+                _ => {
+                    self.config.min_frames_confirm // 3-5 for others
+                }
+            }
+        } else {
+            self.config.min_frames_confirm
+        };
+
         if target_state != LaneChangeState::Drifting
             && self.adaptive_baseline.is_frozen
             && self.state == LaneChangeState::Centered
-            && self.pending_frames < self.config.min_frames_confirm
+            && self.pending_frames < required_frames
+        // ✅ Use dynamic threshold
         {
             self.adaptive_baseline.unfreeze();
             self.initial_position_frozen = None;
             self.pending_max_offset = 0.0;
         }
 
-        if self.pending_frames < self.config.min_frames_confirm {
+        if self.pending_frames < required_frames {
+            // ✅ Use dynamic threshold
             return None;
         }
 
@@ -2058,7 +2076,7 @@ impl LaneChangeStateMachine {
             direction,
             frame_id,
             timestamp_ms,
-            normalized_offset,
+            final_position,
         )
     }
 
