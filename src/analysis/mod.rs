@@ -1,19 +1,29 @@
 // src/analysis/mod.rs
+//
+// Maneuver detection v2 pipeline modules.
+//
+// Signal flow:
+//   YOLO Detections → vehicle_tracker → pass_detector ─┐
+//   UFLDv2 Lanes    → lateral_detector ─────────────────┼→ maneuver_classifier → ManeuverEvent
+//   Raw Frame       → ego_motion ───────────────────────┘
+//   YOLO-seg Markings → maneuver_classifier.update_markings()
+//
+// Orchestrated by maneuver_pipeline::ManeuverPipeline.
 
-pub mod adaptive;
-pub mod baseline_confidence; // 🆕 NEW
-pub mod boundary_detector;
-pub mod curve_detector;
-pub mod fallback_estimator;
-pub mod inference_scheduler; // 🆕 NEW
-pub mod lane_analyzer;
-pub mod model_agreement; // 🆕 NEW
-pub mod position_estimator;
-pub mod state_machine;
-pub mod velocity_tracker; // 🆕 Add this
+pub mod ego_motion;
+pub mod lateral_detector;
+pub mod maneuver_classifier;
+pub mod maneuver_pipeline;
+pub mod pass_detector;
+pub mod vehicle_tracker;
 
-// Re-exports
-pub use baseline_confidence::BaselineConfidence; // 🆕 NEW
-pub use inference_scheduler::InferenceScheduler;
-pub use lane_analyzer::LaneChangeAnalyzer;
-pub use model_agreement::{AgreementChecker, EstimateSource, FusedLaneEstimate}; // 🆕 NEW // 🆕 NEW
+// Re-exports for ergonomic access from main.rs
+pub use ego_motion::{EgoMotionEstimate, GrayFrame};
+pub use lateral_detector::{LaneMeasurement, LateralShiftEvent, ShiftDirection};
+pub use maneuver_classifier::{DetectionSources, ManeuverEvent, ManeuverSide, ManeuverType};
+pub use maneuver_pipeline::{
+    ManeuverFrameInput, ManeuverFrameResult, ManeuverPipeline, ManeuverPipelineConfig,
+};
+pub use pass_detector::{PassDirection, PassEvent, PassSide};
+pub use vehicle_tracker::{DetectionInput, Track, TrackState, VehicleZone};
+
