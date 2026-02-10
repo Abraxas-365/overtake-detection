@@ -2291,29 +2291,71 @@ impl LaneChangeStateMachine {
         let signed_deviation = normalized_offset - baseline;
         let deviation = signed_deviation.abs();
 
-        // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping (Polarity Flip)
-        // When swapping lanes, coordinates jump from Positive Edge (+0.4) to Negative Edge (-0.4) or vice versa.
-        // A linear check sees this as a massive Negative change (LEFT), but physically it's a RIGHT move.
-        // Logic:
-        //   +Baseline to -Current => Moving RIGHT (crossed right boundary)
-        //   -Baseline to +Current => Moving LEFT (crossed left boundary)
-        let current_direction = if self.adaptive_baseline.is_frozen
-            && baseline.abs() > 0.10
+        // ============================================================
+        // 🔧 FIX v3.8.2: WRAP-AROUND DETECTION
+        //
+        // OLD (BROKEN): checked `is_frozen` — which is ONLY true during
+        //   Drifting/Crossing states. In the Centered state (where returns
+        //   are first detected), is_frozen is always false, so the
+        //   wrap-around logic NEVER fired for return detection.
+        //
+        // NEW: also check `seed_lock_frames > 0` — this flag is active
+        //   for up to 900 frames after a confirmed lane change, covering
+        //   the entire return detection window regardless of state.
+        //
+        // Thresholds lowered to match update():
+        //   baseline.abs() > 0.05  (was 0.10) — catches baselines near center
+        //   deviation > 0.20       (was 0.40) — catches returns early
+        // ============================================================
+
+        let is_post_lane_change = self.adaptive_baseline.seed_lock_frames > 0;
+
+        let current_direction = if (self.adaptive_baseline.is_frozen || is_post_lane_change)
+            && baseline.abs() > 0.05
             && normalized_offset.abs() > 0.10
             && baseline.signum() != normalized_offset.signum()
-            && deviation > 0.40
+            && deviation > 0.20
         {
+            // Coordinates wrapped across the 0-line.
+            // Physical direction is the OPPOSITE of what linear math says.
             if baseline > 0.0 {
-                // + to - (e.g. 0.3 to -0.3): Wrapped around Right Edge
+                // Baseline at +X%, vehicle now at −Y%
+                // Vehicle crossed the RIGHT boundary into the adjacent lane
                 Direction::Right
             } else {
-                // - to + (e.g. -0.3 to 0.3): Wrapped around Left Edge
+                // Baseline at −X%, vehicle now at +Y%
+                // Vehicle crossed the LEFT boundary into the adjacent lane
                 Direction::Left
             }
         } else {
-            // Standard linear drift within lane
+            // Standard linear drift within lane — sign of deviation = direction
             Direction::from_offset(signed_deviation)
         };
+
+        // 🔧 CORRECTION: Override pending direction if wrap-around is detected late.
+        // The smoothing might cause the drift threshold (0.15) to trigger 'Left' BEFORE
+        // the wrap-around logic (0.20) realizes it's 'Right'. We must correct it.
+        if self.pending_state == Some(LaneChangeState::Drifting) && is_post_lane_change {
+            if baseline.abs() > 0.05
+                && normalized_offset.abs() > 0.10
+                && baseline.signum() != normalized_offset.signum()
+                && deviation > 0.20
+            {
+                let corrected = if baseline > 0.0 {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                };
+                if self.pending_change_direction != corrected && corrected != Direction::Unknown {
+                    info!(
+                        "🔄 Direction correction: {} -> {} (Wrap-Around detected during pending)",
+                        self.pending_change_direction.as_str(),
+                        corrected.as_str()
+                    );
+                    self.pending_change_direction = corrected;
+                }
+            }
+        }
 
         self.trajectory_analyzer
             .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
