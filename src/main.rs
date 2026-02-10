@@ -37,6 +37,23 @@ use types::{DetectedLane, Frame, VehicleState};
 use vehicle_detection::YoloDetector;
 
 // ============================================================================
+// LAST MANEUVER INFO (for persistent display)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct LastManeuverInfo {
+    pub maneuver_type: String,
+    pub side: String,
+    pub confidence: f32,
+    pub legality: String,
+    pub duration_ms: f64,
+    pub sources: String,
+    pub frame_detected: u64,
+    pub timestamp_detected: f64,
+    pub vehicles_in_this_maneuver: usize,
+}
+
+// ============================================================================
 // PIPELINE STATE
 // ============================================================================
 
@@ -50,6 +67,7 @@ struct PipelineState {
     // ── Transient state ──
     latest_vehicle_detections: Vec<vehicle_detection::Detection>,
     last_vehicle_state: Option<VehicleState>,
+    last_maneuver: Option<LastManeuverInfo>,
 
     // ── Counters ──
     frame_count: u64,
@@ -58,7 +76,7 @@ struct PipelineState {
     v2_overtakes: u64,
     v2_lane_changes: u64,
     v2_being_overtaken: u64,
-    v2_vehicles_overtaken: u64, // ADD THIS
+    v2_vehicles_overtaken: u64,
 }
 
 impl PipelineState {
@@ -105,6 +123,7 @@ impl PipelineState {
             legality_buffer: LegalityRingBuffer::with_capacity(300),
             latest_vehicle_detections: Vec::new(),
             last_vehicle_state: None,
+            last_maneuver: None,
             frame_count: 0,
             yolo_primary_count: 0,
             v2_maneuver_events: 0,
@@ -127,6 +146,7 @@ struct ProcessingStats {
     v2_overtakes: u64,
     v2_lane_changes: u64,
     v2_being_overtaken: u64,
+    v2_vehicles_overtaken: u64,
     duration_secs: f64,
     avg_fps: f64,
 }
@@ -141,6 +161,7 @@ impl ProcessingStats {
             v2_overtakes: ps.v2_overtakes,
             v2_lane_changes: ps.v2_lane_changes,
             v2_being_overtaken: ps.v2_being_overtaken,
+            v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
             duration_secs: duration.as_secs_f64(),
             avg_fps,
         }
@@ -531,14 +552,19 @@ fn run_maneuver_pipeline_v2(
         frame_id: frame_count,
     });
 
-    // ── Update counters ──
+    // ── Update counters and last maneuver ──
     for event in &v2_result.maneuver_events {
         ps.v2_maneuver_events += 1;
+
+        let vehicles_count = if event.passed_vehicle_id.is_some() {
+            1
+        } else {
+            0
+        };
 
         match event.maneuver_type {
             analysis::maneuver_classifier::ManeuverType::Overtake => {
                 ps.v2_overtakes += 1;
-                // Count overtaken vehicles
                 if event.passed_vehicle_id.is_some() {
                     ps.v2_vehicles_overtaken += 1;
                 }
@@ -548,6 +574,19 @@ fn run_maneuver_pipeline_v2(
                 ps.v2_being_overtaken += 1
             }
         }
+
+        // Update last maneuver for persistent display
+        ps.last_maneuver = Some(LastManeuverInfo {
+            maneuver_type: event.maneuver_type.as_str().to_string(),
+            side: event.side.as_str().to_string(),
+            confidence: event.confidence,
+            legality: format!("{:?}", event.legality),
+            duration_ms: event.duration_ms,
+            sources: event.sources.summary(),
+            frame_detected: frame_count,
+            timestamp_detected: timestamp_ms,
+            vehicles_in_this_maneuver: vehicles_count,
+        });
 
         info!(
             "🆕 {} {} | conf={:.2} | sources={} | legality={:?} | frame={}",
@@ -612,6 +651,11 @@ fn run_video_annotation(
         frame_count,
         timestamp_ms,
         legality_ref,
+        &ps.latest_vehicle_detections,
+        ps.v2_overtakes,
+        ps.v2_lane_changes,
+        ps.v2_vehicles_overtaken,
+        ps.last_maneuver.as_ref(),
     ) {
         use opencv::videoio::VideoWriterTrait;
         writer.write(&annotated)?;
@@ -641,8 +685,8 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.v2_maneuver_events
     );
     info!(
-        "║   🚗 Overtakes:             {:>5}                     ║",
-        stats.v2_overtakes
+        "║   🚗 Overtakes:             {:>5} ({} vehicles)        ║",
+        stats.v2_overtakes, stats.v2_vehicles_overtaken
     );
     info!(
         "║   🔀 Lane changes:          {:>5}                     ║",
