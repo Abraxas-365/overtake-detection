@@ -85,22 +85,22 @@ impl ManeuverPipelineConfig {
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 300.0, // ✅ Lowered (was 400)
+                min_beside_duration_ms: 300.0,
                 max_pass_duration_ms: 90000.0,
-                min_beside_frames: 5, // ✅ Lowered (was 6)
+                min_beside_frames: 5,
                 disappearance_grace_frames: 90,
                 ..PassDetectorConfig::default()
             },
             lateral_detector: LateralDetectorConfig {
                 min_lane_confidence: 0.20,
-                shift_start_threshold: 0.35, // ✅ MUCH higher (was 0.18)
-                shift_confirm_threshold: 0.50, // ✅ MUCH higher (was 0.25)
-                shift_end_threshold: 0.20,   // ✅ Higher (was 0.12)
-                min_shift_frames: 15,        // ✅ More frames required
-                baseline_alpha_stable: 0.002, // ✅ Slower drift
+                shift_start_threshold: 0.35,
+                shift_confirm_threshold: 0.50,
+                shift_end_threshold: 0.20,
+                min_shift_frames: 15,
+                baseline_alpha_stable: 0.002,
                 baseline_warmup_frames: 25,
                 occlusion_reset_frames: 60,
-                post_reset_freeze_frames: 60, // ✅ Reduced (was 75)
+                post_reset_freeze_frames: 60,
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
@@ -109,10 +109,10 @@ impl ManeuverPipelineConfig {
                 ..EgoMotionConfig::default()
             },
             classifier: ClassifierConfig {
-                max_correlation_gap_ms: 30000.0,    // ✅ Wider window
-                min_single_source_confidence: 0.35, // ✅ LOWERED to allow tracking-only overtakes
-                correlation_window_ms: 40000.0,     // ✅ Wider window
-                min_combined_confidence: 0.30,      // ✅ LOWERED to catch more overtakes
+                max_correlation_gap_ms: 30000.0,
+                min_single_source_confidence: 0.35,
+                correlation_window_ms: 40000.0,
+                min_combined_confidence: 0.30,
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,
@@ -155,17 +155,27 @@ impl ManeuverPipeline {
     pub fn process_frame(&mut self, input: ManeuverFrameInput) -> ManeuverFrameOutput {
         self.frame_count += 1;
 
+        // 1. VEHICLE TRACKING
         self.tracker
             .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
         let tracked_count = self.tracker.confirmed_count();
         let tracks = self.tracker.confirmed_tracks();
 
-        // 2. PASS DETECTION
+        // ══════════════════════════════════════════════════════════════════
+        // 2. PASS DETECTION + FEED TO CLASSIFIER
+        // ══════════════════════════════════════════════════════════════════
         let pass_events = self
             .pass_detector
             .update(&tracks, input.timestamp_ms, input.frame_id);
 
-        // 3. LATERAL SHIFT DETECTION
+        // ✅ FIX: Feed each detected pass to the classifier!
+        for pass_event in pass_events {
+            self.classifier.feed_pass(pass_event);
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // 3. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
+        // ══════════════════════════════════════════════════════════════════
         let shift_event = self.lateral_detector.update(
             input.lane_measurement,
             input.timestamp_ms,
@@ -175,7 +185,9 @@ impl ManeuverPipeline {
             self.classifier.feed_shift(shift.clone());
         }
 
-        // 4. EGO-MOTION ESTIMATION
+        // ══════════════════════════════════════════════════════════════════
+        // 4. EGO-MOTION ESTIMATION + FEED TO CLASSIFIER
+        // ══════════════════════════════════════════════════════════════════
         let ego_velocity = if self.enable_ego_motion {
             if let Some(gray) = input.gray_frame {
                 let estimate = self.ego_motion.update(gray);
@@ -188,20 +200,26 @@ impl ManeuverPipeline {
             0.0
         };
 
+        // ══════════════════════════════════════════════════════════════════
         // 5. ROAD MARKING UPDATE (for legality context)
+        // ══════════════════════════════════════════════════════════════════
         self.classifier.update_markings(MarkingSnapshot {
             left_name: input.left_marking_name.map(|s| s.to_string()),
             right_name: input.right_marking_name.map(|s| s.to_string()),
             frame_id: input.frame_id,
         });
 
+        // ══════════════════════════════════════════════════════════════════
         // 6. CLASSIFICATION / FUSION
+        // ══════════════════════════════════════════════════════════════════
         // Pass the existing legality buffer through for temporally-correct lookups
         let maneuver_events =
             self.classifier
                 .classify(input.timestamp_ms, input.frame_id, input.legality_buffer);
 
+        // ══════════════════════════════════════════════════════════════════
         // 7. PERIODIC DIAGNOSTICS
+        // ══════════════════════════════════════════════════════════════════
         if self.frame_count % 150 == 0 {
             info!(
                 "📊 Pipeline v2: tracks={} | passes={} | lateral={} | maneuvers={}",
@@ -243,3 +261,4 @@ impl ManeuverPipeline {
         self.frame_count = 0;
     }
 }
+
