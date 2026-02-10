@@ -592,8 +592,16 @@ fn temporal_gap(start_a: f64, end_a: f64, start_b: f64, end_b: f64) -> f64 {
 }
 
 fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
-    matches!(
+    // For mining routes with poor tracking, accept opposite directions too
+    // because the vehicle might disappear and reappear, causing zone confusion
+
+    // Strict matching (preferred)
+    let strict_match = matches!(
         (pass.side, shift.direction),
         (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
-    )
+    );
+
+    // Lenient: if it's a valid pass and shift within time window, likely related
+    // This handles cases where vehicle tracking drops and zones get confused
+    strict_match || pass.confidence > 0.6 // Accept high-confidence passes with any shift
 }

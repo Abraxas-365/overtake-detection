@@ -58,6 +58,7 @@ struct PipelineState {
     v2_overtakes: u64,
     v2_lane_changes: u64,
     v2_being_overtaken: u64,
+    v2_vehicles_overtaken: u64, // ADD THIS
 }
 
 impl PipelineState {
@@ -110,6 +111,7 @@ impl PipelineState {
             v2_overtakes: 0,
             v2_lane_changes: 0,
             v2_being_overtaken: 0,
+            v2_vehicles_overtaken: 0,
         })
     }
 }
@@ -328,7 +330,7 @@ async fn process_video(
 fn run_vehicle_detection(ps: &mut PipelineState, frame: &Arc<Frame>) -> Result<()> {
     if let Ok(detections) = ps
         .yolo_detector
-        .detect(&frame.data, frame.width, frame.height, 0.3)
+        .detect(&frame.data, frame.width, frame.height, 0.25)
     {
         ps.latest_vehicle_detections = detections;
     }
@@ -534,7 +536,13 @@ fn run_maneuver_pipeline_v2(
         ps.v2_maneuver_events += 1;
 
         match event.maneuver_type {
-            analysis::maneuver_classifier::ManeuverType::Overtake => ps.v2_overtakes += 1,
+            analysis::maneuver_classifier::ManeuverType::Overtake => {
+                ps.v2_overtakes += 1;
+                // Count overtaken vehicles
+                if event.passed_vehicle_id.is_some() {
+                    ps.v2_vehicles_overtaken += 1;
+                }
+            }
             analysis::maneuver_classifier::ManeuverType::LaneChange => ps.v2_lane_changes += 1,
             analysis::maneuver_classifier::ManeuverType::BeingOvertaken => {
                 ps.v2_being_overtaken += 1
@@ -625,11 +633,11 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.yolo_primary_count as f64 / stats.total_frames.max(1) as f64 * 100.0
     );
 
-    info!("\n╔════════════════════════════════════════════════════════╗");
-    info!("║         MANEUVER DETECTION v2 RESULTS                 ║");
+    info!("╔════════════════════════════════════════════════════════╗");
+    info!("║       MANEUVER DETECTION v2 (A/B VALIDATION)         ║");
     info!("╠════════════════════════════════════════════════════════╣");
     info!(
-        "║ Total maneuver events:      {:>5}                     ║",
+        "║ Total v2 maneuver events:   {:>5}                     ║",
         stats.v2_maneuver_events
     );
     info!(
@@ -643,6 +651,10 @@ fn print_final_stats(stats: &ProcessingStats) {
     info!(
         "║   ⚠️  Being overtaken:       {:>5}                     ║",
         stats.v2_being_overtaken
+    );
+    info!(
+        "║   👥 Vehicles overtaken:    {:>5}                     ║", // ADD THIS
+        stats.v2_vehicles_overtaken
     );
     info!("╚════════════════════════════════════════════════════════╝");
 

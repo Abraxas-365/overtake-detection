@@ -79,35 +79,36 @@ impl ManeuverPipelineConfig {
     pub fn mining_route() -> Self {
         Self {
             tracker: TrackerConfig {
-                max_coast_frames: 90, // Increased from 60 - allow 3s coast
-                min_confidence: 0.15, // Lowered from 0.20 - detect fainter vehicles
-                min_iou: 0.08,        // Lowered from 0.10 - more lenient tracking
+                max_coast_frames: 120, // 4 seconds coast
+                min_confidence: 0.12,  // Very lenient
+                min_iou: 0.05,         // Very lenient
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 600.0,  // Lowered from 800
-                max_pass_duration_ms: 60000.0,  // Increased from 45000 - allow 1 minute
-                min_beside_frames: 8,           // Lowered from 12
-                disappearance_grace_frames: 60, // Increased from 45 - 2s grace
+                min_beside_duration_ms: 400.0,  // Lower threshold
+                max_pass_duration_ms: 90000.0,  // 90 seconds max
+                min_beside_frames: 6,           // Lower threshold
+                disappearance_grace_frames: 90, // 3 second grace
                 ..PassDetectorConfig::default()
             },
             lateral_detector: LateralDetectorConfig {
-                min_lane_confidence: 0.25,     // Lowered from 0.30
-                shift_start_threshold: 0.20,   // Lowered from 0.25
-                shift_confirm_threshold: 0.30, // Lowered from 0.35
-                occlusion_reset_frames: 45,    // Increased from 30
-                post_reset_freeze_frames: 60,  // Increased from 45
+                min_lane_confidence: 0.20,
+                shift_start_threshold: 0.18,
+                shift_confirm_threshold: 0.25,
+                occlusion_reset_frames: 60,
+                post_reset_freeze_frames: 75,
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
-                min_displacement: 1.5, // Lowered from 2.0
-                min_consensus: 0.40,   // Lowered from 0.45
+                min_displacement: 1.0,
+                min_consensus: 0.35,
                 ..EgoMotionConfig::default()
             },
             classifier: ClassifierConfig {
-                max_correlation_gap_ms: 15000.0, // Increased from 8000 - 15 second window
-                min_single_source_confidence: 0.50, // Lowered from 0.60
-                correlation_window_ms: 20000.0,  // Increased from 10000 - 20 second buffer
+                max_correlation_gap_ms: 25000.0, // 25 second window!
+                min_single_source_confidence: 0.45,
+                correlation_window_ms: 35000.0, // 35 second buffer!
+                min_combined_confidence: 0.40,  // Lower threshold
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,
