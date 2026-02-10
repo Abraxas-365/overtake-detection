@@ -85,22 +85,22 @@ impl ManeuverPipelineConfig {
                 ..TrackerConfig::default()
             },
             pass_detector: PassDetectorConfig {
-                min_beside_duration_ms: 400.0, // Lower threshold
+                min_beside_duration_ms: 300.0, // ✅ Lowered (was 400)
                 max_pass_duration_ms: 90000.0,
-                min_beside_frames: 6,
+                min_beside_frames: 5, // ✅ Lowered (was 6)
                 disappearance_grace_frames: 90,
                 ..PassDetectorConfig::default()
             },
             lateral_detector: LateralDetectorConfig {
-                min_lane_confidence: 0.20,     // ✅ Reverted to allow detection
-                shift_start_threshold: 0.18,   // ✅ More sensitive (was 0.28)
-                shift_confirm_threshold: 0.25, // ✅ More sensitive (was 0.38)
-                shift_end_threshold: 0.12,
-                min_shift_frames: 10, // ✅ Less strict (was 20)
-                baseline_alpha_stable: 0.003,
-                baseline_warmup_frames: 20,
+                min_lane_confidence: 0.20,
+                shift_start_threshold: 0.35, // ✅ MUCH higher (was 0.18)
+                shift_confirm_threshold: 0.50, // ✅ MUCH higher (was 0.25)
+                shift_end_threshold: 0.20,   // ✅ Higher (was 0.12)
+                min_shift_frames: 15,        // ✅ More frames required
+                baseline_alpha_stable: 0.002, // ✅ Slower drift
+                baseline_warmup_frames: 25,
                 occlusion_reset_frames: 60,
-                post_reset_freeze_frames: 75,
+                post_reset_freeze_frames: 60, // ✅ Reduced (was 75)
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
@@ -109,10 +109,10 @@ impl ManeuverPipelineConfig {
                 ..EgoMotionConfig::default()
             },
             classifier: ClassifierConfig {
-                max_correlation_gap_ms: 25000.0,
-                min_single_source_confidence: 0.40, // ✅ Lowered to catch passes (was 0.50)
-                correlation_window_ms: 35000.0,
-                min_combined_confidence: 0.35, // ✅ Lowered (was 0.45)
+                max_correlation_gap_ms: 30000.0,    // ✅ Wider window
+                min_single_source_confidence: 0.35, // ✅ LOWERED to allow tracking-only overtakes
+                correlation_window_ms: 40000.0,     // ✅ Wider window
+                min_combined_confidence: 0.30,      // ✅ LOWERED to catch more overtakes
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,

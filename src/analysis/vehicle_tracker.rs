@@ -301,25 +301,49 @@ impl Track {
         let y_ratio = cy / frame_h;
         let bottom_ratio = self.bbox[3] / frame_h;
 
-        let zone = if lateral_offset > cfg.beside_lateral_min
+        // ══════════════════════════════════════════════════════════════════════
+        // SIZE-BASED OVERRIDE: Large vehicles are AHEAD (too close to be beside)
+        // ══════════════════════════════════════════════════════════════════════
+        let bbox_height = self.bbox[3] - self.bbox[1];
+        let height_ratio = bbox_height / frame_h;
+
+        // If vehicle takes up >35% of frame height OR >20% of total area → AHEAD
+        // (Prevents large trucks from being misclassified as BESIDE)
+        let zone = if height_ratio > 0.35 || area_ratio > 0.20 {
+            VehicleZone::Ahead
+        }
+        // ══════════════════════════════════════════════════════════════════════
+        // BEHIND: Very large bbox at bottom = just passed us or tailgating
+        // ══════════════════════════════════════════════════════════════════════
+        else if bottom_ratio > cfg.behind_bottom_y_min && area_ratio > cfg.behind_area_min {
+            VehicleZone::Behind
+        }
+        // ══════════════════════════════════════════════════════════════════════
+        // BESIDE: Laterally offset + (medium area OR lower in frame)
+        // ══════════════════════════════════════════════════════════════════════
+        else if lateral_offset > cfg.beside_lateral_min
             && (area_ratio > cfg.beside_area_min || bottom_ratio > 0.55)
+            && height_ratio < 0.30
+        // ✅ NEW: Not too tall (prevents ahead from being beside)
         {
-            // Large or low bbox that's laterally offset = BESIDE
             if cx < half_w {
                 VehicleZone::BesideLeft
             } else {
                 VehicleZone::BesideRight
             }
-        } else if bottom_ratio > cfg.behind_bottom_y_min && area_ratio > cfg.behind_area_min {
-            // Very large bbox filling the bottom of frame = BEHIND (tailgating or just passed)
-            VehicleZone::Behind
-        } else if y_ratio < cfg.ahead_y_max && lateral_offset < 0.40 {
-            // Upper frame, roughly centered = AHEAD
+        }
+        // ══════════════════════════════════════════════════════════════════════
+        // AHEAD: Upper frame, roughly centered
+        // ══════════════════════════════════════════════════════════════════════
+        else if y_ratio < cfg.ahead_y_max && lateral_offset < 0.45 {
             VehicleZone::Ahead
-        } else if y_ratio >= cfg.ahead_y_max {
-            // Lower half but not clearly beside or behind — transitional
-            // Use lateral offset to disambiguate
-            if lateral_offset > cfg.beside_lateral_min * 0.8 {
+        }
+        // ══════════════════════════════════════════════════════════════════════
+        // TRANSITIONAL: Lower half but not clearly beside/behind
+        // ══════════════════════════════════════════════════════════════════════
+        else if y_ratio >= cfg.ahead_y_max {
+            // Use stricter lateral offset to confirm BESIDE in lower frame
+            if lateral_offset > cfg.beside_lateral_min * 1.2 && height_ratio < 0.25 {
                 if cx < half_w {
                     VehicleZone::BesideLeft
                 } else {
