@@ -898,7 +898,43 @@ impl LaneChangeStateMachine {
         let baseline = self.adaptive_baseline.effective_value();
         let signed_deviation = normalized_offset - baseline;
         let deviation = signed_deviation.abs();
-        let current_direction = Direction::from_offset(signed_deviation);
+
+        // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping (Polarity Flip)
+        // When swapping lanes, coordinates jump from Positive Edge (+0.4) to Negative Edge (-0.4) or vice versa.
+        // A linear check sees this as a massive Negative change (LEFT), but physically it's a RIGHT move.
+        // Logic:
+        //   +Baseline to -Current => Moving RIGHT (crossed right boundary)
+        //   -Baseline to +Current => Moving LEFT (crossed left boundary)
+        let current_direction = if self.adaptive_baseline.is_frozen
+            && baseline.abs() > 0.10
+            && normalized_offset.abs() > 0.10
+            && baseline.signum() != normalized_offset.signum()
+            && deviation > 0.40
+        {
+            if baseline > 0.0 {
+                // + to - (e.g. 0.3 to -0.3): Wrapped around Right Edge
+                Direction::Right
+            } else {
+                // - to + (e.g. -0.3 to 0.3): Wrapped around Left Edge
+                Direction::Left
+            }
+        } else {
+            // Standard linear drift within lane
+            Direction::from_offset(signed_deviation)
+        };
+
+        // Track max offset during pending and active phases
+        if self.pending_state == Some(LaneChangeState::Drifting)
+            || self.state == LaneChangeState::Drifting
+            || self.state == LaneChangeState::Crossing
+        {
+            if deviation > self.max_offset_in_change {
+                self.max_offset_in_change = deviation;
+            }
+            if deviation > self.pending_max_offset {
+                self.pending_max_offset = deviation;
+            }
+        }
 
         self.trajectory_analyzer
             .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
@@ -2221,7 +2257,30 @@ impl LaneChangeStateMachine {
         let baseline = self.adaptive_baseline.effective_value();
         let signed_deviation = normalized_offset - baseline;
         let deviation = signed_deviation.abs();
-        let current_direction = Direction::from_offset(signed_deviation);
+
+        // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping (Polarity Flip)
+        // When swapping lanes, coordinates jump from Positive Edge (+0.4) to Negative Edge (-0.4) or vice versa.
+        // A linear check sees this as a massive Negative change (LEFT), but physically it's a RIGHT move.
+        // Logic:
+        //   +Baseline to -Current => Moving RIGHT (crossed right boundary)
+        //   -Baseline to +Current => Moving LEFT (crossed left boundary)
+        let current_direction = if self.adaptive_baseline.is_frozen
+            && baseline.abs() > 0.10
+            && normalized_offset.abs() > 0.10
+            && baseline.signum() != normalized_offset.signum()
+            && deviation > 0.40
+        {
+            if baseline > 0.0 {
+                // + to - (e.g. 0.3 to -0.3): Wrapped around Right Edge
+                Direction::Right
+            } else {
+                // - to + (e.g. -0.3 to 0.3): Wrapped around Left Edge
+                Direction::Left
+            }
+        } else {
+            // Standard linear drift within lane
+            Direction::from_offset(signed_deviation)
+        };
 
         self.trajectory_analyzer
             .add_sample(normalized_offset, timestamp_ms, lateral_velocity);
