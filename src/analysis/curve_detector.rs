@@ -2,7 +2,7 @@
 
 use crate::types::{CurveInfo, CurveType, Lane};
 use std::collections::VecDeque;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 pub struct CurveDetector {
     curve_score_history: VecDeque<f32>,

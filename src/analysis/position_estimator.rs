@@ -2,7 +2,7 @@
 
 use crate::types::{Lane, VehicleState};
 use std::collections::VecDeque;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub struct PositionEstimator {
     pub reference_y_ratio: f32,

@@ -1,7 +1,7 @@
 // src/analysis/boundary_detector.rs
 
 use std::collections::VecDeque;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossingType {

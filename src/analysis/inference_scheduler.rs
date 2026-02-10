@@ -3,7 +3,7 @@
 // Adaptive scheduler for YOLOv8-seg inference.
 // Runs YOLOv8-seg only when needed to balance performance and robustness.
 
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Decides when to run YOLOv8-seg based on system state
 pub struct InferenceScheduler {
