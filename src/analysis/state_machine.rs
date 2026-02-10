@@ -2059,7 +2059,6 @@ impl LaneChangeStateMachine {
             && self.adaptive_baseline.is_frozen
             && self.state == LaneChangeState::Centered
             && self.pending_frames < required_frames
-        // ✅ Use dynamic threshold
         {
             self.adaptive_baseline.unfreeze();
             self.initial_position_frozen = None;
@@ -2067,16 +2066,16 @@ impl LaneChangeStateMachine {
         }
 
         if self.pending_frames < required_frames {
-            // ✅ Use dynamic threshold
             return None;
         }
 
+        // ✅ FIXED: Use normalized_offset instead of final_position
         self.execute_transition(
             target_state,
             direction,
             frame_id,
             timestamp_ms,
-            final_position,
+            normalized_offset, // ✅ Correct variable name
         )
     }
 
