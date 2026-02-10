@@ -652,10 +652,6 @@ fn print_final_stats(stats: &ProcessingStats) {
         "║   ⚠️  Being overtaken:       {:>5}                     ║",
         stats.v2_being_overtaken
     );
-    info!(
-        "║   👥 Vehicles overtaken:    {:>5}                     ║", // ADD THIS
-        stats.v2_vehicles_overtaken
-    );
     info!("╚════════════════════════════════════════════════════════╝");
 
     info!(
