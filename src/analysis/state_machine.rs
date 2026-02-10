@@ -901,27 +901,41 @@ impl LaneChangeStateMachine {
         // 🔧 CRITICAL FIX: Handle Lane Coordinate Wrapping
         // When returning from an overtake, the coordinates "wrap around".
         // A move to the RIGHT looks like a massive negative jump (Left) mathematically.
-        // We must invert the logic when this happens.
-        let current_direction = if self.adaptive_baseline.seed_lock_frames > 0 && deviation > 0.35 {
-            // We are locked (mid-maneuver) and see a huge jump.
-            // Check for the "Wrap Around" signature:
+        // We lower the threshold to 0.20 to catch it as it ramps up.
+        let is_wrap_around = self.adaptive_baseline.seed_lock_frames > 0
+            && deviation > 0.20
+            && baseline.signum() != normalized_offset.signum(); // Must cross 0-line
 
-            if baseline > 0.10 && signed_deviation < -0.35 {
-                // Signature: We were on the Right side (+), and value dropped massively (-).
-                // Physics: We crossed the Right boundary.
+        let current_direction = if is_wrap_around {
+            // We are locked (mid-maneuver) and see a significant jump crossing the center.
+            if baseline > 0.05 && signed_deviation < -0.20 {
+                // Signature: Right side (+) to Left side (-). Crossed Right Boundary.
                 Direction::Right
-            } else if baseline < -0.10 && signed_deviation > 0.35 {
-                // Signature: We were on the Left side (-), and value jumped massively (+).
-                // Physics: We crossed the Left boundary.
+            } else if baseline < -0.05 && signed_deviation > 0.20 {
+                // Signature: Left side (-) to Right side (+). Crossed Left Boundary.
                 Direction::Left
             } else {
-                // Standard movement
                 Direction::from_offset(signed_deviation)
             }
         } else {
-            // Standard movement
             Direction::from_offset(signed_deviation)
         };
+
+        // 🔧 CORRECTION: Override pending direction if wrap-around is detected late.
+        // The smoothing might cause the drift threshold (0.15) to trigger 'Left' BEFORE
+        // the wrap-around logic (0.20) realizes it's 'Right'. We must correct it.
+        if self.pending_state == Some(LaneChangeState::Drifting) && is_wrap_around {
+            if self.pending_change_direction != current_direction
+                && current_direction != Direction::Unknown
+            {
+                info!(
+                    "🔄 Direction correction: {} -> {} (Wrap-Around detected)",
+                    self.pending_change_direction.as_str(),
+                    current_direction.as_str()
+                );
+                self.pending_change_direction = current_direction;
+            }
+        }
 
         // Track max offset during pending and active phases
         if self.pending_state == Some(LaneChangeState::Drifting)
@@ -982,7 +996,7 @@ impl LaneChangeStateMachine {
         );
 
         if frame_id % 30 == 0 {
-            debug!(
+            info!(
                 "F{}: dev={:.1}%, state={:?}->{:?}, dir={}",
                 frame_id,
                 deviation * 100.0,
@@ -1941,7 +1955,7 @@ impl LaneChangeStateMachine {
                 self.max_offset_in_change,
             );
 
-            debug!(
+            info!(
                 "📊 Trajectory: excursion={}, returned={}, shape={:.2}",
                 trajectory_analysis.excursion_sufficient,
                 trajectory_analysis.returned_to_start,
@@ -2323,7 +2337,7 @@ impl LaneChangeStateMachine {
         );
 
         if frame_id % 30 == 0 {
-            debug!(
+            info!(
                 "F{}: dev={:.1}%, state={:?}->{:?}, conf={:.2}",
                 frame_id,
                 deviation * 100.0,
