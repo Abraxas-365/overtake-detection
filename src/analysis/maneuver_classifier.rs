@@ -31,14 +31,14 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            max_correlation_gap_ms: 5000.0,
-            min_single_source_confidence: 0.65,
-            min_combined_confidence: 0.45,
+            max_correlation_gap_ms: 50000.0,    // ✅ Wider window
+            min_single_source_confidence: 0.25, // ✅ LOWERED from 0.65
+            min_combined_confidence: 0.25,      // ✅ LOWERED from 0.45
             ego_motion_threshold: 2.0,
-            weight_pass: 0.50,
-            weight_lateral: 0.30,
-            weight_ego_motion: 0.20,
-            correlation_window_ms: 10000.0,
+            weight_pass: 0.60, // ✅ Higher weight for passes
+            weight_lateral: 0.25,
+            weight_ego_motion: 0.15,
+            correlation_window_ms: 60000.0, // ✅ Wider retention
         }
     }
 }
@@ -288,11 +288,29 @@ impl ManeuverClassifier {
             if self.pass_buffer[pass_idx].event.direction == PassDirection::VehicleOvertookEgo {
                 continue;
             }
-            if self.pass_buffer[pass_idx].event.confidence
-                >= self.config.min_single_source_confidence
-            {
+
+            let pass_conf = self.pass_buffer[pass_idx].event.confidence;
+
+            // ✅ ADD THIS LOG
+            info!(
+                "🔍 Checking single-source pass: track={} side={:?} conf={:.2} (min={:.2})",
+                self.pass_buffer[pass_idx].event.vehicle_track_id,
+                self.pass_buffer[pass_idx].event.side,
+                pass_conf,
+                self.config.min_single_source_confidence
+            );
+
+            if pass_conf >= self.config.min_single_source_confidence {
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let maneuver = self.build_overtake(&pass_event, None, legality_buffer);
+
+                // ✅ ADD THIS LOG
+                info!(
+                    "  → Built overtake: conf={:.2} (min_combined={:.2}) sources={}",
+                    maneuver.confidence,
+                    self.config.min_combined_confidence,
+                    maneuver.sources.summary()
+                );
 
                 if maneuver.confidence >= self.config.min_combined_confidence {
                     info!(
@@ -305,7 +323,19 @@ impl ManeuverClassifier {
                     self.recent_events.push(maneuver);
                     self.total_maneuvers += 1;
                     self.pass_buffer[pass_idx].correlated = true;
+                } else {
+                    // ✅ ADD THIS LOG
+                    info!(
+                        "  ❌ Rejected: conf={:.2} < min_combined={:.2}",
+                        maneuver.confidence, self.config.min_combined_confidence
+                    );
                 }
+            } else {
+                // ✅ ADD THIS LOG
+                info!(
+                    "  ❌ Pass conf too low: {:.2} < {:.2}",
+                    pass_conf, self.config.min_single_source_confidence
+                );
             }
         }
 
@@ -384,7 +414,14 @@ impl ManeuverClassifier {
 
         let ego_confirms = self.ego_motion_confirms_lateral();
 
-        let pass_conf = pass.confidence * self.config.weight_pass;
+        // ✅ BOOST pass weight when it's the only source
+        let pass_weight = if shift.is_none() && !ego_confirms {
+            0.70 // Single-source: give passes more weight
+        } else {
+            self.config.weight_pass
+        };
+
+        let pass_conf = pass.confidence * pass_weight; // ✅ Now: 0.70 * 0.70 = 0.49
         let shift_conf = shift
             .map(|s| s.confidence * self.config.weight_lateral)
             .unwrap_or(0.0);
@@ -399,13 +436,15 @@ impl ManeuverClassifier {
             lane_detection: shift.is_some(),
             ego_motion: ego_confirms,
         };
+
         let source_bonus = match sources.count() {
             3 => 0.15,
             2 => 0.08,
+            1 => 0.0, // No bonus for single source (but high pass weight compensates)
             _ => 0.0,
         };
-        let confidence = (pass_conf + shift_conf + ego_conf + source_bonus).min(0.98);
 
+        let confidence = (pass_conf + shift_conf + ego_conf + source_bonus).min(0.98);
         let (start_ms, end_ms) = if let Some(s) = shift {
             (
                 pass.ahead_start_ms.min(s.start_ms),
