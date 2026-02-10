@@ -185,7 +185,12 @@ impl PassDetector {
 
     /// Process current frame's confirmed tracks and emit any completed pass events.
     /// Call this every frame after VehicleTracker::update().
-    pub fn update(&mut self, tracks: &[Track], timestamp_ms: f64, frame_id: u64) -> Vec<PassEvent> {
+    pub fn update(
+        &mut self,
+        tracks: &[&Track],
+        timestamp_ms: f64,
+        frame_id: u64,
+    ) -> Vec<PassEvent> {
         self.recent_events.clear();
 
         let active_ids: HashSet<u32> = tracks.iter().map(|t| t.id).collect();
