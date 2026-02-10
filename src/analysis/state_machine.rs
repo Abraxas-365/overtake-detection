@@ -1591,9 +1591,6 @@ impl LaneChangeStateMachine {
                     return LaneChangeState::Centered;
                 }
 
-                // PATH 0: POST-OCCLUSION - DISABLED (too many false positives)
-                // Commented out to reduce false positives on lane recovery
-
                 // PATH 1: BOUNDARY CROSSING
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
                     if self.is_deviation_sustained(drift_threshold) {
@@ -1649,7 +1646,26 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 5: GRADUAL CHANGE (STRICTER)
+                // 🔧 NEW PATH 4.5: SUSTAINED DEVIATION (SLOW LANE CHANGES)
+                // Triggers for 25-35% deviation with low/no velocity
+                // Requires long sustained movement to avoid false positives
+                if deviation >= DEVIATION_DRIFT_START && deviation < MEDIUM_OFFSET_THRESHOLD {
+                    if self.is_deviation_sustained_long(DEVIATION_DRIFT_START)
+                        && metrics.time_span_ms >= 3000.0
+                        && metrics.is_sustained_movement
+                    {
+                        self.change_detection_path = Some(DetectionPath::MediumDeviation);
+                        info!(
+                            "🚨 [SUSTAINED] dev={:.1}%, span={:.1}s, dir_consistency={:.1}%",
+                            deviation * 100.0,
+                            metrics.time_span_ms / 1000.0,
+                            metrics.direction_consistency * 100.0
+                        );
+                        return LaneChangeState::Drifting;
+                    }
+                }
+
+                // PATH 5: GRADUAL CHANGE (VERY SLOW)
                 if metrics.is_intentional_change && metrics.max_deviation >= DEVIATION_SIGNIFICANT {
                     if self.is_deviation_sustained_long(DEVIATION_DRIFT_START)
                         && metrics.time_span_ms >= 5000.0
@@ -1674,9 +1690,6 @@ impl LaneChangeStateMachine {
                         return LaneChangeState::Drifting;
                     }
                 }
-
-                // PATH 7: STATIC HIGH DEVIATION - DISABLED (causes most false positives)
-                // This path fires on curves and normal drift - removed
 
                 LaneChangeState::Centered
             }
