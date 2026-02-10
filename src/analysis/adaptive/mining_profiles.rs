@@ -72,7 +72,7 @@ impl MiningRouteProfile {
             drift_threshold: 0.30, // More permissive
             crossing_threshold: 0.40,
             consistency_threshold: 0.80,
-            require_yolo_validation: true, // Critical on unpaved
+            require_yolo_validation: false, // Critical on unpaved
             require_boundary_crossing: false,
             allow_sustained_path: true, // Can use gradual changes
             post_occlusion_freeze_frames: 60,
