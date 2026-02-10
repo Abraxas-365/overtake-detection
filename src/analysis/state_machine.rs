@@ -1113,23 +1113,27 @@ impl LaneChangeStateMachine {
 
         match self.state {
             LaneChangeState::Centered => {
-                // 🆕 MINING FIX: More lenient baseline sanity check
+                // ============================================================================
+                // UNIFIED BASELINE SANITY CHECK (Mining-aware)
+                // ============================================================================
                 if !self.adaptive_baseline.is_sane() {
                     let baseline_pct = self.adaptive_baseline.effective_value() * 100.0;
                     let threshold_pct = if self.adaptive_baseline.is_mining_context {
-                        BASELINE_SANITY_CHECK_MINING * 100.0
+                        BASELINE_SANITY_CHECK_MINING * 100.0 // 45%
                     } else {
-                        BASELINE_SANITY_CHECK * 100.0
+                        BASELINE_SANITY_CHECK * 100.0 // 35%
                     };
 
                     warn!(
-                        "⚠️ Baseline questionable: {:.1}% (threshold: {:.1}%) - blocking new detections",
-                        baseline_pct, threshold_pct
-                    );
+            "⚠️ Baseline questionable: {:.1}% (threshold: {:.1}%) - blocking new detections",
+            baseline_pct, threshold_pct
+        );
                     return LaneChangeState::Centered;
                 }
 
-                // Post-occlusion freeze
+                // ============================================================================
+                // POST-OCCLUSION FREEZE
+                // ============================================================================
                 let frames_since_occlusion = self.adaptive_baseline.frames_without_lanes_recent();
                 if frames_since_occlusion > 0 {
                     let freeze_frames = self.current_profile.post_occlusion_freeze_frames;
@@ -1142,7 +1146,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // ============================================================================
                 // PATH 1: BOUNDARY CROSSING
+                // ============================================================================
                 if crossing_type != CrossingType::None && lateral_velocity.abs() > vel_fast {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::BoundaryCrossing);
@@ -1154,26 +1160,11 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // 🚨 PATH 2: HIGH VELOCITY - WITH CRITICAL FALSE POSITIVE FIXES
+                // ============================================================================
+                // PATH 2: HIGH VELOCITY (Fixed - no redundant sanity check)
+                // ============================================================================
                 if lateral_velocity.abs() > vel_fast && deviation >= drift_threshold {
-                    // FIX #1: Check baseline sanity
-                    let baseline = self.adaptive_baseline.effective_value();
-                    let sanity_threshold = if self.adaptive_baseline.is_mining_context {
-                        0.25 // More lenient in mining (25% vs 20%)
-                    } else {
-                        0.20
-                    };
-
-                    if baseline.abs() > sanity_threshold {
-                        warn!(
-                            "⚠️ Rejected HIGH-VEL: suspicious baseline at {:.1}% (threshold: {:.1}%)",
-                            baseline * 100.0,
-                            sanity_threshold * 100.0
-                        );
-                        return LaneChangeState::Centered;
-                    }
-
-                    // FIX #2: Check actual offset from lane center
+                    // ✅ FIX #1: Check actual offset from lane center
                     let actual_offset_from_center = normalized_offset.abs();
                     if actual_offset_from_center < MIN_OFFSET_FROM_CENTER_FOR_DETECTION {
                         warn!(
@@ -1183,7 +1174,7 @@ impl LaneChangeStateMachine {
                         return LaneChangeState::Centered;
                     }
 
-                    // FIX #3: Stricter velocity validation
+                    // ✅ FIX #2: Stricter velocity validation (6/8 frames)
                     if self.is_velocity_sustained_strict(vel_medium) {
                         self.change_detection_path = Some(DetectionPath::HighVelocity);
                         info!(
@@ -1198,7 +1189,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // ============================================================================
                 // PATH 3: VELOCITY SPIKE
+                // ============================================================================
                 if lateral_velocity.abs() > VELOCITY_SPIKE_THRESHOLD && deviation >= drift_threshold
                 {
                     if self.is_velocity_sustained_strict(vel_fast) {
@@ -1215,7 +1208,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // ============================================================================
                 // PATH 4: MEDIUM SPEED + HIGH DEVIATION
+                // ============================================================================
                 if deviation >= drift_threshold + 0.10 && lateral_velocity.abs() > vel_medium {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::MediumDeviation);
@@ -1228,9 +1223,12 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 4.5: SUSTAINED DEVIATION
+                // ============================================================================
+                // PATH 4.5: SUSTAINED DEVIATION (Mining-aware)
+                // ============================================================================
                 if self.current_profile.allow_sustained_path {
                     if deviation >= DEVIATION_DRIFT_START && deviation < MEDIUM_OFFSET_THRESHOLD {
+                        // Reject curves
                         if self.is_in_curve {
                             if metrics.is_sustained_movement && metrics.time_span_ms >= 3000.0 {
                                 info!(
@@ -1260,11 +1258,14 @@ impl LaneChangeStateMachine {
                     }
                 }
 
-                // PATH 5: GRADUAL CHANGE
+                // ============================================================================
+                // PATH 5: GRADUAL CHANGE (Mining-aware)
+                // ============================================================================
                 if self.current_profile.allow_sustained_path {
                     if metrics.is_intentional_change
                         && metrics.max_deviation >= DEVIATION_SIGNIFICANT
                     {
+                        // Reject curves
                         if self.is_in_curve {
                             info!(
                                 "🌀 Curve rejection [GRADUAL]: max={:.1}%, span={:.1}s",
@@ -1289,7 +1290,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // ============================================================================
                 // PATH 6: LARGE DEVIATION
+                // ============================================================================
                 if deviation >= DEVIATION_LANE_CENTER {
                     if self.is_deviation_sustained(drift_threshold) {
                         self.change_detection_path = Some(DetectionPath::LargeDeviation);
@@ -1298,6 +1301,9 @@ impl LaneChangeStateMachine {
                     }
                 }
 
+                // ============================================================================
+                // DEFAULT: Stay Centered
+                // ============================================================================
                 LaneChangeState::Centered
             }
 
