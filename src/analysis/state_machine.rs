@@ -18,6 +18,27 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 // ============================================================================
+// VALIDATION THRESHOLDS (BALANCED)
+// ============================================================================
+const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55;
+const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
+const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
+const LOW_OFFSET_THRESHOLD: f32 = 0.28; // Lowered from 0.30
+
+// Path-specific minimum offsets (NEW)
+const MIN_OFFSET_BOUNDARY: f32 = 0.25; // Physical crossing = high confidence
+const MIN_OFFSET_HIGH_VEL: f32 = 0.27; // Fast movement = clear signal
+const MIN_OFFSET_GRADUAL: f32 = 0.32; // Slow drift = needs higher offset
+const MIN_OFFSET_DEFAULT: f32 = 0.28; // Standard threshold
+
+const MIN_DURATION_VERY_HIGH: f64 = 500.0;
+const MIN_DURATION_HIGH: f64 = 800.0;
+const MIN_DURATION_MEDIUM: f64 = 1200.0;
+const MIN_DURATION_LOW: f64 = 2000.0;
+
+const MIN_NET_DISPLACEMENT: f32 = 0.15;
+
+// ============================================================================
 // VELOCITY THRESHOLDS
 // ============================================================================
 const MIN_VELOCITY_FAST: f32 = 120.0;
@@ -78,18 +99,7 @@ const MIN_DRIFT_RATE_PER_SEC: f32 = 5.0;
 // ============================================================================
 // VALIDATION THRESHOLDS (STRICT)
 // ============================================================================
-const VERY_HIGH_OFFSET_THRESHOLD: f32 = 0.55;
-const HIGH_OFFSET_THRESHOLD: f32 = 0.45;
-const MEDIUM_OFFSET_THRESHOLD: f32 = 0.35;
-const LOW_OFFSET_THRESHOLD: f32 = 0.30; // Increased from 0.25
 const ABSOLUTE_MIN_OFFSET: f32 = 0.30; // NEW: Hard floor for all detections
-
-const MIN_DURATION_VERY_HIGH: f64 = 500.0; // Increased from 400ms
-const MIN_DURATION_HIGH: f64 = 800.0; // Increased from 600ms
-const MIN_DURATION_MEDIUM: f64 = 1200.0; // Increased from 1000ms
-const MIN_DURATION_LOW: f64 = 2000.0; // Increased from 1800ms
-
-const MIN_NET_DISPLACEMENT: f32 = 0.15;
 
 // ============================================================================
 // TRAJECTORY ANALYSIS
@@ -1262,34 +1272,38 @@ impl LaneChangeStateMachine {
         trajectory_analysis: &OvertakeAnalysis,
     ) -> bool {
         // ============================================================================
-        // STRICT VALIDATION v4.1 - FALSE POSITIVE REDUCTION
-        // Research shows: 43-52% FDR in loose systems (naturalistic driving)
-        // Goal: <5% FDR by requiring multiple strong signals
+        // BALANCED VALIDATION v4.2 - Path-Specific Minimums
+        // Research target: <5% FDR while maintaining >90% recall
         // ============================================================================
 
-        let (min_duration_ms, effective_duration, path_name) = match self.change_detection_path {
-            Some(DetectionPath::GradualChange) => {
-                let span = self.pending_span_duration.unwrap_or(duration);
-                let effective = span.max(duration);
-                (3000.0, effective, "GRADUAL")
-            }
+        let (min_duration_ms, effective_duration, min_offset, path_name) =
+            match self.change_detection_path {
+                Some(DetectionPath::GradualChange) => {
+                    let span = self.pending_span_duration.unwrap_or(duration);
+                    let effective = span.max(duration);
+                    (3000.0, effective, MIN_OFFSET_GRADUAL, "GRADUAL")
+                }
 
-            Some(DetectionPath::BoundaryCrossing) => (600.0, duration, "BOUNDARY"),
+                Some(DetectionPath::BoundaryCrossing) => {
+                    (600.0, duration, MIN_OFFSET_BOUNDARY, "BOUNDARY")
+                }
 
-            Some(DetectionPath::HighVelocity) | Some(DetectionPath::VelocitySpike) => {
-                (800.0, duration, "HIGH-VEL")
-            }
+                Some(DetectionPath::HighVelocity) | Some(DetectionPath::VelocitySpike) => {
+                    (800.0, duration, MIN_OFFSET_HIGH_VEL, "HIGH-VEL")
+                }
 
-            Some(DetectionPath::PostOcclusion)
-            | Some(DetectionPath::BlackoutRecovery)
-            | Some(DetectionPath::StaticHighDeviation) => (1500.0, duration, "POST-OCCLUSION"),
+                Some(DetectionPath::PostOcclusion)
+                | Some(DetectionPath::BlackoutRecovery)
+                | Some(DetectionPath::StaticHighDeviation) => {
+                    (1500.0, duration, MIN_OFFSET_GRADUAL, "POST-OCCLUSION")
+                }
 
-            Some(DetectionPath::MediumDeviation) | Some(DetectionPath::LargeDeviation) => {
-                (1000.0, duration, "DEVIATION")
-            }
+                Some(DetectionPath::MediumDeviation) | Some(DetectionPath::LargeDeviation) => {
+                    (1000.0, duration, MIN_OFFSET_DEFAULT, "DEVIATION")
+                }
 
-            _ => (1200.0, duration, "DEFAULT"),
-        };
+                _ => (1200.0, duration, MIN_OFFSET_DEFAULT, "DEFAULT"),
+            };
 
         if effective_duration < min_duration_ms {
             warn!(
@@ -1299,12 +1313,13 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        if self.max_offset_in_change < ABSOLUTE_MIN_OFFSET {
+        // Path-specific minimum offset check
+        if self.max_offset_in_change < min_offset {
             warn!(
-                "❌ Rejected [{}]: max offset {:.1}% < {:.1}% absolute minimum",
+                "❌ Rejected [{}]: max offset {:.1}% < {:.1}% path minimum",
                 path_name,
                 self.max_offset_in_change * 100.0,
-                ABSOLUTE_MIN_OFFSET * 100.0
+                min_offset * 100.0
             );
             return false;
         }
@@ -1321,6 +1336,9 @@ impl LaneChangeStateMachine {
             return false;
         }
 
+        // ============================================================================
+        // TIER 1: Very high offset (>55%) - Strong signal
+        // ============================================================================
         if self.max_offset_in_change >= VERY_HIGH_OFFSET_THRESHOLD {
             if effective_duration >= MIN_DURATION_VERY_HIGH {
                 info!(
@@ -1332,22 +1350,31 @@ impl LaneChangeStateMachine {
                 return true;
             } else {
                 warn!(
-                    "❌ Rejected [{}]: very high offset {:.1}% but dur={:.0}ms < {:.0}ms (likely noise spike)",
-                    path_name,
-                    self.max_offset_in_change * 100.0,
-                    effective_duration,
-                    MIN_DURATION_VERY_HIGH
-                );
+                "❌ Rejected [{}]: very high offset {:.1}% but dur={:.0}ms < {:.0}ms (likely noise spike)",
+                path_name,
+                self.max_offset_in_change * 100.0,
+                effective_duration,
+                MIN_DURATION_VERY_HIGH
+            );
                 return false;
             }
         }
 
+        // ============================================================================
+        // TIER 2: High offset (45-55%) - Require duration AND (trajectory OR velocity)
+        // ============================================================================
         if self.max_offset_in_change >= HIGH_OFFSET_THRESHOLD {
             let has_duration = effective_duration >= MIN_DURATION_HIGH;
             let has_trajectory =
-                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.7;
+                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.65;
 
-            if has_duration && has_trajectory {
+            // BOUNDARY and HIGH-VEL paths get trajectory bypass
+            let is_strong_path = matches!(
+                self.change_detection_path,
+                Some(DetectionPath::BoundaryCrossing) | Some(DetectionPath::HighVelocity)
+            );
+
+            if has_duration && (has_trajectory || is_strong_path) {
                 info!(
                     "✅ Valid [{}]: high offset {:.1}%, dur={:.0}ms, traj={:.2}",
                     path_name,
@@ -1359,7 +1386,7 @@ impl LaneChangeStateMachine {
             }
 
             warn!(
-                "❌ Rejected [{}]: high offset {:.1}% but dur={} traj={} (need BOTH)",
+                "❌ Rejected [{}]: high offset {:.1}% but dur={} traj={}",
                 path_name,
                 self.max_offset_in_change * 100.0,
                 if has_duration { "✓" } else { "✗" },
@@ -1368,23 +1395,35 @@ impl LaneChangeStateMachine {
             return false;
         }
 
+        // ============================================================================
+        // TIER 3: Medium offset (35-45%) - Require 2 of 3 criteria
+        // ============================================================================
         if self.max_offset_in_change >= MEDIUM_OFFSET_THRESHOLD {
             let has_duration = effective_duration >= MIN_DURATION_MEDIUM;
             let has_trajectory =
-                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.6;
+                trajectory_analysis.is_valid_overtake && trajectory_analysis.shape_score >= 0.55;
             let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
 
-            if has_duration && has_trajectory && has_displacement {
+            let conditions_met = [has_duration, has_trajectory, has_displacement]
+                .iter()
+                .filter(|&&x| x)
+                .count();
+
+            if conditions_met >= 2 {
                 info!(
-                    "✅ Valid [{}]: medium offset {:.1}%, ALL criteria met",
-                    path_name,
-                    self.max_offset_in_change * 100.0
-                );
+                "✅ Valid [{}]: medium offset {:.1}%, {}/3 criteria met (dur={} traj={} disp={})",
+                path_name,
+                self.max_offset_in_change * 100.0,
+                conditions_met,
+                if has_duration { "✓" } else { "✗" },
+                if has_trajectory { "✓" } else { "✗" },
+                if has_displacement { "✓" } else { "✗" }
+            );
                 return true;
             }
 
             warn!(
-                "❌ Rejected [{}]: medium offset {:.1}%, dur={} traj={} disp={} (need ALL THREE)",
+                "❌ Rejected [{}]: medium offset {:.1}%, dur={} traj={} disp={} (need 2 of 3)",
                 path_name,
                 self.max_offset_in_change * 100.0,
                 if has_duration { "✓" } else { "✗" },
@@ -1394,15 +1433,32 @@ impl LaneChangeStateMachine {
             return false;
         }
 
-        if self.change_detection_path == Some(DetectionPath::BoundaryCrossing) {
-            let drift_duration_s = (effective_duration / 1000.0) as f32;
-            let drift_rate = if drift_duration_s > 0.0 {
-                (self.max_offset_in_change * 100.0) / drift_duration_s
-            } else {
-                999.0
-            };
+        // ============================================================================
+        // TIER 4: Low offset (28-35%) - Strict validation
+        // ============================================================================
 
-            if drift_rate >= MIN_DRIFT_RATE_PER_SEC && effective_duration >= 1500.0 {
+        // Require sustained drift rate
+        let drift_duration_s = (effective_duration / 1000.0) as f32;
+        let drift_rate = if drift_duration_s > 0.0 {
+            (self.max_offset_in_change * 100.0) / drift_duration_s
+        } else {
+            999.0
+        };
+
+        if drift_rate < MIN_DRIFT_RATE_PER_SEC {
+            warn!(
+            "❌ Rejected [{}]: LOW offset {:.1}% with slow drift rate {:.1}%/s (< {:.1}%/s min)",
+            path_name,
+            self.max_offset_in_change * 100.0,
+            drift_rate,
+            MIN_DRIFT_RATE_PER_SEC
+        );
+            return false;
+        }
+
+        // For BOUNDARY crossing, allow with good duration + rate
+        if self.change_detection_path == Some(DetectionPath::BoundaryCrossing) {
+            if effective_duration >= 1500.0 && drift_rate >= MIN_DRIFT_RATE_PER_SEC {
                 info!(
                     "✅ Valid [BOUNDARY]: low offset {:.1}%, rate={:.1}%/s, dur={:.0}ms",
                     self.max_offset_in_change * 100.0,
@@ -1413,11 +1469,36 @@ impl LaneChangeStateMachine {
             }
         }
 
+        // For other paths, require 2 of 3 + good rate
+        let has_duration = effective_duration >= MIN_DURATION_LOW;
+        let has_trajectory = trajectory_analysis.is_valid_overtake;
+        let has_displacement = net_displacement >= MIN_NET_DISPLACEMENT;
+
+        let conditions_met = [has_duration, has_trajectory, has_displacement]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+
+        if conditions_met >= 2 && drift_rate >= MIN_DRIFT_RATE_PER_SEC {
+            info!(
+                "✅ Valid [{}]: lower offset {:.1}%, {}/3 conditions met, rate={:.1}%/s",
+                path_name,
+                self.max_offset_in_change * 100.0,
+                conditions_met,
+                drift_rate
+            );
+            return true;
+        }
+
         warn!(
-            "❌ Rejected [{}]: offset {:.1}% too low for reliable detection",
-            path_name,
-            self.max_offset_in_change * 100.0
-        );
+        "❌ Rejected [{}]: offset {:.1}%, dur={} traj={} disp={}, rate={:.1}%/s (need 2 of 3 + good rate)",
+        path_name,
+        self.max_offset_in_change * 100.0,
+        if has_duration { "✓" } else { "✗" },
+        if has_trajectory { "✓" } else { "✗" },
+        if has_displacement { "✓" } else { "✗" },
+        drift_rate
+    );
         false
     }
 
@@ -2303,4 +2384,3 @@ impl LaneChangeStateMachine {
         )
     }
 }
-
