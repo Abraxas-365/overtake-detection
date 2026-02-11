@@ -2,6 +2,11 @@
 //
 // Fusion layer: combines vehicle tracking, lateral shift detection,
 // and ego-motion estimation to classify maneuvers.
+//
+// v4.3 FIX: Ego-motion gate for single-source (tracking-only) passes.
+//           A real overtake REQUIRES the ego vehicle to move laterally.
+//           If there's no lateral shift and no ego motion, the "pass"
+//           is almost certainly a zone misclassification.
 
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
@@ -10,7 +15,7 @@ use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use tracing::info;
+use tracing::{info, warn};
 
 // ============================================================================
 // CONFIGURATION
@@ -26,19 +31,24 @@ pub struct ClassifierConfig {
     pub weight_lateral: f32,
     pub weight_ego_motion: f32,
     pub correlation_window_ms: f64,
+    /// v4.3: Minimum peak ego lateral velocity (px/frame) required for
+    /// single-source (tracking-only) passes. Below this, the pass is
+    /// rejected as a zone misclassification.
+    pub min_ego_motion_for_single_source: f32,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            max_correlation_gap_ms: 50000.0,    // ✅ Wider window
-            min_single_source_confidence: 0.25, // ✅ LOWERED from 0.65
-            min_combined_confidence: 0.25,      // ✅ LOWERED from 0.45
+            max_correlation_gap_ms: 50000.0,
+            min_single_source_confidence: 0.25,
+            min_combined_confidence: 0.25,
             ego_motion_threshold: 2.0,
-            weight_pass: 0.60, // ✅ Higher weight for passes
+            weight_pass: 0.60,
             weight_lateral: 0.25,
             weight_ego_motion: 0.15,
-            correlation_window_ms: 60000.0, // ✅ Wider retention
+            correlation_window_ms: 60000.0,
+            min_ego_motion_for_single_source: 1.0,
         }
     }
 }
@@ -113,7 +123,6 @@ pub struct MarkingSnapshot {
     pub frame_id: u64,
 }
 
-/// Final output event - uses serde(skip) for non-serializable nested types
 #[derive(Debug, Clone, Serialize)]
 pub struct ManeuverEvent {
     pub maneuver_type: ManeuverType,
@@ -223,7 +232,6 @@ impl ManeuverClassifier {
         self.shift_buffer
             .retain(|s| timestamp_ms - s.event.end_ms < window);
 
-        // ✅✅✅ ADD THIS IMMEDIATELY AFTER BUFFER RETENTION ✅✅✅
         info!(
             "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
             timestamp_ms / 1000.0,
@@ -233,15 +241,10 @@ impl ManeuverClassifier {
 
         for (i, p) in self.pass_buffer.iter().enumerate() {
             info!(
-            "  Pass[{}]: track={} side={:?} direction={:?} conf={:.2} correlated={} beside_end={:.1}s",
-            i,
-            p.event.vehicle_track_id,
-            p.event.side,
-            p.event.direction,
-            p.event.confidence,
-            p.correlated,
-            p.event.beside_end_ms / 1000.0
-        );
+                "  Pass[{}]: track={} side={:?} direction={:?} conf={:.2} correlated={} beside_end={:.1}s",
+                i, p.event.vehicle_track_id, p.event.side, p.event.direction,
+                p.event.confidence, p.correlated, p.event.beside_end_ms / 1000.0
+            );
         }
 
         for (i, s) in self.shift_buffer.iter().enumerate() {
@@ -312,7 +315,13 @@ impl ManeuverClassifier {
             }
         }
 
-        // ── UNCORRELATED HIGH-CONFIDENCE PASSES → OVERTAKE ──────
+        // ══════════════════════════════════════════════════════════════════
+        // UNCORRELATED HIGH-CONFIDENCE PASSES → OVERTAKE
+        //
+        // v4.3 FIX: Added ego-motion gate. Single-source passes (tracking
+        // only, no lateral shift) MUST have some ego lateral motion.
+        // Without this, zone misclassifications fire as false overtakes.
+        // ══════════════════════════════════════════════════════════════════
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
                 continue;
@@ -323,7 +332,6 @@ impl ManeuverClassifier {
 
             let pass_conf = self.pass_buffer[pass_idx].event.confidence;
 
-            // ✅ ADD THIS LOG
             info!(
                 "🔍 Checking single-source pass: track={} side={:?} conf={:.2} (min={:.2})",
                 self.pass_buffer[pass_idx].event.vehicle_track_id,
@@ -333,10 +341,39 @@ impl ManeuverClassifier {
             );
 
             if pass_conf >= self.config.min_single_source_confidence {
+                // ══════════════════════════════════════════════════════
+                // v4.3 EGO-MOTION GATE FOR SINGLE-SOURCE PASSES
+                // ══════════════════════════════════════════════════════
+                let ego_confirms = self.ego_motion_confirms_lateral();
+                let had_any_lateral_shift = self.shift_buffer.iter().any(|s| !s.correlated);
+
+                if !ego_confirms && !had_any_lateral_shift {
+                    let peak_ego = self
+                        .ego_motion_during_window
+                        .iter()
+                        .rev()
+                        .take(60)
+                        .map(|v| v.abs())
+                        .fold(0.0f32, |a, b| a.max(b));
+
+                    if peak_ego < self.config.min_ego_motion_for_single_source {
+                        warn!(
+                            "  ❌ REJECTED single-source pass (track {}): no lateral motion \
+                             (peak_ego={:.2} < {:.2}, ego_confirms={}, shifts={})",
+                            self.pass_buffer[pass_idx].event.vehicle_track_id,
+                            peak_ego,
+                            self.config.min_ego_motion_for_single_source,
+                            ego_confirms,
+                            had_any_lateral_shift
+                        );
+                        self.pass_buffer[pass_idx].correlated = true;
+                        continue;
+                    }
+                }
+
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let maneuver = self.build_overtake(&pass_event, None, legality_buffer);
 
-                // ✅ ADD THIS LOG
                 info!(
                     "  → Built overtake: conf={:.2} (min_combined={:.2}) sources={}",
                     maneuver.confidence,
@@ -356,14 +393,12 @@ impl ManeuverClassifier {
                     self.total_maneuvers += 1;
                     self.pass_buffer[pass_idx].correlated = true;
                 } else {
-                    // ✅ ADD THIS LOG
                     info!(
                         "  ❌ Rejected: conf={:.2} < min_combined={:.2}",
                         maneuver.confidence, self.config.min_combined_confidence
                     );
                 }
             } else {
-                // ✅ ADD THIS LOG
                 info!(
                     "  ❌ Pass conf too low: {:.2} < {:.2}",
                     pass_conf, self.config.min_single_source_confidence
@@ -446,14 +481,13 @@ impl ManeuverClassifier {
 
         let ego_confirms = self.ego_motion_confirms_lateral();
 
-        // ✅ BOOST pass weight when it's the only source
         let pass_weight = if shift.is_none() && !ego_confirms {
-            0.70 // Single-source: give passes more weight
+            0.70
         } else {
             self.config.weight_pass
         };
 
-        let pass_conf = pass.confidence * pass_weight; // ✅ Now: 0.70 * 0.70 = 0.49
+        let pass_conf = pass.confidence * pass_weight;
         let shift_conf = shift
             .map(|s| s.confidence * self.config.weight_lateral)
             .unwrap_or(0.0);
@@ -472,7 +506,7 @@ impl ManeuverClassifier {
         let source_bonus = match sources.count() {
             3 => 0.15,
             2 => 0.08,
-            1 => 0.0, // No bonus for single source (but high pass weight compensates)
+            1 => 0.0,
             _ => 0.0,
         };
 
@@ -663,16 +697,15 @@ fn temporal_gap(start_a: f64, end_a: f64, start_b: f64, end_b: f64) -> f64 {
 }
 
 fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
-    // For mining routes with poor tracking, accept opposite directions too
-    // because the vehicle might disappear and reappear, causing zone confusion
-
     // Strict matching (preferred)
     let strict_match = matches!(
         (pass.side, shift.direction),
         (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
     );
 
-    // Lenient: if it's a valid pass and shift within time window, likely related
-    // This handles cases where vehicle tracking drops and zones get confused
-    strict_match || pass.confidence > 0.6 // Accept high-confidence passes with any shift
+    // v4.3: Tightened lenient matching. Previously accepted any high-confidence
+    // pass with any shift direction. Now require strict match OR the pass must
+    // have very high confidence AND the shift must be confirmed.
+    strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
+

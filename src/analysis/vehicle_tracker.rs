@@ -9,6 +9,9 @@
 //   - Tracks coast through brief detection gaps (dust, glare)
 //   - Zone assignment from bbox geometry — no lane markings needed
 //   - Each track stores zone history for transition analysis
+//
+// v4.3 FIX: Zone hysteresis to prevent large AHEAD vehicles from
+//           flickering into BESIDE due to bbox jitter or camera offset.
 
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
@@ -156,7 +159,20 @@ pub struct Track {
     pub last_confidence: f32,
     prev_cx: f32,
     prev_cy: f32,
+
+    // ── v4.3 FIX: Zone hysteresis ──
+    /// Consecutive frames the raw zone computation returned BESIDE
+    /// while the confirmed zone is still AHEAD.
+    consecutive_beside_raw: u32,
+    /// The last zone that was actually committed (after hysteresis).
+    /// Used to detect AHEAD→BESIDE transitions that need confirmation.
+    last_stable_zone: VehicleZone,
 }
+
+/// Minimum consecutive raw-BESIDE frames before we allow transition from AHEAD.
+/// At 30fps this means ~170ms — enough to filter out single-frame bbox jitter
+/// but fast enough to catch real beside events within 200ms.
+const BESIDE_HYSTERESIS_FRAMES: u32 = 5;
 
 impl Track {
     fn new(id: u32, det: &DetectionInput, timestamp_ms: f64, frame_id: u64) -> Self {
@@ -178,6 +194,8 @@ impl Track {
             last_confidence: det.confidence,
             prev_cx: cx,
             prev_cy: cy,
+            consecutive_beside_raw: 0,
+            last_stable_zone: VehicleZone::Unknown,
         }
     }
 
@@ -301,15 +319,17 @@ impl Track {
         let y_ratio = cy / frame_h;
         let bottom_ratio = self.bbox[3] / frame_h;
 
-        // ══════════════════════════════════════════════════════════════════════
-        // SIZE-BASED OVERRIDE: Large vehicles are AHEAD (too close to be beside)
-        // ══════════════════════════════════════════════════════════════════════
         let bbox_height = self.bbox[3] - self.bbox[1];
         let height_ratio = bbox_height / frame_h;
 
-        // If vehicle takes up >35% of frame height OR >20% of total area → AHEAD
-        // (Prevents large trucks from being misclassified as BESIDE)
-        let zone = if height_ratio > 0.35 || area_ratio > 0.20 {
+        // ══════════════════════════════════════════════════════════════════════
+        // SIZE-BASED OVERRIDE: Large vehicles are AHEAD
+        //
+        // v4.3 FIX: Lowered thresholds from 0.35/0.20 to 0.28/0.12 to catch
+        // mining trucks that vary frame-to-frame and whose bboxes can be
+        // slightly below the old thresholds while clearly being ahead.
+        // ══════════════════════════════════════════════════════════════════════
+        let raw_zone = if height_ratio > 0.28 || area_ratio > 0.12 {
             VehicleZone::Ahead
         }
         // ══════════════════════════════════════════════════════════════════════
@@ -323,8 +343,8 @@ impl Track {
         // ══════════════════════════════════════════════════════════════════════
         else if lateral_offset > cfg.beside_lateral_min
             && (area_ratio > cfg.beside_area_min || bottom_ratio > 0.55)
-            && height_ratio < 0.30
-        // ✅ NEW: Not too tall (prevents ahead from being beside)
+            && height_ratio < 0.25
+        // v4.3: tightened from 0.30
         {
             if cx < half_w {
                 VehicleZone::BesideLeft
@@ -342,21 +362,64 @@ impl Track {
         // TRANSITIONAL: Lower half but not clearly beside/behind
         // ══════════════════════════════════════════════════════════════════════
         else if y_ratio >= cfg.ahead_y_max {
-            // Use stricter lateral offset to confirm BESIDE in lower frame
-            if lateral_offset > cfg.beside_lateral_min * 1.2 && height_ratio < 0.25 {
+            if lateral_offset > cfg.beside_lateral_min * 1.2 && height_ratio < 0.22 {
                 if cx < half_w {
                     VehicleZone::BesideLeft
                 } else {
                     VehicleZone::BesideRight
                 }
             } else {
-                VehicleZone::Ahead // Still ahead but closer
+                VehicleZone::Ahead
             }
         } else {
             VehicleZone::Unknown
         };
 
+        // ══════════════════════════════════════════════════════════════════════
+        // v4.3 FIX: ZONE HYSTERESIS
+        //
+        // Prevent AHEAD→BESIDE flickering. When a vehicle has been stably
+        // AHEAD, require BESIDE_HYSTERESIS_FRAMES consecutive raw-BESIDE
+        // readings before committing the transition. This filters out
+        // single-frame bbox jitter from lateral camera offset or dust.
+        //
+        // BEHIND and AHEAD transitions are NOT gated — they're less
+        // prone to false positives and need to be responsive.
+        // ══════════════════════════════════════════════════════════════════════
+        let zone = if self.last_stable_zone == VehicleZone::Ahead && raw_zone.is_beside() {
+            self.consecutive_beside_raw += 1;
+            if self.consecutive_beside_raw >= BESIDE_HYSTERESIS_FRAMES {
+                // Confirmed transition: vehicle genuinely moved to BESIDE
+                debug!(
+                    "✅ Track {} AHEAD→{} confirmed after {} frames",
+                    self.id,
+                    raw_zone.as_str(),
+                    self.consecutive_beside_raw
+                );
+                self.consecutive_beside_raw = 0;
+                raw_zone
+            } else {
+                debug!(
+                    "⏳ Track {} raw={} but holding AHEAD ({}/{} hysteresis)",
+                    self.id,
+                    raw_zone.as_str(),
+                    self.consecutive_beside_raw,
+                    BESIDE_HYSTERESIS_FRAMES
+                );
+                VehicleZone::Ahead // Hold at AHEAD during hysteresis
+            }
+        } else {
+            // Not an AHEAD→BESIDE transition — apply raw zone immediately
+            if !raw_zone.is_beside() {
+                self.consecutive_beside_raw = 0;
+            }
+            raw_zone
+        };
+
+        // Update stable zone tracking
+        self.last_stable_zone = zone;
         self.zone = zone;
+
         self.zone_history.push_back(ZoneObservation {
             zone,
             timestamp_ms,
@@ -436,11 +499,9 @@ impl VehicleTracker {
             .collect();
 
         // ── MATCHING ────────────────────────────────────────────
-        // Greedy IoU matching: for each detection, find best matching track
         let mut matched_track_indices: Vec<bool> = vec![false; self.tracks.len()];
         let mut matched_det_indices: Vec<bool> = vec![false; valid.len()];
 
-        // Build IoU matrix and sort by descending IoU for greedy assignment
         let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
             for (di, det) in valid.iter().enumerate() {
@@ -483,7 +544,6 @@ impl VehicleTracker {
         let (fw, fh) = (self.frame_w, self.frame_h);
         for track in &mut self.tracks {
             if track.frames_since_hit == 0 {
-                // Only update zone when we have a fresh detection
                 track.assign_zone(fw, fh, &zone_cfg, timestamp_ms, frame_id);
             }
         }
@@ -499,7 +559,6 @@ impl VehicleTracker {
                 );
                 return false;
             }
-            // Remove tentative tracks that never confirmed
             if t.state == TrackState::Tentative && t.age > min_hits * 3 {
                 return false;
             }
@@ -509,22 +568,18 @@ impl VehicleTracker {
         &self.tracks
     }
 
-    /// Get all currently confirmed tracks
     pub fn confirmed_tracks(&self) -> Vec<&Track> {
         self.tracks.iter().filter(|t| t.is_confirmed()).collect()
     }
 
-    /// Get all tracks (including tentative/lost) — useful for debugging
     pub fn all_tracks(&self) -> &[Track] {
         &self.tracks
     }
 
-    /// Get a specific track by ID
     pub fn get_track(&self, id: u32) -> Option<&Track> {
         self.tracks.iter().find(|t| t.id == id)
     }
 
-    /// Number of confirmed tracks
     pub fn confirmed_count(&self) -> usize {
         self.tracks.iter().filter(|t| t.is_confirmed()).count()
     }
@@ -552,7 +607,6 @@ mod tests {
         let a = [0.0, 0.0, 100.0, 100.0];
         let b = [50.0, 50.0, 150.0, 150.0];
         let score = iou(&a, &b);
-        // Intersection = 50*50 = 2500, Union = 10000 + 10000 - 2500 = 17500
         assert!((score - 2500.0 / 17500.0).abs() < 0.01);
     }
 
@@ -568,13 +622,11 @@ mod tests {
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
-        // Frame 1: detection appears
         let dets = vec![det(500.0, 200.0, 600.0, 300.0)];
         tracker.update(&dets, 0.0, 1);
         assert_eq!(tracker.all_tracks().len(), 1);
         assert_eq!(tracker.all_tracks()[0].state, TrackState::Tentative);
 
-        // Frame 2-3: same area, track confirms
         tracker.update(&dets, 33.3, 2);
         tracker.update(&dets, 66.6, 3);
         assert_eq!(tracker.all_tracks()[0].state, TrackState::Confirmed);
@@ -585,7 +637,6 @@ mod tests {
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
-        // Small bbox in upper center = AHEAD
         let dets = vec![det(580.0, 200.0, 700.0, 300.0)];
         for i in 0..4 {
             tracker.update(&dets, i as f64 * 33.3, i as u64);
@@ -594,13 +645,46 @@ mod tests {
     }
 
     #[test]
-    fn test_zone_assignment_beside_right() {
+    fn test_zone_hysteresis_prevents_flicker() {
+        // A large truck slightly offset should NOT immediately become BESIDE
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
-        // Large bbox on right side = BESIDE_RIGHT
-        let dets = vec![det(900.0, 300.0, 1250.0, 650.0)];
-        for i in 0..4 {
+        // Phase 1: clearly AHEAD (centered, upper)
+        for i in 0..10 {
+            let dets = vec![det(500.0, 200.0, 780.0, 400.0)];
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        assert_eq!(tracker.all_tracks()[0].zone, VehicleZone::Ahead);
+
+        // Phase 2: bbox shifts slightly right (camera jitter) for 3 frames
+        // This should NOT trigger BESIDE due to hysteresis
+        for i in 10..13 {
+            let dets = vec![det(700.0, 300.0, 1100.0, 550.0)];
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        // Should still be AHEAD (hysteresis requires 5 frames)
+        assert_eq!(
+            tracker.all_tracks()[0].zone,
+            VehicleZone::Ahead,
+            "Should remain AHEAD during hysteresis period"
+        );
+    }
+
+    #[test]
+    fn test_zone_assignment_beside_right_after_hysteresis() {
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Phase 1: clearly AHEAD
+        for i in 0..10 {
+            let dets = vec![det(580.0, 200.0, 700.0, 300.0)];
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+
+        // Phase 2: genuinely BESIDE for enough frames to pass hysteresis
+        for i in 10..20 {
+            let dets = vec![det(900.0, 300.0, 1250.0, 500.0)];
             tracker.update(&dets, i as f64 * 33.3, i as u64);
         }
         assert_eq!(tracker.all_tracks()[0].zone, VehicleZone::BesideRight);
@@ -611,20 +695,40 @@ mod tests {
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
-        // Simulate a vehicle moving from AHEAD → BESIDE_RIGHT
-        // Phase 1: ahead (small, centered, upper)
+        // Phase 1: ahead
         for i in 0..10 {
             let dets = vec![det(580.0, 200.0, 700.0, 300.0)];
             tracker.update(&dets, i as f64 * 33.3, i as u64);
         }
 
-        // Phase 2: beside right (large, offset right, lower)
-        for i in 10..20 {
-            let dets = vec![det(900.0, 350.0, 1250.0, 680.0)];
+        // Phase 2: beside right (long enough for hysteresis)
+        for i in 10..25 {
+            let dets = vec![det(900.0, 350.0, 1250.0, 500.0)];
             tracker.update(&dets, i as f64 * 33.3, i as u64);
         }
 
         let track = &tracker.all_tracks()[0];
         assert!(track.has_zone_sequence(&[VehicleZone::Ahead, VehicleZone::BesideRight]));
     }
+
+    #[test]
+    fn test_large_truck_stays_ahead() {
+        // v4.3 FIX: A truck with height_ratio=0.30 should be AHEAD
+        // (previously only caught at 0.35)
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Truck: 800x216 bbox (height_ratio = 216/720 = 0.30, area_ratio = 0.187)
+        // Center at x=700 (slightly right of center 640)
+        let dets = vec![det(300.0, 250.0, 1100.0, 466.0)];
+        for i in 0..10 {
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        assert_eq!(
+            tracker.all_tracks()[0].zone,
+            VehicleZone::Ahead,
+            "Large truck with 30% height ratio should be AHEAD"
+        );
+    }
 }
+
