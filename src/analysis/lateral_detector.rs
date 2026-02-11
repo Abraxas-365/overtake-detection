@@ -775,7 +775,7 @@ impl LateralShiftDetector {
                 && self.shift_frames >= self.config.min_shift_frames;
 
             return if confirmed {
-                Some(self.emit_shift_event(timestamp_ms, frame_id))
+                self.emit_shift_event(timestamp_ms, frame_id)
             } else {
                 debug!(
                     "❌ Lateral shift rejected: peak={:.1}% (need {:.1}%), frames={} (need {})",
@@ -805,9 +805,11 @@ impl LateralShiftDetector {
 
             return if confirmed {
                 let evt = self.emit_shift_event(timestamp_ms, frame_id);
+                // Update baseline whether event was emitted or vetoed —
+                // the vehicle HAS settled in a new position regardless.
                 self.baseline = normalized;
                 self.baseline_samples = 1;
-                Some(evt)
+                evt
             } else {
                 self.baseline = normalized;
                 self.baseline_samples = 1;
@@ -864,12 +866,14 @@ impl LateralShiftDetector {
                 (timestamp_ms - self.shift_start_ms) / 1000.0,
             );
             let evt = self.emit_shift_event(timestamp_ms, frame_id);
-            // Reset baseline — we don't know exact position, so keep it and let
-            // recovery re-establish when lanes come back.
-            self.baseline_samples = 0;
-            self.freeze_remaining = self.config.post_reset_freeze_frames;
-            self.state = State::Recovering;
-            return Some(evt);
+            if evt.is_some() {
+                // Only transition to Recovering if the event was actually emitted
+                // (not vetoed by ego-direction disagreement).
+                self.baseline_samples = 0;
+                self.freeze_remaining = self.config.post_reset_freeze_frames;
+                self.state = State::Recovering;
+            }
+            return evt;
         }
 
         // Not enough evidence to confirm — just reset
@@ -893,24 +897,39 @@ impl LateralShiftDetector {
         let confirmed = self.shift_peak_offset >= self.config.shift_confirm_threshold;
 
         let result = if confirmed {
-            Some(self.emit_shift_event(timestamp_ms, frame_id))
+            // emit_shift_event handles state reset internally
+            self.emit_shift_event(timestamp_ms, frame_id)
         } else {
+            self.state = State::Stable;
+            self.reset_shift();
             None
         };
 
+        // Update baseline to current position regardless of outcome
         self.baseline = current_normalized;
         self.baseline_samples = 1;
-        self.state = State::Stable;
-        self.reset_shift();
         result
     }
 
     /// Build and emit the shift event, applying direction validation.
-    fn emit_shift_event(&mut self, end_ms: f64, end_frame: u64) -> LateralShiftEvent {
-        // ── FINAL DIRECTION VALIDATION (v4.4) ───────────────────
+    /// Returns None if the shift was vetoed by ego-direction disagreement.
+    fn emit_shift_event(&mut self, end_ms: f64, end_frame: u64) -> Option<LateralShiftEvent> {
+        let duration_ms = end_ms - self.shift_start_ms;
+
+        // ── FINAL DIRECTION VALIDATION (v4.4, v4.10b) ────────────
         // Ego cumulative displacement is the ground truth for direction.
         // If ego clearly moved one way, trust that over initial lane reading.
-        let validated_direction = self.validate_final_direction();
+        // v4.10b: Can return None to veto short shifts where ego disagrees.
+        let validated_direction = match self.validate_final_direction(duration_ms) {
+            Some(dir) => dir,
+            None => {
+                // Vetoed — ego disagrees with lane for a short shift.
+                // Reset and return to stable without emitting an event.
+                self.state = State::Stable;
+                self.reset_shift();
+                return None;
+            }
+        };
 
         let avg_confidence = if self.shift_frames > 0 {
             self.shift_confidence_sum / self.shift_frames as f32
@@ -938,7 +957,7 @@ impl LateralShiftDetector {
             end_ms,
             start_frame: self.shift_start_frame,
             end_frame,
-            duration_ms: end_ms - self.shift_start_ms,
+            duration_ms,
             confidence,
             confirmed: true,
         };
@@ -959,15 +978,22 @@ impl LateralShiftDetector {
 
         self.state = State::Stable;
         self.reset_shift();
-        evt
+        Some(evt)
     }
 
     /// Validate shift direction using cumulative ego motion.
-    /// Returns the validated direction.
+    /// Returns the validated direction, or None if the shift should be vetoed
+    /// (ego strongly disagrees with lane direction for a short shift).
+    ///
     /// v4.10: Uses peak cumulative (max absolute value during shift) instead of
     /// final cumulative, because by shift end the vehicle has returned to its lane
     /// and the cumulative has swung back toward zero or even the opposite direction.
-    fn validate_final_direction(&self) -> ShiftDirection {
+    ///
+    /// v4.10b: Duration-scaled override threshold. Short shifts (< 1.5s) need
+    /// far less ego evidence to override lane direction, because lane transients
+    /// are common (detector jumps, boundary misidentification) but ego motion
+    /// doesn't lie about which direction the vehicle moved.
+    fn validate_final_direction(&self, duration_ms: f64) -> Option<ShiftDirection> {
         let initial_dir = self.shift_direction.unwrap_or(ShiftDirection::Left);
 
         // Use peak cumulative — this captures the direction when ego motion
@@ -978,9 +1004,50 @@ impl LateralShiftDetector {
             self.ego_cumulative_px
         };
 
+        // ── v4.10b: Duration-scaled ego threshold ────────────────
+        // For short shifts, lane data alone is unreliable (could be a
+        // detector transient). Lower the ego override bar proportionally.
+        //   < 1.0s: 3px  (very easy to override — short shifts are suspect)
+        //   1.0-2.0s: 5-10px (moderate)
+        //   > 3.0s: 15px (high bar — long shifts with consistent lane data are trustworthy)
+        let duration_s = (duration_ms / 1000.0) as f32;
+        let ego_override_threshold = if duration_s < 1.0 {
+            3.0
+        } else if duration_s < 2.0 {
+            3.0 + (duration_s - 1.0) * 7.0 // 3→10 linearly
+        } else if duration_s < 3.0 {
+            10.0 + (duration_s - 2.0) * 5.0 // 10→15 linearly
+        } else {
+            15.0
+        };
+
         // If we don't have enough ego data, trust the lane-based direction
-        if cum.abs() < 15.0 {
-            return initial_dir;
+        if cum.abs() < ego_override_threshold {
+            // ── v4.10b: Ego disagreement veto for very short shifts ──
+            // Even if ego cumulative is below the override threshold,
+            // if it's in the OPPOSITE direction for a very short shift,
+            // the shift is almost certainly a lane detector transient.
+            // Veto it entirely rather than emitting a wrong direction.
+            if duration_s < 1.5 && cum.abs() > 1.5 {
+                let ego_dir = if cum < 0.0 {
+                    ShiftDirection::Left
+                } else {
+                    ShiftDirection::Right
+                };
+                if ego_dir != initial_dir {
+                    warn!(
+                        "❌ Ego-direction veto: shift {} dur={:.1}s but ego_cum={:.1}px says {} \
+                         (below override threshold {:.0}px but disagrees) → REJECTING shift",
+                        initial_dir.as_str(),
+                        duration_s,
+                        cum,
+                        ego_dir.as_str(),
+                        ego_override_threshold,
+                    );
+                    return None; // Veto — don't emit this shift
+                }
+            }
+            return Some(initial_dir);
         }
 
         let ego_dir = if cum < 0.0 {
@@ -991,16 +1058,19 @@ impl LateralShiftDetector {
 
         if ego_dir != initial_dir {
             warn!(
-                "🔄 Direction validation: initial={} ego={} (peak_cum={:.1}px, final_cum={:.1}px) → using {}",
+                "🔄 Direction validation: initial={} ego={} (peak_cum={:.1}px, final_cum={:.1}px, \
+                 threshold={:.0}px, dur={:.1}s) → using {}",
                 initial_dir.as_str(),
                 ego_dir.as_str(),
                 self.ego_cumulative_peak_px,
                 self.ego_cumulative_px,
+                ego_override_threshold,
+                duration_s,
                 ego_dir.as_str(),
             );
-            ego_dir
+            Some(ego_dir)
         } else {
-            initial_dir
+            Some(initial_dir)
         }
     }
 
@@ -1657,6 +1727,89 @@ mod tests {
 
         // Should be occluded (cache expired, no ego motion)
         assert_eq!(det.state, State::Occluded);
+    }
+
+    #[test]
+    fn test_ego_direction_veto_short_shift() {
+        // v4.10b: Short lane-based shift where ego disagrees should be vetoed.
+        // Scenario: lane detector jumps to +46% RIGHT, but ego is weakly LEFT.
+        // Duration < 1.5s → veto should reject the RIGHT shift.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            shift_start_threshold: 0.35,
+            shift_confirm_threshold: 0.30,
+            shift_end_threshold: 0.10,
+            min_shift_frames: 5,
+            shift_end_grace_frames: 3,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup at ~0 offset
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Lane jumps to RIGHT (+300px = 37.5%) while ego moves LEFT (-3.0 px/f)
+        // This is the false positive scenario from the BTH-894 video
+        for i in 20..30 {
+            det.update(meas(300.0, w, 0.8), ego(-3.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Shifting);
+
+        // Lane returns to center (shift end condition)
+        let events: Vec<_> = (30..40)
+            .filter_map(|i| det.update(meas(0.0, w, 0.8), ego(-1.0), i as f64 * 33.3, i as u64))
+            .collect();
+
+        // Should NOT have emitted any events — ego disagreed with lane direction
+        // for this short shift, so it was vetoed.
+        assert!(
+            events.is_empty(),
+            "Short RIGHT shift should be vetoed when ego says LEFT, got {} events",
+            events.len()
+        );
+        assert_eq!(det.state, State::Stable);
+    }
+
+    #[test]
+    fn test_ego_direction_veto_does_not_affect_long_shifts() {
+        // v4.10b: Long shifts (> 1.5s) should NOT be vetoed even if ego
+        // weakly disagrees — lane data is more reliable over longer durations.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            shift_start_threshold: 0.30,
+            shift_confirm_threshold: 0.25,
+            shift_end_threshold: 0.08,
+            min_shift_frames: 5,
+            shift_end_grace_frames: 3,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+
+        // Sustained RIGHT offset (300px=37.5%) for 60 frames (~2s)
+        // with weakly disagreeing ego (-0.5 px/f — below min_displacement)
+        for i in 20..80 {
+            det.update(meas(300.0, w, 0.8), ego(-0.5), i as f64 * 33.3, i);
+        }
+
+        // Settle back
+        let events: Vec<_> = (80..100)
+            .filter_map(|i| det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i as u64))
+            .collect();
+
+        // Should emit the RIGHT shift — duration > 1.5s so veto doesn't apply,
+        // and ego cumulative is low enough that lane direction is trusted.
+        assert_eq!(events.len(), 1, "Long RIGHT shift should still be emitted");
+        assert_eq!(events[0].direction, ShiftDirection::Right);
     }
 }
 
