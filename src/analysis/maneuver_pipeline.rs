@@ -25,7 +25,7 @@ use super::maneuver_classifier::{
 use super::pass_detector::{PassDetector, PassDetectorConfig};
 use super::vehicle_tracker::{DetectionInput, Track, TrackerConfig, VehicleTracker};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
-use tracing::info;
+use tracing::{info, warn};
 
 // ============================================================================
 // INPUT / OUTPUT
