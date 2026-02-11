@@ -597,7 +597,7 @@ impl VehicleTracker {
             matched_det_indices[*di] = true;
 
             let track_state = self.tracks[*ti].state;
-            debug!(
+            info!(
                 "🔗 Centroid rescue: Track {} ({:?}) ↔ det (dist={:.0}px, class={}, IoU < {:.2})",
                 self.tracks[*ti].id,
                 track_state,
