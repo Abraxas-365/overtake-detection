@@ -14,6 +14,9 @@
 //           flickering into BESIDE due to bbox jitter or camera offset.
 // v4.5 FIX: Hybrid matching (IoU + centroid distance) to maintain track
 //           continuity during extreme geometric transformations (overtakes).
+// v4.8 FIX: Lateral-aware size override — large bboxes at frame edges are
+//           BESIDE, not AHEAD. Class stability after track confirmation.
+//           Tightened centroid rescue to prevent ghost associations.
 
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
@@ -36,10 +39,14 @@ pub struct TrackerConfig {
     pub vehicle_class_ids: Vec<u32>,
     /// Zone geometry — ratio thresholds relative to frame dimensions
     pub zone: ZoneConfig,
-    /// Maximum centroid distance (as fraction of frame width) for fallback matching
+    /// Maximum centroid distance (as fraction of frame width) for confirmed/lost tracks
     pub max_centroid_distance_ratio: f32,
-    /// Maximum frames since last hit for centroid fallback to apply
+    /// Maximum centroid distance (as fraction of frame width) for tentative tracks
+    pub max_centroid_distance_ratio_tentative: f32,
+    /// Maximum frames since last hit for centroid fallback to apply (confirmed/lost)
     pub centroid_fallback_max_coast: u32,
+    /// Maximum frames since last hit for centroid fallback to apply (tentative)
+    pub centroid_fallback_max_coast_tentative: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +61,10 @@ pub struct ZoneConfig {
     pub behind_bottom_y_min: f32,
     /// Min area ratio for BEHIND (very large = right behind us)
     pub behind_area_min: f32,
+    /// v4.8: Max lateral offset ratio (|cx - frame_center| / frame_w) for
+    /// the size-based AHEAD override to apply. Vehicles farther from center
+    /// than this are candidates for BESIDE even if large.
+    pub size_override_max_lateral: f32,
 }
 
 impl Default for TrackerConfig {
@@ -65,8 +76,29 @@ impl Default for TrackerConfig {
             min_confidence: 0.20,
             vehicle_class_ids: vec![2, 3, 5, 7],
             zone: ZoneConfig::default(),
-            max_centroid_distance_ratio: 0.20, // 20% of frame width (generous for mining)
-            centroid_fallback_max_coast: 10,   // Only rescue recently-lost tracks
+            max_centroid_distance_ratio: 0.20, // 20% of frame width
+            max_centroid_distance_ratio_tentative: 0.15, // 15% for tentative (stricter)
+            centroid_fallback_max_coast: 10,
+            centroid_fallback_max_coast_tentative: 5,
+        }
+    }
+}
+
+impl TrackerConfig {
+    /// Mining-optimized configuration — more generous coasting and centroid
+    /// rescue for dust/glare, but still strict enough to prevent ghost tracks.
+    pub fn mining() -> Self {
+        Self {
+            min_iou: 0.12,
+            max_coast_frames: 45,
+            min_hits_to_confirm: 3,
+            min_confidence: 0.20,
+            vehicle_class_ids: vec![2, 3, 5, 7],
+            zone: ZoneConfig::mining(),
+            max_centroid_distance_ratio: 0.22, // Slightly generous for dust
+            max_centroid_distance_ratio_tentative: 0.15,
+            centroid_fallback_max_coast: 12,
+            centroid_fallback_max_coast_tentative: 5,
         }
     }
 }
@@ -79,6 +111,20 @@ impl Default for ZoneConfig {
             beside_area_min: 0.015,
             behind_bottom_y_min: 0.88,
             behind_area_min: 0.06,
+            size_override_max_lateral: 0.25, // v4.8: only override when within 25% of center
+        }
+    }
+}
+
+impl ZoneConfig {
+    pub fn mining() -> Self {
+        Self {
+            ahead_y_max: 0.60,
+            beside_lateral_min: 0.22,
+            beside_area_min: 0.015,
+            behind_bottom_y_min: 0.88,
+            behind_area_min: 0.06,
+            size_override_max_lateral: 0.25,
         }
     }
 }
@@ -175,12 +221,23 @@ pub struct Track {
     /// The last zone that was actually committed (after hysteresis).
     /// Used to detect AHEAD→BESIDE transitions that need confirmation.
     last_stable_zone: VehicleZone,
+
+    // ── v4.8 FIX: Class stability ──
+    /// The class_id that was assigned when the track was confirmed.
+    /// Once set, IoU and centroid matches with a different class_id
+    /// are penalized (IoU) or rejected (centroid).
+    confirmed_class_id: Option<u32>,
 }
 
 /// Minimum consecutive raw-BESIDE frames before we allow transition from AHEAD.
 /// At 30fps this means ~170ms — enough to filter out single-frame bbox jitter
 /// but fast enough to catch real beside events within 200ms.
 const BESIDE_HYSTERESIS_FRAMES: u32 = 5;
+
+/// v4.8: IoU penalty multiplier when detection class differs from confirmed
+/// track class. 0.5 = halve the IoU score, making same-class matches win
+/// the greedy assignment when both are available.
+const CROSS_CLASS_IOU_PENALTY: f32 = 0.5;
 
 impl Track {
     fn new(id: u32, det: &DetectionInput, timestamp_ms: f64, frame_id: u64) -> Self {
@@ -204,6 +261,7 @@ impl Track {
             prev_cy: cy,
             consecutive_beside_raw: 0,
             last_stable_zone: VehicleZone::Unknown,
+            confirmed_class_id: None,
         }
     }
 
@@ -278,15 +336,22 @@ impl Track {
     }
 
     fn update_with_detection(&mut self, det: &DetectionInput) {
-        let (new_cx, new_cy) = det.center();
         self.prev_cx = self.center().0;
         self.prev_cy = self.center().1;
         self.bbox = det.bbox;
-        self.class_id = det.class_id;
         self.last_confidence = det.confidence;
         self.consecutive_hits += 1;
         self.frames_since_hit = 0;
         self.age += 1;
+
+        // ── v4.8 FIX: Class stability ──
+        // Only update class_id for tentative tracks (identity not yet locked).
+        // Once confirmed, keep the original class to prevent identity drift
+        // where a track hops between car→bus→truck across frames.
+        if self.confirmed_class_id.is_none() {
+            self.class_id = det.class_id;
+        }
+        // else: keep self.class_id as confirmed_class_id
 
         let area = det.area();
         if area > self.peak_area {
@@ -295,6 +360,11 @@ impl Track {
 
         if self.state == TrackState::Tentative && self.consecutive_hits >= 3 {
             self.state = TrackState::Confirmed;
+            self.confirmed_class_id = Some(self.class_id);
+            debug!(
+                "✅ Track {} confirmed with class={}",
+                self.id, self.class_id
+            );
         }
         if self.state == TrackState::Lost {
             self.state = TrackState::Confirmed;
@@ -331,13 +401,26 @@ impl Track {
         let height_ratio = bbox_height / frame_h;
 
         // ══════════════════════════════════════════════════════════════════════
-        // SIZE-BASED OVERRIDE: Large vehicles are AHEAD
+        // v4.8 FIX: LATERAL-AWARE SIZE OVERRIDE
         //
-        // v4.3 FIX: Lowered thresholds from 0.35/0.20 to 0.28/0.12 to catch
-        // mining trucks that vary frame-to-frame and whose bboxes can be
-        // slightly below the old thresholds while clearly being ahead.
+        // The size-based AHEAD override was catching vehicles that are BESIDE
+        // during overtakes. A vehicle being passed is close → large bbox, but
+        // displaced to one side. We now only apply the size override when the
+        // bbox center is roughly centered in the frame.
+        //
+        // lateral_offset_ratio: |cx - frame_center| / frame_width
+        //   0.0 = perfectly centered, 0.5 = at frame edge
+        //
+        // Example from the bug:
+        //   T6 bbox=[0,402,98,633] → cx=49, lateral_offset_ratio=0.46
+        //   height_ratio=0.32 (exceeds 0.28) but laterally it's at the edge
+        //   → should NOT be forced AHEAD, should fall through to BESIDE logic
         // ══════════════════════════════════════════════════════════════════════
-        let raw_zone = if height_ratio > 0.28 || area_ratio > 0.12 {
+        let lateral_offset_ratio = (cx - half_w).abs() / frame_w; // 0=center, 0.5=edge
+        let is_laterally_centered = lateral_offset_ratio < cfg.size_override_max_lateral;
+
+        let raw_zone = if is_laterally_centered && (height_ratio > 0.28 || area_ratio > 0.12) {
+            // Large, centered vehicle — genuinely AHEAD
             VehicleZone::Ahead
         }
         // ══════════════════════════════════════════════════════════════════════
@@ -345,6 +428,21 @@ impl Track {
         // ══════════════════════════════════════════════════════════════════════
         else if bottom_ratio > cfg.behind_bottom_y_min && area_ratio > cfg.behind_area_min {
             VehicleZone::Behind
+        }
+        // ══════════════════════════════════════════════════════════════════════
+        // v4.8: BESIDE for large lateral vehicles (previously swallowed by
+        // the size override). These are vehicles close to the ego vehicle
+        // during an overtake — large bbox but displaced to one side.
+        // ══════════════════════════════════════════════════════════════════════
+        else if !is_laterally_centered
+            && (height_ratio > 0.20 || area_ratio > 0.08)
+            && lateral_offset > cfg.beside_lateral_min
+        {
+            if cx < half_w {
+                VehicleZone::BesideLeft
+            } else {
+                VehicleZone::BesideRight
+            }
         }
         // ══════════════════════════════════════════════════════════════════════
         // BESIDE: Laterally offset + (medium area OR lower in frame)
@@ -508,6 +606,13 @@ impl VehicleTracker {
 
         // ══════════════════════════════════════════════════════════════════════
         // PHASE 1: IoU-BASED MATCHING (PRIMARY)
+        //
+        // v4.8: Cross-class IoU penalty. When a confirmed track's locked
+        // class_id differs from the detection's class_id, the effective IoU
+        // is halved. This makes same-class matches win the greedy assignment
+        // when both are available, while still allowing cross-class matches
+        // as a last resort (YOLO can flicker between car/truck for the same
+        // physical vehicle, especially with mining equipment).
         // ══════════════════════════════════════════════════════════════════════
         let mut matched_track_indices: Vec<bool> = vec![false; self.tracks.len()];
         let mut matched_det_indices: Vec<bool> = vec![false; valid.len()];
@@ -515,9 +620,25 @@ impl VehicleTracker {
         let mut iou_pairs: Vec<(usize, usize, f32)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
             for (di, det) in valid.iter().enumerate() {
-                let score = iou(&track.bbox, &det.bbox);
-                if score >= self.config.min_iou {
-                    iou_pairs.push((ti, di, score));
+                let raw_iou = iou(&track.bbox, &det.bbox);
+                if raw_iou < self.config.min_iou {
+                    continue;
+                }
+
+                // v4.8: Penalize cross-class matches for confirmed tracks
+                let effective_iou = if let Some(locked_class) = track.confirmed_class_id {
+                    if locked_class != det.class_id {
+                        raw_iou * CROSS_CLASS_IOU_PENALTY
+                    } else {
+                        raw_iou
+                    }
+                } else {
+                    raw_iou
+                };
+
+                // Only include if the penalized IoU still meets the threshold
+                if effective_iou >= self.config.min_iou {
+                    iou_pairs.push((ti, di, effective_iou));
                 }
             }
         }
@@ -533,17 +654,24 @@ impl VehicleTracker {
         }
 
         // ══════════════════════════════════════════════════════════════════════
-        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 + v4.6 TENTATIVE RESCUE)
-        // v4.7: Increased thresholds for mining environment (dust + large vehicles)
+        // PHASE 2: CENTROID-DISTANCE FALLBACK
+        //
+        // v4.8: Tightened from v4.7's extremely generous thresholds.
+        //   - Strict class matching: confirmed tracks ONLY match same class
+        //   - Reduced distances: 20%/15% (was 30%/25%)
+        //   - Separate coast limits for confirmed vs tentative
+        //   - Prevents ghost associations that were corrupting track identity
+        //
+        // The v4.7 thresholds (30% = 384px) allowed matching completely
+        // different vehicles at opposite sides of the frame. The new limits
+        // are generous enough for dust/glare gaps but strict enough to
+        // prevent cross-vehicle associations.
         // ══════════════════════════════════════════════════════════════════════
-        // ══════════════════// ══════════════════════════════════════════════════════════════════════
-        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.7 FINAL - Mining Environment)
-        // ══════════════════════════════════════════════════════════════════════
-        // v4.7: Extremely generous for dust/large vehicles/long gaps
-        let max_dist_confirmed_px = self.frame_w * 0.30; // 30% = 384px @ 1280w (was 20%)
+        let max_dist_confirmed_px = self.frame_w * self.config.max_centroid_distance_ratio;
         let max_dist_confirmed_sq = max_dist_confirmed_px * max_dist_confirmed_px;
 
-        let max_dist_tentative_px = self.frame_w * 0.25; // 25% = 320px (was 20%)
+        let max_dist_tentative_px =
+            self.frame_w * self.config.max_centroid_distance_ratio_tentative;
         let max_dist_tentative_sq = max_dist_tentative_px * max_dist_tentative_px;
 
         let mut centroid_pairs: Vec<(usize, usize, f32)> = Vec::new();
@@ -553,13 +681,14 @@ impl VehicleTracker {
             }
 
             let (max_allowed_dist_sq, max_coast_frames) = match track.state {
-                TrackState::Confirmed | TrackState::Lost => {
-                    // Lost tracks need VERY generous limits - they've coasted 6-10 frames already
-                    (max_dist_confirmed_sq, 15) // Was 10
-                }
-                TrackState::Tentative => {
-                    (max_dist_tentative_sq, 10) // Was 8
-                }
+                TrackState::Confirmed | TrackState::Lost => (
+                    max_dist_confirmed_sq,
+                    self.config.centroid_fallback_max_coast,
+                ),
+                TrackState::Tentative => (
+                    max_dist_tentative_sq,
+                    self.config.centroid_fallback_max_coast_tentative,
+                ),
             };
 
             if track.frames_since_hit > max_coast_frames {
@@ -568,12 +697,20 @@ impl VehicleTracker {
 
             let (tcx, tcy) = track.center();
 
+            // v4.8: Determine which class to match against.
+            // Confirmed tracks use their locked class; tentative use current.
+            let required_class = track.confirmed_class_id.unwrap_or(track.class_id);
+
             for (di, det) in valid.iter().enumerate() {
                 if matched_det_indices[di] {
                     continue;
                 }
 
-                if track.class_id != det.class_id {
+                // v4.8: Strict class matching for centroid rescue.
+                // Unlike IoU (which penalizes but allows cross-class), centroid
+                // rescue has no geometric overlap to validate the match — class
+                // agreement is the only identity signal.
+                if required_class != det.class_id {
                     continue;
                 }
 
@@ -601,13 +738,14 @@ impl VehicleTracker {
                 self.tracks[*ti].id,
                 track_state,
                 dist_sq.sqrt(),
-                self.tracks[*ti].class_id,
+                valid[*di].class_id,
                 self.config.min_iou
             );
 
             self.tracks[*ti].update_with_detection(valid[*di]);
         }
-        //════════════════════════════════════════════════════
+
+        // ══════════════════════════════════════════════════════════════════════
         // UNMATCHED TRACKS → COAST
         // ══════════════════════════════════════════════════════════════════════
         for (ti, matched) in matched_track_indices.iter().enumerate() {
@@ -711,6 +849,14 @@ mod tests {
         }
     }
 
+    fn det_with_class(x1: f32, y1: f32, x2: f32, y2: f32, class_id: u32) -> DetectionInput {
+        DetectionInput {
+            bbox: [x1, y1, x2, y2],
+            class_id,
+            confidence: 0.8,
+        }
+    }
+
     #[test]
     fn test_iou_overlap() {
         let a = [0.0, 0.0, 100.0, 100.0];
@@ -742,6 +888,32 @@ mod tests {
     }
 
     #[test]
+    fn test_confirmed_class_locked() {
+        // v4.8: After confirmation, class_id should not change even if
+        // matched with a different class via IoU
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Confirm as class=7 (truck)
+        let dets = vec![det(500.0, 200.0, 600.0, 300.0)];
+        for i in 0..4 {
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        assert_eq!(tracker.all_tracks()[0].state, TrackState::Confirmed);
+        assert_eq!(tracker.all_tracks()[0].class_id, 7);
+        assert_eq!(tracker.all_tracks()[0].confirmed_class_id, Some(7));
+
+        // Now send same bbox with class=2 (car) — should still keep class=7
+        let dets = vec![det_with_class(500.0, 200.0, 600.0, 300.0, 2)];
+        tracker.update(&dets, 5.0 * 33.3, 5);
+        assert_eq!(
+            tracker.all_tracks()[0].class_id,
+            7,
+            "Confirmed track should keep locked class_id"
+        );
+    }
+
+    #[test]
     fn test_centroid_fallback_rescues_track() {
         // v4.5: Track should survive extreme bbox transformation via centroid fallback
         let cfg = TrackerConfig::default();
@@ -755,9 +927,9 @@ mod tests {
         assert_eq!(tracker.confirmed_count(), 1);
         let track_id = tracker.all_tracks()[0].id;
 
-        // Frame 4: Extreme bbox change (simulating close approach)
+        // Frame 4: Extreme bbox change (simulating close approach) — SAME CLASS
         // IoU will be very low, but centroid is close (~100px)
-        let dets = vec![det(550.0, 250.0, 1100.0, 600.0)];
+        let dets = vec![det(550.0, 250.0, 800.0, 450.0)];
         tracker.update(&dets, 4.0 * 33.3, 4);
 
         // Track should still exist with same ID (rescued by centroid fallback)
@@ -770,6 +942,39 @@ mod tests {
             tracker.all_tracks()[0].id,
             track_id,
             "Track ID should not change"
+        );
+    }
+
+    #[test]
+    fn test_centroid_rejects_cross_class() {
+        // v4.8: Centroid rescue should NOT match across different classes
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Confirm track as class=7 (truck)
+        for i in 1..=3 {
+            let dets = vec![det(500.0, 200.0, 600.0, 300.0)];
+            tracker.update(&dets, i as f64 * 33.3, i);
+        }
+        assert_eq!(tracker.confirmed_count(), 1);
+        let original_id = tracker.all_tracks()[0].id;
+
+        // Coast for a few frames (no detections)
+        for i in 4..=6 {
+            tracker.update(&[], i as f64 * 33.3, i);
+        }
+
+        // Now detection appears nearby but as class=2 (car)
+        // Centroid distance is ~0 (same position) but class differs
+        let dets = vec![det_with_class(500.0, 200.0, 600.0, 300.0, 2)];
+        tracker.update(&dets, 7.0 * 33.3, 7);
+
+        // Should create a NEW track, not rescue the old one
+        let tracks: Vec<_> = tracker.all_tracks().iter().collect();
+        let new_track = tracks.iter().find(|t| t.class_id == 2);
+        assert!(
+            new_track.is_some(),
+            "Cross-class detection should create new track"
         );
     }
 
@@ -852,11 +1057,12 @@ mod tests {
     }
 
     #[test]
-    fn test_large_truck_stays_ahead() {
+    fn test_large_centered_truck_stays_ahead() {
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
-        // Truck: 800x216 bbox (height_ratio = 216/720 = 0.30, area_ratio = 0.187)
+        // Truck: large bbox but CENTERED in frame — should be AHEAD
+        // cx=700, lateral_offset_ratio = |700-640|/1280 = 0.047 (well under 0.25)
         let dets = vec![det(300.0, 250.0, 1100.0, 466.0)];
         for i in 0..10 {
             tracker.update(&dets, i as f64 * 33.3, i as u64);
@@ -864,7 +1070,59 @@ mod tests {
         assert_eq!(
             tracker.all_tracks()[0].zone,
             VehicleZone::Ahead,
-            "Large truck with 30% height ratio should be AHEAD"
+            "Large centered truck should be AHEAD"
+        );
+    }
+
+    #[test]
+    fn test_large_lateral_vehicle_is_beside() {
+        // v4.8: The critical regression test — this was the overtake detection bug.
+        // A vehicle at the far left edge with a large bbox should be BESIDE_LEFT,
+        // not forced to AHEAD by the size override.
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Reproduce the exact scenario from the logs:
+        // T6 bbox=[0,402,98,633] → cx=49, height=231, height_ratio=0.32
+        // lateral_offset_ratio = |49 - 640| / 1280 = 0.46 >> 0.25
+        // → should NOT be forced AHEAD, should be BESIDE_LEFT
+        let dets = vec![det_with_class(0.0, 402.0, 98.0, 633.0, 2)];
+        for i in 0..10 {
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        assert_eq!(
+            tracker.all_tracks()[0].zone,
+            VehicleZone::BesideLeft,
+            "Large vehicle at far left edge should be BESIDE_LEFT, not AHEAD"
+        );
+    }
+
+    #[test]
+    fn test_overtake_zone_sequence_with_lateral_vehicle() {
+        // v4.8: End-to-end test for the overtake zone sequence that was failing.
+        // Simulates a vehicle that starts AHEAD, moves to BESIDE_LEFT as we pass it.
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Phase 1: Vehicle ahead (centered, small-medium)
+        for i in 0..15 {
+            let dets = vec![det_with_class(550.0, 250.0, 720.0, 380.0, 2)];
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+        assert_eq!(tracker.all_tracks()[0].zone, VehicleZone::Ahead);
+
+        // Phase 2: Vehicle moves to left side of frame as we overtake it
+        // Gets larger (closer) and displaced left
+        for i in 15..30 {
+            let dets = vec![det_with_class(0.0, 300.0, 200.0, 600.0, 2)];
+            tracker.update(&dets, i as f64 * 33.3, i as u64);
+        }
+
+        let track = &tracker.all_tracks()[0];
+        assert!(
+            track.has_zone_sequence(&[VehicleZone::Ahead, VehicleZone::BesideLeft]),
+            "Should detect AHEAD→BESIDE_LEFT sequence during overtake. Got: {:?}",
+            track.zone_transitions()
         );
     }
 }
