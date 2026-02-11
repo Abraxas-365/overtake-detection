@@ -533,18 +533,21 @@ impl VehicleTracker {
         }
 
         // ══════════════════════════════════════════════════════════════════════
-        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 FIX)
+        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 + v4.6 TENTATIVE RESCUE)
         //
-        // When IoU fails due to extreme geometric transformations (e.g., mining
-        // truck bbox growing 6x as it approaches), use spatial proximity as a
-        // fallback for confirmed/recently-lost tracks.
+        // v4.5: Rescue confirmed/lost tracks when IoU fails during geometric changes
+        // v4.6: ALSO rescue tentative tracks (stricter constraints) to help them confirm
         //
-        // This prevents track churn during overtakes where the same vehicle is
-        // continuously detected but IoU drops below threshold, causing the old
-        // track to die and new tentative tracks to spawn repeatedly.
+        // Without this, tentative tracks die after ~9 frames because intermittent
+        // IoU failures prevent them from accumulating 3 consecutive hits needed
+        // to reach confirmed state.
         // ══════════════════════════════════════════════════════════════════════
-        let max_dist_px = self.frame_w * self.config.max_centroid_distance_ratio;
-        let max_dist_sq = max_dist_px * max_dist_px;
+        let max_dist_confirmed_px = self.frame_w * self.config.max_centroid_distance_ratio;
+        let max_dist_confirmed_sq = max_dist_confirmed_px * max_dist_confirmed_px;
+
+        // Tentative tracks get STRICTER constraints (haven't proven themselves yet)
+        let max_dist_tentative_px = self.frame_w * 0.15; // 15% of frame width (~192px @ 1280w)
+        let max_dist_tentative_sq = max_dist_tentative_px * max_dist_tentative_px;
 
         let mut centroid_pairs: Vec<(usize, usize, f32)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
@@ -552,15 +555,25 @@ impl VehicleTracker {
                 continue; // Already matched via IoU
             }
 
-            // Only rescue confirmed or recently-lost tracks (not tentative)
-            // Tentative tracks should naturally expire if IoU fails — they haven't
-            // proven themselves yet
-            if track.state == TrackState::Tentative {
-                continue;
-            }
+            // Determine constraints based on track state
+            let (max_allowed_dist_sq, max_coast_frames, state_name) = match track.state {
+                TrackState::Confirmed | TrackState::Lost => {
+                    // Generous: these tracks have proven themselves
+                    (
+                        max_dist_confirmed_sq,
+                        self.config.centroid_fallback_max_coast,
+                        "Confirmed/Lost",
+                    )
+                }
+                TrackState::Tentative => {
+                    // Strict: only rescue if JUST missed (1-3 frames) and nearby
+                    // This helps tentative tracks accumulate consecutive hits to confirm
+                    (max_dist_tentative_sq, 3, "Tentative")
+                }
+            };
 
-            // Only rescue tracks lost in the last N frames (prevent stale matches)
-            if track.frames_since_hit > self.config.centroid_fallback_max_coast {
+            // Skip tracks that coasted too long for their state
+            if track.frames_since_hit > max_coast_frames {
                 continue;
             }
 
@@ -579,13 +592,13 @@ impl VehicleTracker {
                 let (dcx, dcy) = det.center();
                 let dist_sq = (tcx - dcx).powi(2) + (tcy - dcy).powi(2);
 
-                if dist_sq < max_dist_sq {
+                if dist_sq < max_allowed_dist_sq {
                     centroid_pairs.push((ti, di, dist_sq));
                 }
             }
         }
 
-        // Sort by distance (nearest first)
+        // Sort by distance (nearest first) for greedy matching
         centroid_pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
         // Greedy matching: assign nearest pairs first
@@ -596,11 +609,14 @@ impl VehicleTracker {
             matched_track_indices[*ti] = true;
             matched_det_indices[*di] = true;
 
+            let track_state = self.tracks[*ti].state;
             debug!(
-                "🔗 Centroid rescue: Track {} ↔ det (dist={:.0}px, class={}, IoU was below threshold)",
+                "🔗 Centroid rescue: Track {} ({:?}) ↔ det (dist={:.0}px, class={}, IoU < {:.2})",
                 self.tracks[*ti].id,
+                track_state,
                 dist_sq.sqrt(),
-                self.tracks[*ti].class_id
+                self.tracks[*ti].class_id,
+                self.config.min_iou
             );
 
             self.tracks[*ti].update_with_detection(valid[*di]);
