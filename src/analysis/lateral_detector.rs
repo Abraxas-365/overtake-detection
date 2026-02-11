@@ -46,6 +46,25 @@ pub struct LateralDetectorConfig {
     /// Max shift duration for ego-started shifts (shorter than lane-started)
     pub ego_shift_max_frames: u32,
 
+    // ── v4.10: Ego-preempt tuning ───────────────────────────────
+    /// Minimum ego lateral velocity to trigger ego-preempt when lanes ARE present.
+    /// Higher than ego_motion_min_velocity because we're overriding lane data and
+    /// need stronger evidence. Set to 0.0 to disable ego-preempt entirely.
+    pub ego_preempt_min_velocity: f32,
+    /// Minimum frames a shift must be active before shift_end_threshold is checked.
+    /// Prevents ego-preempt shifts from being immediately killed before the lane
+    /// offset has had time to develop (camera and lanes move together initially).
+    pub shift_end_grace_frames: u32,
+    /// Extended hold period for ego-preempt shifts: while ego is still active,
+    /// shift_end is suppressed for up to this many frames. Only after ego stops
+    /// AND this many frames have elapsed does the normal shift_end logic apply.
+    /// This prevents the ego-preempt oscillation bug where shifts get rejected
+    /// every 2 frames because lane offset is small.
+    pub ego_preempt_hold_frames: u32,
+    /// After an ego-preempt shift is rejected, suppress further ego-preempts
+    /// for this many frames to prevent oscillation.
+    pub ego_preempt_cooldown_frames: u32,
+
     // ── v4.10: Lane measurement caching ─────────────────────────
     /// Max frames to reuse the last valid lane measurement during brief dropouts.
     /// The cached measurement has its offset adjusted by ego motion each frame
@@ -77,6 +96,12 @@ impl Default for LateralDetectorConfig {
             ego_px_per_norm_unit: 600.0,  // ~lane_width, rough conversion
             ego_only_confidence_penalty: 0.2,
             ego_shift_max_frames: 180, // 6s max for ego-started shifts
+
+            // v4.10 ego-preempt tuning
+            ego_preempt_min_velocity: 3.5, // px/frame — stronger than ego_motion_min_velocity
+            shift_end_grace_frames: 15,    // ~500ms at 30fps — lane offset needs time to develop
+            ego_preempt_hold_frames: 75,   // ~2.5s at 30fps — keep shift alive while ego is active
+            ego_preempt_cooldown_frames: 60, // ~2s cooldown after rejection
 
             // v4.10 lane cache defaults
             lane_cache_max_frames: 4,          // ~133ms at 30fps
@@ -221,6 +246,11 @@ pub struct LateralShiftDetector {
     // v4.10: Lane measurement cache for brief dropouts
     cached_measurement: Option<LaneMeasurement>,
     cached_measurement_age: u32,
+
+    // v4.10: Ego-preempt anti-oscillation
+    ego_preempt_originated: bool, // whether current shift started via ego-preempt
+    ego_preempt_cooldown: u32,    // remaining cooldown frames after rejection
+    ego_cumulative_peak_px: f32, // peak |ego_cumulative_px| during shift (for direction validation)
 }
 
 impl LateralShiftDetector {
@@ -249,6 +279,9 @@ impl LateralShiftDetector {
             offset_history: VecDeque::with_capacity(30),
             cached_measurement: None,
             cached_measurement_age: 0,
+            ego_preempt_originated: false,
+            ego_preempt_cooldown: 0,
+            ego_cumulative_peak_px: 0.0,
         }
     }
 
@@ -266,6 +299,11 @@ impl LateralShiftDetector {
     ) -> Option<LateralShiftEvent> {
         let ego = ego_motion.unwrap_or_default();
         self.ego_last_velocity = ego.lateral_velocity;
+
+        // v4.10: Decrement ego-preempt cooldown
+        if self.ego_preempt_cooldown > 0 {
+            self.ego_preempt_cooldown -= 1;
+        }
 
         // Track sustained ego motion for ego-start detection
         if ego.confidence > 0.3 && ego.lateral_velocity.abs() >= self.config.ego_motion_min_velocity
@@ -423,7 +461,13 @@ impl LateralShiftDetector {
                 // and lane markings move together initially during a lane
                 // change, keeping the lane offset small while the ego is
                 // clearly moving laterally.
-                else if self.ego_active_frames >= self.config.ego_shift_start_frames {
+                // Uses a higher velocity threshold than no-lanes ego-start
+                // because we're overriding lane data — need stronger evidence.
+                else if self.ego_preempt_cooldown == 0
+                    && self.config.ego_preempt_min_velocity > 0.0
+                    && ego.lateral_velocity.abs() >= self.config.ego_preempt_min_velocity
+                    && self.ego_active_frames >= self.config.ego_shift_start_frames
+                {
                     let direction = if ego.lateral_velocity < 0.0 {
                         ShiftDirection::Left
                     } else {
@@ -443,6 +487,7 @@ impl LateralShiftDetector {
                         timestamp_ms,
                         frame_id,
                     );
+                    self.ego_preempt_originated = true;
 
                     info!(
                         "🔀🚀 Ego-preempt shift (lanes present): {} | lane_dev={:.1}% < threshold {:.1}% \
@@ -648,6 +693,11 @@ impl LateralShiftDetector {
         self.shift_confidence_sum += lane_confidence;
         self.ego_cumulative_px += ego.lateral_velocity;
 
+        // v4.10: Track peak cumulative for direction validation at emit time
+        if self.ego_cumulative_px.abs() > self.ego_cumulative_peak_px.abs() {
+            self.ego_cumulative_peak_px = self.ego_cumulative_px;
+        }
+
         if abs_dev > self.shift_peak_offset {
             self.shift_peak_offset = abs_dev;
         }
@@ -655,6 +705,8 @@ impl LateralShiftDetector {
         // ── DIRECTION VALIDATION (v4.4) ─────────────────────────
         // If lane position says one direction but cumulative ego motion
         // strongly disagrees, trust ego for direction.
+        // v4.10: Only allow correction in the first 30 frames — late flips
+        // are caused by the return-to-lane phase inflating cumulative.
         let lane_direction = if deviation < 0.0 {
             ShiftDirection::Left
         } else {
@@ -662,7 +714,10 @@ impl LateralShiftDetector {
         };
 
         if let Some(current_dir) = self.shift_direction {
-            if lane_direction != current_dir && abs_dev > self.config.shift_confirm_threshold {
+            if self.shift_frames <= 30
+                && lane_direction != current_dir
+                && abs_dev > self.config.shift_confirm_threshold
+            {
                 // Lane says opposite direction. Check ego.
                 let ego_direction = if self.ego_cumulative_px < 0.0 {
                     ShiftDirection::Left
@@ -699,7 +754,23 @@ impl LateralShiftDetector {
         }
 
         // ── SHIFT END (returned toward baseline) ────────────────
-        if abs_dev < self.config.shift_end_threshold {
+        // v4.10: Grace period — don't check shift_end until the shift has been
+        // active for enough frames. This prevents ego-preempt shifts from being
+        // immediately killed before the lane offset has time to develop.
+        //
+        // For ego-preempt shifts, use extended hold period AND keep the shift
+        // alive while ego is still active (the whole point of ego-preempt is
+        // that lane offset lags behind ego motion).
+        let grace = if self.ego_preempt_originated {
+            self.config.ego_preempt_hold_frames
+        } else {
+            self.config.shift_end_grace_frames
+        };
+        let ego_holding = self.ego_preempt_originated
+            && self.ego_active_frames > 0
+            && self.shift_frames <= self.config.ego_preempt_hold_frames;
+
+        if !ego_holding && self.shift_frames > grace && abs_dev < self.config.shift_end_threshold {
             let confirmed = self.shift_peak_offset >= self.config.shift_confirm_threshold
                 && self.shift_frames >= self.config.min_shift_frames;
 
@@ -713,6 +784,14 @@ impl LateralShiftDetector {
                     self.shift_frames,
                     self.config.min_shift_frames
                 );
+                // v4.10: Cooldown after ego-preempt rejection to prevent oscillation
+                if self.ego_preempt_originated {
+                    self.ego_preempt_cooldown = self.config.ego_preempt_cooldown_frames;
+                    debug!(
+                        "⏸️  Ego-preempt cooldown: {} frames after rejected shift",
+                        self.ego_preempt_cooldown,
+                    );
+                }
                 self.update_baseline(normalized);
                 self.state = State::Stable;
                 self.reset_shift();
@@ -866,12 +945,14 @@ impl LateralShiftDetector {
 
         info!(
             "✅ Lateral shift completed: {} | peak={:.1}% | dur={:.1}s | conf={:.2} | \
-             source={:?} | ego_cum={:.1}px | lane_frames={}",
+             source={:?} | ego_cum={:.1}px (peak={:.1}px) | lane_frames={}/{}",
             evt.direction.as_str(),
             evt.peak_offset * 100.0,
             evt.duration_ms / 1000.0,
             evt.confidence,
             self.shift_source,
+            self.ego_cumulative_px,
+            self.ego_cumulative_peak_px,
             self.shift_lane_frames,
             self.shift_frames,
         );
@@ -883,15 +964,26 @@ impl LateralShiftDetector {
 
     /// Validate shift direction using cumulative ego motion.
     /// Returns the validated direction.
+    /// v4.10: Uses peak cumulative (max absolute value during shift) instead of
+    /// final cumulative, because by shift end the vehicle has returned to its lane
+    /// and the cumulative has swung back toward zero or even the opposite direction.
     fn validate_final_direction(&self) -> ShiftDirection {
         let initial_dir = self.shift_direction.unwrap_or(ShiftDirection::Left);
 
+        // Use peak cumulative — this captures the direction when ego motion
+        // was strongest (during the actual lane change), not after return.
+        let cum = if self.ego_cumulative_peak_px.abs() > self.ego_cumulative_px.abs() {
+            self.ego_cumulative_peak_px
+        } else {
+            self.ego_cumulative_px
+        };
+
         // If we don't have enough ego data, trust the lane-based direction
-        if self.ego_cumulative_px.abs() < 15.0 {
+        if cum.abs() < 15.0 {
             return initial_dir;
         }
 
-        let ego_dir = if self.ego_cumulative_px < 0.0 {
+        let ego_dir = if cum < 0.0 {
             ShiftDirection::Left
         } else {
             ShiftDirection::Right
@@ -899,9 +991,10 @@ impl LateralShiftDetector {
 
         if ego_dir != initial_dir {
             warn!(
-                "🔄 Direction validation: initial={} ego={} (cum={:.1}px) → using {}",
+                "🔄 Direction validation: initial={} ego={} (peak_cum={:.1}px, final_cum={:.1}px) → using {}",
                 initial_dir.as_str(),
                 ego_dir.as_str(),
+                self.ego_cumulative_peak_px,
                 self.ego_cumulative_px,
                 ego_dir.as_str(),
             );
@@ -949,6 +1042,7 @@ impl LateralShiftDetector {
         self.offset_history.clear();
         self.cached_measurement = None;
         self.cached_measurement_age = 0;
+        self.ego_preempt_cooldown = 0;
         self.reset_shift();
     }
 
@@ -981,8 +1075,10 @@ impl LateralShiftDetector {
         self.shift_confidence_sum = 0.0;
         self.shift_lane_frames = 0;
         self.ego_cumulative_px = 0.0;
+        self.ego_cumulative_peak_px = 0.0;
         self.ego_bridge_frames = 0;
         self.ego_estimated_offset = 0.0;
+        self.ego_preempt_originated = false;
     }
 
     fn is_deviation_stable(&self) -> bool {
@@ -1300,9 +1396,11 @@ mod tests {
     fn test_ego_preempt_with_lanes_present() {
         // v4.10: Strong ego motion should start a shift even when lanes
         // are present but offset hasn't crossed the threshold yet.
+        // Requires ego velocity >= ego_preempt_min_velocity (higher bar).
         let cfg = LateralDetectorConfig {
             baseline_warmup_frames: 10,
             ego_motion_min_velocity: 1.5,
+            ego_preempt_min_velocity: 3.5,
             ego_shift_start_frames: 8,
             shift_start_threshold: 0.35, // mining threshold
             min_shift_frames: 5,
@@ -1317,7 +1415,7 @@ mod tests {
         }
         assert_eq!(det.state, State::Stable);
 
-        // Strong ego motion with lanes present but small offset (< 35%)
+        // Strong ego motion (above preempt threshold) with lanes present but small offset
         // Offset = -80px / 800px = 10% — below 35% threshold
         for i in 20..35 {
             det.update(meas(-80.0, w, 0.8), ego(-7.0), i as f64 * 33.3, i);
@@ -1326,6 +1424,172 @@ mod tests {
         // Should be shifting via ego-preempt despite offset < threshold
         assert_eq!(det.state, State::Shifting);
         assert_eq!(det.shift_direction, Some(ShiftDirection::Left));
+    }
+
+    #[test]
+    fn test_ego_preempt_rejected_weak_motion() {
+        // v4.10: Moderate ego motion below ego_preempt_min_velocity should
+        // NOT trigger ego-preempt when lanes are present. This prevents
+        // false triggers from road vibration / mild corrections.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            ego_motion_min_velocity: 1.5,
+            ego_preempt_min_velocity: 3.5,
+            ego_shift_start_frames: 8,
+            shift_start_threshold: 0.35,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+
+        // Moderate ego motion (above ego_motion_min but below preempt threshold)
+        for i in 20..40 {
+            det.update(meas(-50.0, w, 0.8), ego(-2.5), i as f64 * 33.3, i);
+        }
+
+        // Should NOT be shifting — ego too weak for preempt
+        assert_eq!(det.state, State::Stable);
+    }
+
+    #[test]
+    fn test_shift_end_grace_period() {
+        // v4.10: Shift should not be killed by shift_end_threshold during
+        // the grace period, giving lane offset time to develop after ego-preempt.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            ego_motion_min_velocity: 1.5,
+            ego_preempt_min_velocity: 3.5,
+            ego_shift_start_frames: 8,
+            shift_start_threshold: 0.35,
+            shift_end_threshold: 0.12,
+            shift_end_grace_frames: 15,
+            ego_preempt_hold_frames: 75,
+            min_shift_frames: 5,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+
+        // Ego-preempt starts shift
+        for i in 20..30 {
+            det.update(meas(-50.0, w, 0.8), ego(-5.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Shifting);
+
+        // Lane offset is small (6.25% < shift_end 12%) but within grace period
+        // — shift should survive
+        for i in 30..38 {
+            det.update(meas(-50.0, w, 0.8), ego(-5.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(
+            det.state,
+            State::Shifting,
+            "Shift should survive during grace period"
+        );
+    }
+
+    #[test]
+    fn test_ego_preempt_hold_keeps_shift_alive() {
+        // v4.10: Even after shift_end_grace expires, ego-preempt shift stays
+        // alive while ego is still active (ego_active_frames > 0) within the
+        // hold period. The shift only ends when ego stops OR hold expires.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            ego_motion_min_velocity: 1.5,
+            ego_preempt_min_velocity: 3.5,
+            ego_shift_start_frames: 8,
+            shift_start_threshold: 0.35,
+            shift_end_threshold: 0.12,
+            shift_end_grace_frames: 15,
+            ego_preempt_hold_frames: 75,
+            min_shift_frames: 5,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+
+        // Ego-preempt starts shift (8 frames sustained at -7.0)
+        for i in 20..30 {
+            det.update(meas(-50.0, w, 0.8), ego(-7.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Shifting);
+        assert!(det.ego_preempt_originated);
+
+        // Continue for 50 more frames with ego active + small lane offset
+        // This is PAST the 15-frame grace but WITHIN the 75-frame hold
+        // and ego is still active → shift must survive
+        for i in 30..80 {
+            det.update(meas(-60.0, w, 0.8), ego(-6.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(
+            det.state,
+            State::Shifting,
+            "Ego-preempt hold should keep shift alive while ego is active"
+        );
+    }
+
+    #[test]
+    fn test_ego_preempt_cooldown_prevents_oscillation() {
+        // v4.10: After an ego-preempt shift is rejected, cooldown prevents
+        // immediate re-triggering (the oscillation bug).
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            ego_motion_min_velocity: 1.5,
+            ego_preempt_min_velocity: 3.5,
+            ego_shift_start_frames: 8,
+            shift_start_threshold: 0.35,
+            shift_end_threshold: 0.12,
+            ego_preempt_hold_frames: 10, // Short hold for test
+            ego_preempt_cooldown_frames: 30,
+            min_shift_frames: 5,
+            shift_confirm_threshold: 0.30,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+
+        // Ego-preempt starts shift
+        for i in 20..30 {
+            det.update(meas(-30.0, w, 0.8), ego(-5.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Shifting);
+
+        // Ego stops → hold expires → shift rejected (peak < confirm threshold)
+        for i in 30..50 {
+            det.update(meas(-30.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable, "Shift should be rejected");
+        assert!(det.ego_preempt_cooldown > 0, "Cooldown should be active");
+
+        // Ego motion resumes but cooldown is active → should NOT re-trigger
+        for i in 50..65 {
+            det.update(meas(-30.0, w, 0.8), ego(-5.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(
+            det.state,
+            State::Stable,
+            "Ego-preempt should not fire during cooldown"
+        );
     }
 
     #[test]
