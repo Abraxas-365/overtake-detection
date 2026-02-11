@@ -534,45 +534,35 @@ impl VehicleTracker {
 
         // ══════════════════════════════════════════════════════════════════════
         // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 + v4.6 TENTATIVE RESCUE)
-        //
-        // v4.5: Rescue confirmed/lost tracks when IoU fails during geometric changes
-        // v4.6: ALSO rescue tentative tracks (stricter constraints) to help them confirm
-        //
-        // Without this, tentative tracks die after ~9 frames because intermittent
-        // IoU failures prevent them from accumulating 3 consecutive hits needed
-        // to reach confirmed state.
+        // v4.7: Increased thresholds for mining environment (dust + large vehicles)
         // ══════════════════════════════════════════════════════════════════════
         let max_dist_confirmed_px = self.frame_w * self.config.max_centroid_distance_ratio;
         let max_dist_confirmed_sq = max_dist_confirmed_px * max_dist_confirmed_px;
 
-        // Tentative tracks get STRICTER constraints (haven't proven themselves yet)
-        let max_dist_tentative_px = self.frame_w * 0.15; // 15% of frame width (~192px @ 1280w)
+        // v4.7: Tentative tracks now get SAME generous threshold as confirmed
+        // Rationale: They NEED help to confirm in harsh conditions
+        let max_dist_tentative_px = self.frame_w * 0.20; // Same as confirmed (256px @ 1280w)
         let max_dist_tentative_sq = max_dist_tentative_px * max_dist_tentative_px;
 
         let mut centroid_pairs: Vec<(usize, usize, f32)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
             if matched_track_indices[ti] {
-                continue; // Already matched via IoU
+                continue;
             }
 
-            // Determine constraints based on track state
-            let (max_allowed_dist_sq, max_coast_frames, state_name) = match track.state {
+            let (max_allowed_dist_sq, max_coast_frames) = match track.state {
                 TrackState::Confirmed | TrackState::Lost => {
-                    // Generous: these tracks have proven themselves
                     (
                         max_dist_confirmed_sq,
                         self.config.centroid_fallback_max_coast,
-                        "Confirmed/Lost",
-                    )
+                    ) // 10 frames
                 }
                 TrackState::Tentative => {
-                    // Strict: only rescue if JUST missed (1-3 frames) and nearby
-                    // This helps tentative tracks accumulate consecutive hits to confirm
-                    (max_dist_tentative_sq, 3, "Tentative")
+                    // v4.7: Increased from 3 to 8 frames to handle dust gaps
+                    (max_dist_tentative_sq, 8)
                 }
             };
 
-            // Skip tracks that coasted too long for their state
             if track.frames_since_hit > max_coast_frames {
                 continue;
             }
@@ -581,10 +571,9 @@ impl VehicleTracker {
 
             for (di, det) in valid.iter().enumerate() {
                 if matched_det_indices[di] {
-                    continue; // Detection already matched
+                    continue;
                 }
 
-                // Class ID must match (car can't become truck)
                 if track.class_id != det.class_id {
                     continue;
                 }
@@ -598,10 +587,8 @@ impl VehicleTracker {
             }
         }
 
-        // Sort by distance (nearest first) for greedy matching
         centroid_pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Greedy matching: assign nearest pairs first
         for (ti, di, dist_sq) in &centroid_pairs {
             if matched_track_indices[*ti] || matched_det_indices[*di] {
                 continue;
@@ -610,7 +597,7 @@ impl VehicleTracker {
             matched_det_indices[*di] = true;
 
             let track_state = self.tracks[*ti].state;
-            info!(
+            debug!(
                 "🔗 Centroid rescue: Track {} ({:?}) ↔ det (dist={:.0}px, class={}, IoU < {:.2})",
                 self.tracks[*ti].id,
                 track_state,
@@ -621,7 +608,6 @@ impl VehicleTracker {
 
             self.tracks[*ti].update_with_detection(valid[*di]);
         }
-
         // ══════════════════════════════════════════════════════════════════════
         // UNMATCHED TRACKS → COAST
         // ══════════════════════════════════════════════════════════════════════
