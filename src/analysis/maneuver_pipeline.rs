@@ -10,9 +10,15 @@
 // The existing PipelineState already populates it from YOLOv8-seg.
 // We receive it as a reference in ManeuverFrameInput so the classifier
 // can look up temporally-correct legality at the actual crossing frame.
+//
+// v4.4: Reordered steps so ego-motion is computed BEFORE lateral detection.
+//       This allows the lateral detector to use ego motion for bridging
+//       through lane detection dropout.
 
-use super::ego_motion::{EgoMotionConfig, EgoMotionEstimator, GrayFrame};
-use super::lateral_detector::{LaneMeasurement, LateralDetectorConfig, LateralShiftDetector};
+use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
+use super::lateral_detector::{
+    EgoMotionInput, LaneMeasurement, LateralDetectorConfig, LateralShiftDetector,
+};
 use super::maneuver_classifier::{
     ClassifierConfig, ManeuverClassifier, ManeuverEvent, MarkingSnapshot,
 };
@@ -101,6 +107,13 @@ impl ManeuverPipelineConfig {
                 baseline_warmup_frames: 25,
                 occlusion_reset_frames: 60,
                 post_reset_freeze_frames: 60,
+                // v4.4: ego-motion fusion for mining
+                ego_motion_min_velocity: 1.5,
+                ego_shift_start_frames: 8,
+                ego_bridge_max_frames: 120,
+                ego_px_per_norm_unit: 800.0,
+                ego_only_confidence_penalty: 0.20,
+                ego_shift_max_frames: 150,
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
@@ -132,6 +145,8 @@ pub struct ManeuverPipeline {
     classifier: ManeuverClassifier,
     enable_ego_motion: bool,
     frame_count: u64,
+    /// v4.4: Cached ego estimate from current frame, computed before lateral detection
+    last_ego_estimate: EgoMotionEstimate,
 }
 
 impl ManeuverPipeline {
@@ -148,6 +163,7 @@ impl ManeuverPipeline {
             classifier: ManeuverClassifier::new(config.classifier),
             enable_ego_motion: config.enable_ego_motion,
             frame_count: 0,
+            last_ego_estimate: EgoMotionEstimate::none(),
         }
     }
 
@@ -155,7 +171,9 @@ impl ManeuverPipeline {
     pub fn process_frame(&mut self, input: ManeuverFrameInput) -> ManeuverFrameOutput {
         self.frame_count += 1;
 
+        // ══════════════════════════════════════════════════════════════════
         // 1. VEHICLE TRACKING
+        // ══════════════════════════════════════════════════════════════════
         self.tracker
             .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
         let tracked_count = self.tracker.confirmed_count();
@@ -168,30 +186,19 @@ impl ManeuverPipeline {
             .pass_detector
             .update(&tracks, input.timestamp_ms, input.frame_id);
 
-        // ✅ FIX: Feed each detected pass to the classifier!
         for pass_event in pass_events {
             self.classifier.feed_pass(pass_event);
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // 3. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
-        // ══════════════════════════════════════════════════════════════════
-        let shift_event = self.lateral_detector.update(
-            input.lane_measurement,
-            self.build_ego_motion_input(), // ← new arg
-            input.timestamp_ms,
-            input.frame_id,
-        );
-        if let Some(ref shift) = shift_event {
-            self.classifier.feed_shift(shift.clone());
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // 4. EGO-MOTION ESTIMATION + FEED TO CLASSIFIER
+        // 3. EGO-MOTION ESTIMATION (moved BEFORE lateral detection)
+        //    v4.4: Must run first so lateral detector can use ego motion
+        //    to bridge through lane detection dropout.
         // ══════════════════════════════════════════════════════════════════
         let ego_velocity = if self.enable_ego_motion {
             if let Some(gray) = input.gray_frame {
                 let estimate = self.ego_motion.update(gray);
+                self.last_ego_estimate = estimate;
                 self.classifier.feed_ego_motion(estimate);
                 estimate.lateral_velocity_px
             } else {
@@ -200,6 +207,29 @@ impl ManeuverPipeline {
         } else {
             0.0
         };
+
+        // ══════════════════════════════════════════════════════════════════
+        // 4. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
+        //    v4.4: Now receives ego-motion input for fusion/bridging.
+        // ══════════════════════════════════════════════════════════════════
+        let ego_input = if self.enable_ego_motion {
+            Some(EgoMotionInput {
+                lateral_velocity: self.last_ego_estimate.lateral_velocity_px,
+                confidence: self.last_ego_estimate.confidence,
+            })
+        } else {
+            None
+        };
+
+        let shift_event = self.lateral_detector.update(
+            input.lane_measurement,
+            ego_input,
+            input.timestamp_ms,
+            input.frame_id,
+        );
+        if let Some(ref shift) = shift_event {
+            self.classifier.feed_shift(shift.clone());
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 5. ROAD MARKING UPDATE (for legality context)
@@ -213,7 +243,6 @@ impl ManeuverPipeline {
         // ══════════════════════════════════════════════════════════════════
         // 6. CLASSIFICATION / FUSION
         // ══════════════════════════════════════════════════════════════════
-        // Pass the existing legality buffer through for temporally-correct lookups
         let maneuver_events =
             self.classifier
                 .classify(input.timestamp_ms, input.frame_id, input.legality_buffer);
@@ -223,10 +252,11 @@ impl ManeuverPipeline {
         // ══════════════════════════════════════════════════════════════════
         if self.frame_count % 150 == 0 {
             info!(
-                "📊 Pipeline v2: tracks={} | passes={} | lateral={} | maneuvers={}",
+                "📊 Pipeline v2: tracks={} | passes={} | lateral={} | ego={:.2}px/f | maneuvers={}",
                 tracked_count,
                 self.pass_detector.total_passes(),
                 self.lateral_detector.state_str(),
+                ego_velocity,
                 self.classifier.total_maneuvers(),
             );
         }
@@ -260,5 +290,7 @@ impl ManeuverPipeline {
         self.ego_motion.reset();
         self.classifier.reset();
         self.frame_count = 0;
+        self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
+
