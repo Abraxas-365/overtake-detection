@@ -15,7 +15,7 @@ use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // CONFIGURATION
@@ -232,7 +232,7 @@ impl ManeuverClassifier {
         self.shift_buffer
             .retain(|s| timestamp_ms - s.event.end_ms < window);
 
-        info!(
+        debug!(
             "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
             timestamp_ms / 1000.0,
             self.pass_buffer.len(),
@@ -708,4 +708,3 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
     // have very high confidence AND the shift must be confirmed.
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
-
