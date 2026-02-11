@@ -348,6 +348,45 @@ impl LateralShiftDetector {
                         ego.lateral_velocity,
                     );
                 }
+                // ── v4.10: Ego-motion pre-empt with lanes present ───
+                // When lanes are present but offset hasn't crossed the
+                // threshold yet, strong sustained ego motion should still
+                // trigger a shift. This handles the case where the camera
+                // and lane markings move together initially during a lane
+                // change, keeping the lane offset small while the ego is
+                // clearly moving laterally.
+                else if self.ego_active_frames >= self.config.ego_shift_start_frames {
+                    let direction = if ego.lateral_velocity < 0.0 {
+                        ShiftDirection::Left
+                    } else {
+                        ShiftDirection::Right
+                    };
+
+                    // Use ego-estimated deviation as initial offset since
+                    // lane offset hasn't caught up yet
+                    let est_dev = ego.lateral_velocity.abs() / self.last_lane_width_px
+                        * self.ego_active_frames as f32;
+
+                    self.start_shift(
+                        direction,
+                        ShiftSource::EgoStarted,
+                        est_dev.max(abs_dev),
+                        meas.confidence,
+                        timestamp_ms,
+                        frame_id,
+                    );
+
+                    info!(
+                        "🔀🚀 Ego-preempt shift (lanes present): {} | lane_dev={:.1}% < threshold {:.1}% \
+                         | ego={:.2}px/f sustained {}f | est_dev={:.1}%",
+                        direction.as_str(),
+                        abs_dev * 100.0,
+                        self.config.shift_start_threshold * 100.0,
+                        ego.lateral_velocity,
+                        self.ego_active_frames,
+                        est_dev * 100.0,
+                    );
+                }
 
                 None
             }
@@ -1184,4 +1223,39 @@ mod tests {
         // Should go occluded, not shifting
         assert_ne!(det.state, State::Shifting);
     }
+
+    // ── v4.10 TESTS ─────────────────────────────────────────────
+
+    #[test]
+    fn test_ego_preempt_with_lanes_present() {
+        // v4.10: Strong ego motion should start a shift even when lanes
+        // are present but offset hasn't crossed the threshold yet.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            ego_motion_min_velocity: 1.5,
+            ego_shift_start_frames: 8,
+            shift_start_threshold: 0.35, // mining threshold
+            min_shift_frames: 5,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Strong ego motion with lanes present but small offset (< 35%)
+        // Offset = -80px / 800px = 10% — below 35% threshold
+        for i in 20..35 {
+            det.update(meas(-80.0, w, 0.8), ego(-7.0), i as f64 * 33.3, i);
+        }
+
+        // Should be shifting via ego-preempt despite offset < threshold
+        assert_eq!(det.state, State::Shifting);
+        assert_eq!(det.shift_direction, Some(ShiftDirection::Left));
+    }
 }
+
