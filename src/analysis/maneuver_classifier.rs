@@ -8,11 +8,25 @@
 //           If there's no lateral shift and no ego motion, the "pass"
 //           is almost certainly a zone misclassification.
 //
-// v4.8 FIX: Raised single-source confidence thresholds. Mining
-//           environments produce too many zone-jitter-induced passes
-//           that slip through at conf=0.25. Also added pass quality
-//           validation — single-source passes now require the pass
-//           event itself to have high enough confidence.
+// v4.8 FIX: Raised single-source confidence thresholds for mining.
+//           Added pass quality gate (min_pass_confidence_single_source).
+//
+// v4.10 FIX: Ego-motion-induced pass rejection (INVERSE ego-motion gate).
+//            When the ego vehicle is actively changing lanes, vehicles in
+//            the original lane appear to shift through zones (AHEAD →
+//            BESIDE → BEHIND) WITHOUT any actual longitudinal passing.
+//            This creates false EgoOvertook events.
+//
+//            The fix detects when ego lateral velocity is strong enough
+//            in the direction that would produce the observed pass side
+//            as an apparent artifact, and rejects the pass. Applied to
+//            both correlated (pass+shift) and uncorrelated paths.
+//
+//            Direction mapping:
+//              Ego moves LEFT  → vehicles appear to shift RIGHT
+//                → AHEAD→BESIDE_RIGHT → PassSide::Left (false EgoOvertook)
+//              Ego moves RIGHT → vehicles appear to shift LEFT
+//                → AHEAD→BESIDE_LEFT → PassSide::Right (false EgoOvertook)
 
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
@@ -42,31 +56,38 @@ pub struct ClassifierConfig {
     /// rejected as a zone misclassification.
     pub min_ego_motion_for_single_source: f32,
     /// v4.8: Minimum pass event confidence for single-source overtakes.
-    /// The pass_detector assigns confidence based on track quality;
-    /// single-source overtakes should only fire for high-quality passes.
     pub min_pass_confidence_single_source: f32,
+    /// v4.10: Minimum sustained ego lateral velocity (px/frame) above
+    /// which an EgoOvertook pass is rejected as ego-motion-induced.
+    /// When ego moves at this speed for enough frames, apparent zone
+    /// transitions are artifacts of the lane change, not real overtakes.
+    pub ego_induced_pass_velocity_threshold: f32,
+    /// v4.10: Minimum number of frames at or above the velocity threshold
+    /// to consider the ego lateral motion "sustained" (not just noise).
+    pub ego_induced_pass_min_sustained_frames: usize,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
             max_correlation_gap_ms: 50000.0,
-            min_single_source_confidence: 0.35, // v4.8: raised from 0.25
-            min_combined_confidence: 0.30,      // v4.8: raised from 0.25
+            min_single_source_confidence: 0.35,
+            min_combined_confidence: 0.30,
             ego_motion_threshold: 2.0,
             weight_pass: 0.60,
             weight_lateral: 0.25,
             weight_ego_motion: 0.15,
             correlation_window_ms: 60000.0,
             min_ego_motion_for_single_source: 1.0,
-            min_pass_confidence_single_source: 0.55, // v4.8: pass event must be decent
+            min_pass_confidence_single_source: 0.55,
+            ego_induced_pass_velocity_threshold: 3.0, // v4.10: 3 px/frame
+            ego_induced_pass_min_sustained_frames: 8, // v4.10: ~267ms at 30fps
         }
     }
 }
 
 impl ClassifierConfig {
-    /// Mining environment — more conservative single-source thresholds
-    /// due to frequent zone jitter from dust and large vehicles.
+    /// Mining environment — more conservative thresholds.
     pub fn mining() -> Self {
         Self {
             max_correlation_gap_ms: 50000.0,
@@ -79,6 +100,8 @@ impl ClassifierConfig {
             correlation_window_ms: 60000.0,
             min_ego_motion_for_single_source: 1.2,
             min_pass_confidence_single_source: 0.60,
+            ego_induced_pass_velocity_threshold: 2.5, // lower threshold in mining (dusty, noisy flow)
+            ego_induced_pass_min_sustained_frames: 6,
         }
     }
 }
@@ -299,6 +322,24 @@ impl ManeuverClassifier {
                 continue;
             }
 
+            // ══════════════════════════════════════════════════════
+            // v4.10: REJECT EGO-MOTION-INDUCED PASSES (pre-check)
+            //
+            // If ego's own lane change explains the apparent zone
+            // transition, this pass is an artifact — skip correlation
+            // so the shift event becomes a LANE_CHANGE instead.
+            // ══════════════════════════════════════════════════════
+            if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
+                warn!(
+                    "  ❌ REJECTED pass (track {}, side={:?}): ego lateral motion \
+                     explains apparent zone transition (ego lane change artifact)",
+                    self.pass_buffer[pass_idx].event.vehicle_track_id,
+                    self.pass_buffer[pass_idx].event.side,
+                );
+                self.pass_buffer[pass_idx].correlated = true; // consume it
+                continue;
+            }
+
             let mut best_shift_idx: Option<usize> = None;
             let mut best_time_gap = f64::MAX;
 
@@ -348,10 +389,11 @@ impl ManeuverClassifier {
         // ══════════════════════════════════════════════════════════════════
         // UNCORRELATED HIGH-CONFIDENCE PASSES → OVERTAKE
         //
-        // v4.3 FIX: Added ego-motion gate.
-        // v4.8 FIX: Added pass quality gate. The pass event itself must
-        //           have sufficient confidence (which encodes AHEAD duration,
-        //           track age, etc.) to prevent zone-jitter false positives.
+        // v4.3: Ego-motion gate (reject if NO ego motion)
+        // v4.8: Pass quality gate (min_pass_confidence_single_source)
+        // v4.10: Ego-induced gate already applied above (correlated check).
+        //        Re-check here for passes that weren't consumed by the
+        //        correlated path.
         // ══════════════════════════════════════════════════════════════════
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
@@ -373,25 +415,30 @@ impl ManeuverClassifier {
                 self.config.min_pass_confidence_single_source,
             );
 
+            // ── v4.10: Ego-motion-induced pass gate (redundant safety check) ──
+            // The pre-check above should have caught this, but if timing
+            // or buffer order caused it to slip through, catch it here.
+            if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
+                warn!(
+                    "  ❌ REJECTED single-source pass (track {}): ego lateral motion \
+                     explains apparent zone transition",
+                    self.pass_buffer[pass_idx].event.vehicle_track_id,
+                );
+                self.pass_buffer[pass_idx].correlated = true;
+                continue;
+            }
+
             // ── v4.8: Pass event quality gate ──
-            // The pass_detector's confidence encodes track quality
-            // (AHEAD duration, track age, detection confidence).
-            // For single-source overtakes (no corroborating lateral shift),
-            // we need the pass itself to be high-quality.
             if pass_conf < self.config.min_pass_confidence_single_source {
                 info!(
                     "  ❌ Pass conf too low for single-source: {:.2} < {:.2}",
                     pass_conf, self.config.min_pass_confidence_single_source
                 );
-                // Don't mark as correlated — might still correlate with a
-                // future lateral shift event.
                 continue;
             }
 
             if pass_conf >= self.config.min_single_source_confidence {
-                // ══════════════════════════════════════════════════════
-                // v4.3 EGO-MOTION GATE FOR SINGLE-SOURCE PASSES
-                // ══════════════════════════════════════════════════════
+                // ── v4.3 EGO-MOTION GATE (absence check) ──
                 let ego_confirms = self.ego_motion_confirms_lateral();
                 let had_any_lateral_shift = self.shift_buffer.iter().any(|s| !s.correlated);
 
@@ -711,6 +758,85 @@ impl ManeuverClassifier {
         peak >= self.config.ego_motion_threshold
     }
 
+    /// v4.10: Determine if ego's own lateral motion could create the
+    /// apparent zone transition that generated this EgoOvertook pass event.
+    ///
+    /// When the ego vehicle changes lanes, vehicles that were AHEAD in
+    /// the original lane appear to shift laterally through zones:
+    ///
+    ///   Ego moves LEFT (negative velocity):
+    ///     Ahead vehicle appears to shift RIGHT
+    ///     → AHEAD → BESIDE_RIGHT → BEHIND
+    ///     → PassSide::Left (ego "passed on left") ← false positive
+    ///
+    ///   Ego moves RIGHT (positive velocity):
+    ///     Ahead vehicle appears to shift LEFT
+    ///     → AHEAD → BESIDE_LEFT → BEHIND
+    ///     → PassSide::Right (ego "passed on right") ← false positive
+    ///
+    /// Returns true if ego lateral motion is sustained and strong enough
+    /// in the direction that would produce the observed pass side.
+    fn ego_motion_explains_pass(&self, pass: &PassEvent) -> bool {
+        // Only applies to EgoOvertook — VehicleOvertookEgo has opposite
+        // zone transition direction and is not affected.
+        if pass.direction != PassDirection::EgoOvertook {
+            return false;
+        }
+
+        if self.ego_motion_during_window.len() < 15 {
+            return false;
+        }
+
+        let threshold = self.config.ego_induced_pass_velocity_threshold;
+        let min_sustained = self.config.ego_induced_pass_min_sustained_frames;
+
+        // Examine ego motion over a window covering the pass.
+        // Use the last 90 samples (~3s at 30fps) to capture the lane
+        // change that produced the apparent zone transition.
+        let samples: Vec<f32> = self
+            .ego_motion_during_window
+            .iter()
+            .rev()
+            .take(90)
+            .copied()
+            .collect();
+
+        match pass.side {
+            PassSide::Left => {
+                // PassSide::Left means vehicle was BESIDE_RIGHT.
+                // Ego moving LEFT (negative velocity) would create this.
+                let sustained_left = samples.iter().filter(|&&v| v < -threshold).count();
+                let peak_left = samples.iter().fold(0.0f32, |a, &b| a.min(b));
+
+                if sustained_left >= min_sustained {
+                    info!(
+                        "  🔍 ego_motion_explains_pass: track={} side=Left | \
+                         ego moving LEFT: peak={:.2} px/f, sustained={}/{} frames → EXPLAINS pass",
+                        pass.vehicle_track_id, peak_left, sustained_left, min_sustained
+                    );
+                    return true;
+                }
+            }
+            PassSide::Right => {
+                // PassSide::Right means vehicle was BESIDE_LEFT.
+                // Ego moving RIGHT (positive velocity) would create this.
+                let sustained_right = samples.iter().filter(|&&v| v > threshold).count();
+                let peak_right = samples.iter().fold(0.0f32, |a, &b| a.max(b));
+
+                if sustained_right >= min_sustained {
+                    info!(
+                        "  🔍 ego_motion_explains_pass: track={} side=Right | \
+                         ego moving RIGHT: peak={:.2} px/f, sustained={}/{} frames → EXPLAINS pass",
+                        pass.vehicle_track_id, peak_right, sustained_right, min_sustained
+                    );
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn recent_events(&self) -> &[ManeuverEvent] {
         &self.recent_events
     }
@@ -750,7 +876,5 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
         (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
     );
 
-    // v4.3: Tightened lenient matching — require strict match OR very high
-    // confidence pass with confirmed shift.
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
