@@ -12,6 +12,8 @@
 //
 // v4.3 FIX: Zone hysteresis to prevent large AHEAD vehicles from
 //           flickering into BESIDE due to bbox jitter or camera offset.
+// v4.5 FIX: Hybrid matching (IoU + centroid distance) to maintain track
+//           continuity during extreme geometric transformations (overtakes).
 
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
@@ -34,6 +36,10 @@ pub struct TrackerConfig {
     pub vehicle_class_ids: Vec<u32>,
     /// Zone geometry — ratio thresholds relative to frame dimensions
     pub zone: ZoneConfig,
+    /// Maximum centroid distance (as fraction of frame width) for fallback matching
+    pub max_centroid_distance_ratio: f32,
+    /// Maximum frames since last hit for centroid fallback to apply
+    pub centroid_fallback_max_coast: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +65,8 @@ impl Default for TrackerConfig {
             min_confidence: 0.20,
             vehicle_class_ids: vec![2, 3, 5, 7],
             zone: ZoneConfig::default(),
+            max_centroid_distance_ratio: 0.20, // 20% of frame width (generous for mining)
+            centroid_fallback_max_coast: 10,   // Only rescue recently-lost tracks
         }
     }
 }
@@ -498,48 +506,138 @@ impl VehicleTracker {
             })
             .collect();
 
-        // ── MATCHING ────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 1: IoU-BASED MATCHING (PRIMARY)
+        // ══════════════════════════════════════════════════════════════════════
         let mut matched_track_indices: Vec<bool> = vec![false; self.tracks.len()];
         let mut matched_det_indices: Vec<bool> = vec![false; valid.len()];
 
-        let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
+        let mut iou_pairs: Vec<(usize, usize, f32)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
             for (di, det) in valid.iter().enumerate() {
                 let score = iou(&track.bbox, &det.bbox);
                 if score >= self.config.min_iou {
-                    pairs.push((ti, di, score));
+                    iou_pairs.push((ti, di, score));
                 }
             }
         }
-        pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        iou_pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (ti, di, _score) in &pairs {
+        for (ti, di, _score) in &iou_pairs {
+            if matched_track_indices[*ti] || matched_det_indices[*di] {
+                continue;
+            }
+            matched_track_indices[*ti] = true;
+            matched_det_indices[*di] = true;
+            self.tracks[*ti].update_with_detection(valid[*di]);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 FIX)
+        //
+        // When IoU fails due to extreme geometric transformations (e.g., mining
+        // truck bbox growing 6x as it approaches), use spatial proximity as a
+        // fallback for confirmed/recently-lost tracks.
+        //
+        // This prevents track churn during overtakes where the same vehicle is
+        // continuously detected but IoU drops below threshold, causing the old
+        // track to die and new tentative tracks to spawn repeatedly.
+        // ══════════════════════════════════════════════════════════════════════
+        let max_dist_px = self.frame_w * self.config.max_centroid_distance_ratio;
+        let max_dist_sq = max_dist_px * max_dist_px;
+
+        let mut centroid_pairs: Vec<(usize, usize, f32)> = Vec::new();
+        for (ti, track) in self.tracks.iter().enumerate() {
+            if matched_track_indices[ti] {
+                continue; // Already matched via IoU
+            }
+
+            // Only rescue confirmed or recently-lost tracks (not tentative)
+            // Tentative tracks should naturally expire if IoU fails — they haven't
+            // proven themselves yet
+            if track.state == TrackState::Tentative {
+                continue;
+            }
+
+            // Only rescue tracks lost in the last N frames (prevent stale matches)
+            if track.frames_since_hit > self.config.centroid_fallback_max_coast {
+                continue;
+            }
+
+            let (tcx, tcy) = track.center();
+
+            for (di, det) in valid.iter().enumerate() {
+                if matched_det_indices[di] {
+                    continue; // Detection already matched
+                }
+
+                // Class ID must match (car can't become truck)
+                if track.class_id != det.class_id {
+                    continue;
+                }
+
+                let (dcx, dcy) = det.center();
+                let dist_sq = (tcx - dcx).powi(2) + (tcy - dcy).powi(2);
+
+                if dist_sq < max_dist_sq {
+                    centroid_pairs.push((ti, di, dist_sq));
+                }
+            }
+        }
+
+        // Sort by distance (nearest first)
+        centroid_pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Greedy matching: assign nearest pairs first
+        for (ti, di, dist_sq) in &centroid_pairs {
             if matched_track_indices[*ti] || matched_det_indices[*di] {
                 continue;
             }
             matched_track_indices[*ti] = true;
             matched_det_indices[*di] = true;
 
+            debug!(
+                "🔗 Centroid rescue: Track {} ↔ det (dist={:.0}px, class={}, IoU was below threshold)",
+                self.tracks[*ti].id,
+                dist_sq.sqrt(),
+                self.tracks[*ti].class_id
+            );
+
             self.tracks[*ti].update_with_detection(valid[*di]);
         }
 
-        // ── UNMATCHED TRACKS → COAST ────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        // UNMATCHED TRACKS → COAST
+        // ══════════════════════════════════════════════════════════════════════
         for (ti, matched) in matched_track_indices.iter().enumerate() {
             if !matched {
                 self.tracks[ti].mark_missed();
             }
         }
 
-        // ── UNMATCHED DETECTIONS → NEW TRACKS ───────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        // UNMATCHED DETECTIONS → NEW TRACKS
+        // ══════════════════════════════════════════════════════════════════════
         for (di, matched) in matched_det_indices.iter().enumerate() {
             if !matched {
                 let track = Track::new(self.next_id, valid[di], timestamp_ms, frame_id);
+                debug!(
+                    "🆕 New track T{} created: class={}, bbox=[{:.0},{:.0},{:.0},{:.0}]",
+                    self.next_id,
+                    track.class_id,
+                    track.bbox[0],
+                    track.bbox[1],
+                    track.bbox[2],
+                    track.bbox[3]
+                );
                 self.next_id += 1;
                 self.tracks.push(track);
             }
         }
 
-        // ── ZONE ASSIGNMENT ─────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        // ZONE ASSIGNMENT
+        // ══════════════════════════════════════════════════════════════════════
         let zone_cfg = self.config.zone.clone();
         let (fw, fh) = (self.frame_w, self.frame_h);
         for track in &mut self.tracks {
@@ -548,7 +646,9 @@ impl VehicleTracker {
             }
         }
 
-        // ── PRUNE DEAD TRACKS ───────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════════
+        // PRUNE DEAD TRACKS
+        // ══════════════════════════════════════════════════════════════════════
         let max_coast = self.config.max_coast_frames;
         let min_hits = self.config.min_hits_to_confirm;
         self.tracks.retain(|t| {
@@ -560,6 +660,10 @@ impl VehicleTracker {
                 return false;
             }
             if t.state == TrackState::Tentative && t.age > min_hits * 3 {
+                debug!(
+                    "🗑️  Track {} pruned (tentative too long: age={})",
+                    t.id, t.age
+                );
                 return false;
             }
             true
@@ -589,6 +693,10 @@ impl VehicleTracker {
         self.next_id = 1;
     }
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -633,6 +741,38 @@ mod tests {
     }
 
     #[test]
+    fn test_centroid_fallback_rescues_track() {
+        // v4.5: Track should survive extreme bbox transformation via centroid fallback
+        let cfg = TrackerConfig::default();
+        let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
+
+        // Frame 1-3: Normal progression, track confirms
+        for i in 1..=3 {
+            let dets = vec![det(500.0, 200.0, 600.0, 300.0)];
+            tracker.update(&dets, i as f64 * 33.3, i);
+        }
+        assert_eq!(tracker.confirmed_count(), 1);
+        let track_id = tracker.all_tracks()[0].id;
+
+        // Frame 4: Extreme bbox change (simulating close approach)
+        // IoU will be very low, but centroid is close (~100px)
+        let dets = vec![det(550.0, 250.0, 1100.0, 600.0)];
+        tracker.update(&dets, 4.0 * 33.3, 4);
+
+        // Track should still exist with same ID (rescued by centroid fallback)
+        assert_eq!(
+            tracker.confirmed_count(),
+            1,
+            "Track should survive via centroid fallback"
+        );
+        assert_eq!(
+            tracker.all_tracks()[0].id,
+            track_id,
+            "Track ID should not change"
+        );
+    }
+
+    #[test]
     fn test_zone_assignment_ahead() {
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
@@ -646,7 +786,6 @@ mod tests {
 
     #[test]
     fn test_zone_hysteresis_prevents_flicker() {
-        // A large truck slightly offset should NOT immediately become BESIDE
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
@@ -713,13 +852,10 @@ mod tests {
 
     #[test]
     fn test_large_truck_stays_ahead() {
-        // v4.3 FIX: A truck with height_ratio=0.30 should be AHEAD
-        // (previously only caught at 0.35)
         let cfg = TrackerConfig::default();
         let mut tracker = VehicleTracker::new(cfg, 1280.0, 720.0);
 
         // Truck: 800x216 bbox (height_ratio = 216/720 = 0.30, area_ratio = 0.187)
-        // Center at x=700 (slightly right of center 640)
         let dets = vec![det(300.0, 250.0, 1100.0, 466.0)];
         for i in 0..10 {
             tracker.update(&dets, i as f64 * 33.3, i as u64);
