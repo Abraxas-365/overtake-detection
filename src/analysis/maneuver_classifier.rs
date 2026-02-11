@@ -7,6 +7,12 @@
 //           A real overtake REQUIRES the ego vehicle to move laterally.
 //           If there's no lateral shift and no ego motion, the "pass"
 //           is almost certainly a zone misclassification.
+//
+// v4.8 FIX: Raised single-source confidence thresholds. Mining
+//           environments produce too many zone-jitter-induced passes
+//           that slip through at conf=0.25. Also added pass quality
+//           validation — single-source passes now require the pass
+//           event itself to have high enough confidence.
 
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
@@ -35,20 +41,44 @@ pub struct ClassifierConfig {
     /// single-source (tracking-only) passes. Below this, the pass is
     /// rejected as a zone misclassification.
     pub min_ego_motion_for_single_source: f32,
+    /// v4.8: Minimum pass event confidence for single-source overtakes.
+    /// The pass_detector assigns confidence based on track quality;
+    /// single-source overtakes should only fire for high-quality passes.
+    pub min_pass_confidence_single_source: f32,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
             max_correlation_gap_ms: 50000.0,
-            min_single_source_confidence: 0.25,
-            min_combined_confidence: 0.25,
+            min_single_source_confidence: 0.35, // v4.8: raised from 0.25
+            min_combined_confidence: 0.30,      // v4.8: raised from 0.25
             ego_motion_threshold: 2.0,
             weight_pass: 0.60,
             weight_lateral: 0.25,
             weight_ego_motion: 0.15,
             correlation_window_ms: 60000.0,
             min_ego_motion_for_single_source: 1.0,
+            min_pass_confidence_single_source: 0.55, // v4.8: pass event must be decent
+        }
+    }
+}
+
+impl ClassifierConfig {
+    /// Mining environment — more conservative single-source thresholds
+    /// due to frequent zone jitter from dust and large vehicles.
+    pub fn mining() -> Self {
+        Self {
+            max_correlation_gap_ms: 50000.0,
+            min_single_source_confidence: 0.40,
+            min_combined_confidence: 0.35,
+            ego_motion_threshold: 2.0,
+            weight_pass: 0.60,
+            weight_lateral: 0.25,
+            weight_ego_motion: 0.15,
+            correlation_window_ms: 60000.0,
+            min_ego_motion_for_single_source: 1.2,
+            min_pass_confidence_single_source: 0.60,
         }
     }
 }
@@ -318,9 +348,10 @@ impl ManeuverClassifier {
         // ══════════════════════════════════════════════════════════════════
         // UNCORRELATED HIGH-CONFIDENCE PASSES → OVERTAKE
         //
-        // v4.3 FIX: Added ego-motion gate. Single-source passes (tracking
-        // only, no lateral shift) MUST have some ego lateral motion.
-        // Without this, zone misclassifications fire as false overtakes.
+        // v4.3 FIX: Added ego-motion gate.
+        // v4.8 FIX: Added pass quality gate. The pass event itself must
+        //           have sufficient confidence (which encodes AHEAD duration,
+        //           track age, etc.) to prevent zone-jitter false positives.
         // ══════════════════════════════════════════════════════════════════
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
@@ -333,12 +364,29 @@ impl ManeuverClassifier {
             let pass_conf = self.pass_buffer[pass_idx].event.confidence;
 
             info!(
-                "🔍 Checking single-source pass: track={} side={:?} conf={:.2} (min={:.2})",
+                "🔍 Checking single-source pass: track={} side={:?} conf={:.2} \
+                 (min_single={:.2}, min_pass_conf={:.2})",
                 self.pass_buffer[pass_idx].event.vehicle_track_id,
                 self.pass_buffer[pass_idx].event.side,
                 pass_conf,
-                self.config.min_single_source_confidence
+                self.config.min_single_source_confidence,
+                self.config.min_pass_confidence_single_source,
             );
+
+            // ── v4.8: Pass event quality gate ──
+            // The pass_detector's confidence encodes track quality
+            // (AHEAD duration, track age, detection confidence).
+            // For single-source overtakes (no corroborating lateral shift),
+            // we need the pass itself to be high-quality.
+            if pass_conf < self.config.min_pass_confidence_single_source {
+                info!(
+                    "  ❌ Pass conf too low for single-source: {:.2} < {:.2}",
+                    pass_conf, self.config.min_pass_confidence_single_source
+                );
+                // Don't mark as correlated — might still correlate with a
+                // future lateral shift event.
+                continue;
+            }
 
             if pass_conf >= self.config.min_single_source_confidence {
                 // ══════════════════════════════════════════════════════
@@ -697,14 +745,13 @@ fn temporal_gap(start_a: f64, end_a: f64, start_b: f64, end_b: f64) -> f64 {
 }
 
 fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
-    // Strict matching (preferred)
     let strict_match = matches!(
         (pass.side, shift.direction),
         (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
     );
 
-    // v4.3: Tightened lenient matching. Previously accepted any high-confidence
-    // pass with any shift direction. Now require strict match OR the pass must
-    // have very high confidence AND the shift must be confirmed.
+    // v4.3: Tightened lenient matching — require strict match OR very high
+    // confidence pass with confirmed shift.
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
+
