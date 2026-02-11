@@ -178,6 +178,7 @@ impl ManeuverPipeline {
         // ══════════════════════════════════════════════════════════════════
         let shift_event = self.lateral_detector.update(
             input.lane_measurement,
+            self.build_ego_motion_input(), // ← new arg
             input.timestamp_ms,
             input.frame_id,
         );
@@ -261,4 +262,3 @@ impl ManeuverPipeline {
         self.frame_count = 0;
     }
 }
-
