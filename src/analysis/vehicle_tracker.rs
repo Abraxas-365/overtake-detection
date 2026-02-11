@@ -464,7 +464,7 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 // ============================================================================
 
 pub struct VehicleTracker {
-    config: TrackerConfig,
+    pub config: TrackerConfig,
     tracks: Vec<Track>,
     next_id: u32,
     frame_w: f32,
@@ -731,4 +731,3 @@ mod tests {
         );
     }
 }
-

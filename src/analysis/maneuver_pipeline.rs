@@ -138,15 +138,15 @@ impl ManeuverPipelineConfig {
 // ============================================================================
 
 pub struct ManeuverPipeline {
-    tracker: VehicleTracker,
+    pub tracker: VehicleTracker,
     pass_detector: PassDetector,
     lateral_detector: LateralShiftDetector,
     ego_motion: EgoMotionEstimator,
     classifier: ManeuverClassifier,
     enable_ego_motion: bool,
     frame_count: u64,
-    /// v4.4: Cached ego estimate from current frame, computed before lateral detection
     last_ego_estimate: EgoMotionEstimate,
+    last_tracked_count: usize, // 🆕 Add this
 }
 
 impl ManeuverPipeline {
@@ -164,6 +164,7 @@ impl ManeuverPipeline {
             enable_ego_motion: config.enable_ego_motion,
             frame_count: 0,
             last_ego_estimate: EgoMotionEstimate::none(),
+            last_tracked_count: 0, // 🆕 Initialize to 0
         }
     }
 
@@ -172,12 +173,41 @@ impl ManeuverPipeline {
         self.frame_count += 1;
 
         // ══════════════════════════════════════════════════════════════════
+        // 🆕 DIAGNOSTIC: Count raw detections before filtering
+        // ══════════════════════════════════════════════════════════════════
+        let raw_det_count = input.vehicle_detections.len();
+
+        // Count valid detections (would pass tracker's filters)
+        // This replicates the filtering logic from VehicleTracker::update()
+        let valid_det_count = input
+            .vehicle_detections
+            .iter()
+            .filter(|d| {
+                d.confidence >= self.tracker.config.min_confidence
+                    && self.tracker.config.vehicle_class_ids.contains(&d.class_id)
+            })
+            .count();
+
+        // ══════════════════════════════════════════════════════════════════
         // 1. VEHICLE TRACKING
         // ══════════════════════════════════════════════════════════════════
         self.tracker
             .update(input.vehicle_detections, input.timestamp_ms, input.frame_id);
         let tracked_count = self.tracker.confirmed_count();
         let tracks = self.tracker.confirmed_tracks();
+
+        // 🆕 DIAGNOSTIC: Track IDs and zones
+        let track_info: Vec<String> = tracks
+            .iter()
+            .map(|t| format!("T{}:{}", t.id, t.zone.as_str()))
+            .collect();
+
+        // 🆕 DIAGNOSTIC: Class ID distribution in raw detections
+        let mut class_counts: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for det in input.vehicle_detections {
+            *class_counts.entry(det.class_id).or_default() += 1;
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 2. PASS DETECTION + FEED TO CLASSIFIER
@@ -248,17 +278,55 @@ impl ManeuverPipeline {
                 .classify(input.timestamp_ms, input.frame_id, input.legality_buffer);
 
         // ══════════════════════════════════════════════════════════════════
-        // 7. PERIODIC DIAGNOSTICS
+        // 7. PERIODIC DIAGNOSTICS (ENHANCED)
         // ══════════════════════════════════════════════════════════════════
+
+        // 🆕 Always log critical tracking failures
+        if raw_det_count > 0 && tracked_count == 0 {
+            warn!(
+            "⚠️  F{}: TRACKING FAILURE | raw_dets={} | valid_dets={} | tracks={} | classes={:?}",
+            self.frame_count,
+            raw_det_count,
+            valid_det_count,
+            tracked_count,
+            class_counts,
+        );
+        }
+
+        // 🆕 Enhanced periodic diagnostics
         if self.frame_count % 150 == 0 {
             info!(
-                "📊 Pipeline v2: tracks={} | passes={} | lateral={} | ego={:.2}px/f | maneuvers={}",
-                tracked_count,
-                self.pass_detector.total_passes(),
-                self.lateral_detector.state_str(),
-                ego_velocity,
-                self.classifier.total_maneuvers(),
-            );
+            "📊 Pipeline v2 (F{}): raw_dets={} | valid_dets={} | tracks={} [{}] | passes={} | lateral={} | ego={:.2}px/f | maneuvers={}",
+            self.frame_count,
+            raw_det_count,
+            valid_det_count,
+            tracked_count,
+            track_info.join(", "),
+            self.pass_detector.total_passes(),
+            self.lateral_detector.state_str(),
+            ego_velocity,
+            self.classifier.total_maneuvers(),
+        );
+
+            if !class_counts.is_empty() {
+                info!("    └─ Class distribution: {:?}", class_counts);
+            }
+        }
+
+        // 🆕 Log when tracks appear/disappear
+        if tracked_count != self.last_tracked_count {
+            if tracked_count > self.last_tracked_count {
+                info!(
+                    "✅ F{}: Tracks increased {} → {} | new tracks: {:?}",
+                    self.frame_count, self.last_tracked_count, tracked_count, track_info,
+                );
+            } else {
+                warn!(
+                    "❌ F{}: Tracks decreased {} → {} | remaining: {:?}",
+                    self.frame_count, self.last_tracked_count, tracked_count, track_info,
+                );
+            }
+            self.last_tracked_count = tracked_count;
         }
 
         ManeuverFrameOutput {
@@ -293,4 +361,3 @@ impl ManeuverPipeline {
         self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
-
