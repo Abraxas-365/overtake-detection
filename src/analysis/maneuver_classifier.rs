@@ -754,4 +754,3 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
     // confidence pass with confirmed shift.
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
-
