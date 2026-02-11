@@ -536,12 +536,14 @@ impl VehicleTracker {
         // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.5 + v4.6 TENTATIVE RESCUE)
         // v4.7: Increased thresholds for mining environment (dust + large vehicles)
         // ══════════════════════════════════════════════════════════════════════
-        let max_dist_confirmed_px = self.frame_w * self.config.max_centroid_distance_ratio;
+        // ══════════════════// ══════════════════════════════════════════════════════════════════════
+        // PHASE 2: CENTROID-DISTANCE FALLBACK (v4.7 FINAL - Mining Environment)
+        // ══════════════════════════════════════════════════════════════════════
+        // v4.7: Extremely generous for dust/large vehicles/long gaps
+        let max_dist_confirmed_px = self.frame_w * 0.30; // 30% = 384px @ 1280w (was 20%)
         let max_dist_confirmed_sq = max_dist_confirmed_px * max_dist_confirmed_px;
 
-        // v4.7: Tentative tracks now get SAME generous threshold as confirmed
-        // Rationale: They NEED help to confirm in harsh conditions
-        let max_dist_tentative_px = self.frame_w * 0.20; // Same as confirmed (256px @ 1280w)
+        let max_dist_tentative_px = self.frame_w * 0.25; // 25% = 320px (was 20%)
         let max_dist_tentative_sq = max_dist_tentative_px * max_dist_tentative_px;
 
         let mut centroid_pairs: Vec<(usize, usize, f32)> = Vec::new();
@@ -552,14 +554,11 @@ impl VehicleTracker {
 
             let (max_allowed_dist_sq, max_coast_frames) = match track.state {
                 TrackState::Confirmed | TrackState::Lost => {
-                    (
-                        max_dist_confirmed_sq,
-                        self.config.centroid_fallback_max_coast,
-                    ) // 10 frames
+                    // Lost tracks need VERY generous limits - they've coasted 6-10 frames already
+                    (max_dist_confirmed_sq, 15) // Was 10
                 }
                 TrackState::Tentative => {
-                    // v4.7: Increased from 3 to 8 frames to handle dust gaps
-                    (max_dist_tentative_sq, 8)
+                    (max_dist_tentative_sq, 10) // Was 8
                 }
             };
 
@@ -608,7 +607,7 @@ impl VehicleTracker {
 
             self.tracks[*ti].update_with_detection(valid[*di]);
         }
-        // ══════════════════════════════════════════════════════════════════════
+        //════════════════════════════════════════════════════
         // UNMATCHED TRACKS → COAST
         // ══════════════════════════════════════════════════════════════════════
         for (ti, matched) in matched_track_indices.iter().enumerate() {
