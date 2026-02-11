@@ -157,7 +157,9 @@ impl ManeuverPipeline {
     pub fn with_config(config: ManeuverPipelineConfig, frame_w: f32, frame_h: f32) -> Self {
         Self {
             tracker: VehicleTracker::new(config.tracker, frame_w, frame_h),
-            pass_detector: PassDetector::new(config.pass_detector),
+
+            pass_detector: PassDetector::new(config.pass_detector, frame_h),
+
             lateral_detector: LateralShiftDetector::new(config.lateral_detector),
             ego_motion: EgoMotionEstimator::new(config.ego_motion),
             classifier: ManeuverClassifier::new(config.classifier),
