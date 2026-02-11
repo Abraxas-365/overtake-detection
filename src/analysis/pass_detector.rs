@@ -72,6 +72,13 @@ pub struct PassDetectorConfig {
     /// qualifies for reverse-pass (VehicleOvertookEgo from behind).
     /// Filters out brief BEHIND zone flicker.
     pub min_behind_frames_for_reverse: u32,
+    /// v4.10: Minimum track age (frames) before BESIDE observations are
+    /// counted for VehicleOvertookEgo. New tracks have unstable zone
+    /// assignments during Kalman filter warmup — a truck appearing AHEAD
+    /// may briefly register as BESIDE_LEFT in its first 2-3 frames.
+    /// This gate prevents those initial misclassifications from seeding
+    /// a false VehicleOvertookEgo sequence.
+    pub min_track_age_for_beside_overtook: u32,
 }
 
 impl Default for PassDetectorConfig {
@@ -89,7 +96,8 @@ impl Default for PassDetectorConfig {
             min_ahead_after_beside_frames: 15,
             min_beside_duration_overtook_ego_ms: 1500.0,
             min_beside_height_ratio_overtook_ego: 0.15, // v4.10: 15% of frame height
-            min_behind_frames_for_reverse: 5, // v4.9b: ~167ms at 30fps
+            min_behind_frames_for_reverse: 5,           // v4.9b: ~167ms at 30fps
+            min_track_age_for_beside_overtook: 5,       // v4.10: ~167ms warmup
         }
     }
 }
@@ -111,6 +119,7 @@ impl PassDetectorConfig {
             min_beside_duration_overtook_ego_ms: 2000.0,
             min_beside_height_ratio_overtook_ego: 0.18, // v4.10: 18% for mining (larger vehicles)
             min_behind_frames_for_reverse: 8,
+            min_track_age_for_beside_overtook: 8, // v4.10: ~267ms warmup for mining
         }
     }
 }
@@ -177,6 +186,10 @@ struct PendingPass {
     /// Used to reject VehicleOvertookEgo for distant/oncoming vehicles
     /// that were never actually alongside the ego vehicle.
     peak_beside_height_ratio: f32,
+    /// v4.10: Track age (frames) when BESIDE was first observed.
+    /// Used to reject VehicleOvertookEgo when the first BESIDE occurred
+    /// during track warmup (unstable bbox/zone assignment).
+    first_beside_track_age: Option<u32>,
     had_ahead: bool,
     beside_confirmed: bool,
     frames_since_beside: u32,
@@ -196,7 +209,6 @@ struct PendingPass {
     overtook_ego_confirmed: bool,
 
     // ── v4.9b: Reverse-pass tracking (BEHIND → BESIDE → AHEAD) ──
-
     /// Set true after the BEHIND handler's first EgoOvertook attempt.
     /// Prevents the handler from re-firing on every subsequent BEHIND
     /// frame, which inflated beside_duration and caused false positives
@@ -242,6 +254,7 @@ impl PendingPass {
             beside_consecutive: 0,
             peak_beside_area: 0.0,
             peak_beside_height_ratio: 0.0,
+            first_beside_track_age: None,
             had_ahead: false,
             beside_confirmed: false,
             frames_since_beside: 0,
@@ -296,7 +309,11 @@ impl PassDetector {
             completed_ids: HashSet::new(),
             recent_events: Vec::new(),
             rejected_disappeared_logged: HashSet::new(),
-            frame_height: if frame_height > 0.0 { frame_height } else { 720.0 },
+            frame_height: if frame_height > 0.0 {
+                frame_height
+            } else {
+                720.0
+            },
         }
     }
 
@@ -365,7 +382,11 @@ impl PassDetector {
                                 "📍 Track {} AHEAD-after-BESIDE streak started at F{}{}",
                                 track.id,
                                 frame_id,
-                                if pending.came_from_behind { " (reverse-pass)" } else { "" }
+                                if pending.came_from_behind {
+                                    " (reverse-pass)"
+                                } else {
+                                    ""
+                                }
                             );
                         }
 
@@ -378,20 +399,22 @@ impl PassDetector {
                             info!(
                                 "✅ Track {} VehicleOvertookEgo confirmed: \
                                  {} consecutive AHEAD frames after BESIDE (threshold={}) \
-                                 peak_height_ratio={:.2} (min={:.2}){}",
+                                 peak_height_ratio={:.2} (min={:.2}) \
+                                 beside_at_age={:?} (min={}){}",
                                 track.id,
                                 pending.ahead_consecutive_after_beside,
                                 self.config.min_ahead_after_beside_frames,
                                 pending.peak_beside_height_ratio,
                                 self.config.min_beside_height_ratio_overtook_ego,
+                                pending.first_beside_track_age,
+                                self.config.min_track_age_for_beside_overtook,
                                 if pending.came_from_behind {
                                     " [BEHIND→BESIDE→AHEAD reverse-pass]"
                                 } else {
                                     ""
                                 }
                             );
-                            tracks_to_check_overtook_ego
-                                .push((track.id, (*track).clone()));
+                            tracks_to_check_overtook_ego.push((track.id, (*track).clone()));
                         }
                     }
 
@@ -412,9 +435,8 @@ impl PassDetector {
                     // If the track was just in BEHIND (with enough consecutive
                     // frames to not be jitter), this BESIDE phase is a reverse-
                     // pass candidate: the vehicle is emerging from behind.
-                    let is_transition_from_behind =
-                        pending.last_zone == Some(VehicleZone::Behind)
-                            && pending.behind_consecutive >= self.config.min_behind_frames_for_reverse;
+                    let is_transition_from_behind = pending.last_zone == Some(VehicleZone::Behind)
+                        && pending.behind_consecutive >= self.config.min_behind_frames_for_reverse;
 
                     if is_transition_from_behind && !pending.came_from_behind {
                         pending.came_from_behind = true;
@@ -447,6 +469,7 @@ impl PassDetector {
                         pending.current_beside_phase_start_frame = Some(frame_id);
                         pending.ever_beside = true;
                         pending.beside_ordering_locked = true;
+                        pending.first_beside_track_age = Some(track.age); // v4.10
 
                         if pending.ahead_before_beside {
                             info!(
@@ -677,7 +700,9 @@ impl PassDetector {
                     if first_rejection {
                         warn!(
                             "❌ Track {} rejected: beside_dur={:.0}ms < {:.0}ms min",
-                            track_id, beside_duration, self.config.min_beside_duration_disappeared_ms
+                            track_id,
+                            beside_duration,
+                            self.config.min_beside_duration_disappeared_ms
                         );
                         self.rejected_disappeared_logged.insert(track_id);
                     }
@@ -783,9 +808,7 @@ impl PassDetector {
                     debug!(
                         "❌ Pass rejected (track {}): not a VehicleOvertookEgo candidate \
                          (ahead_before_beside={}, came_from_behind={})",
-                        pending.track_id,
-                        pending.ahead_before_beside,
-                        pending.came_from_behind
+                        pending.track_id, pending.ahead_before_beside, pending.came_from_behind
                     );
                     return None;
                 }
@@ -817,6 +840,23 @@ impl PassDetector {
                     );
                     return None;
                 }
+                // v4.10: Track warmup gate — if the first BESIDE observation
+                // happened during Kalman filter warmup (first few frames of
+                // the track's life), the zone was likely misclassified.
+                // A truck appearing AHEAD often registers as BESIDE_LEFT
+                // for 1-3 frames before bbox stabilizes.
+                if let Some(age_at_beside) = pending.first_beside_track_age {
+                    if age_at_beside < self.config.min_track_age_for_beside_overtook {
+                        warn!(
+                            "❌ Pass rejected (track {}): first BESIDE at track age {} \
+                             (< {} min) — likely initial zone instability, not genuine alongside",
+                            pending.track_id,
+                            age_at_beside,
+                            self.config.min_track_age_for_beside_overtook
+                        );
+                        return None;
+                    }
+                }
             }
         }
 
@@ -835,15 +875,14 @@ impl PassDetector {
         // current BESIDE phase start (after BEHIND) rather than the
         // first-ever BESIDE start. The original beside_since_ms includes
         // time spent in BEHIND/AHEAD between phases, inflating the duration.
-        let beside_start = if direction == PassDirection::VehicleOvertookEgo
-            && pending.came_from_behind
-        {
-            pending.current_beside_phase_start_ms.unwrap_or_else(|| {
+        let beside_start =
+            if direction == PassDirection::VehicleOvertookEgo && pending.came_from_behind {
+                pending
+                    .current_beside_phase_start_ms
+                    .unwrap_or_else(|| pending.beside_since_ms.unwrap_or(timestamp_ms))
+            } else {
                 pending.beside_since_ms.unwrap_or(timestamp_ms)
-            })
-        } else {
-            pending.beside_since_ms.unwrap_or(timestamp_ms)
-        };
+            };
 
         // v4.9: For VehicleOvertookEgo, beside_end = AHEAD streak start
         let beside_end = match direction {
@@ -1126,7 +1165,10 @@ mod tests {
             events.extend(pass_det.update(&tracker.confirmed_tracks(), t, i));
         }
 
-        assert!(events.is_empty(), "BESIDE-only disappeared track should not fire");
+        assert!(
+            events.is_empty(),
+            "BESIDE-only disappeared track should not fire"
+        );
     }
 
     #[test]
@@ -1236,7 +1278,10 @@ mod tests {
             .iter()
             .filter(|e| e.direction == PassDirection::VehicleOvertookEgo)
             .collect();
-        assert!(!overtook.is_empty(), "Genuine VehicleOvertookEgo should fire");
+        assert!(
+            !overtook.is_empty(),
+            "Genuine VehicleOvertookEgo should fire"
+        );
         assert!(overtook[0].duration_ms > 1000.0);
     }
 
@@ -1506,3 +1551,4 @@ mod tests {
         );
     }
 }
+
