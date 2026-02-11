@@ -1812,4 +1812,3 @@ mod tests {
         assert_eq!(events[0].direction, ShiftDirection::Right);
     }
 }
-

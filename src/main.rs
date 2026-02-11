@@ -5,15 +5,8 @@
 // Minimal implementation focused on the new signal-fusion architecture
 
 mod analysis;
-mod frame_buffer;
-mod inference;
-mod lane_detection;
 mod lane_legality;
-mod overtake_analyzer;
-mod overtake_tracker;
 mod pipeline;
-mod preprocessing;
-mod shadow_overtake;
 mod types;
 mod vehicle_detection;
 mod video_processor;
