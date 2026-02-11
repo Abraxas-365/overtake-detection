@@ -62,6 +62,12 @@ pub struct PassDetectorConfig {
     pub min_ahead_after_beside_frames: u32,
     /// v4.9: Minimum beside duration (ms) for VehicleOvertookEgo events.
     pub min_beside_duration_overtook_ego_ms: f64,
+    /// v4.10: Minimum peak height ratio (bbox height / frame height)
+    /// during the BESIDE phase for VehicleOvertookEgo events.
+    /// A vehicle genuinely alongside the ego vehicle must be large.
+    /// Filters out oncoming traffic and far-away false detections that
+    /// enter BESIDE from the frame edge while remaining small.
+    pub min_beside_height_ratio_overtook_ego: f32,
     /// v4.9b: Minimum BEHIND frames before a BEHIND→BESIDE transition
     /// qualifies for reverse-pass (VehicleOvertookEgo from behind).
     /// Filters out brief BEHIND zone flicker.
@@ -82,6 +88,7 @@ impl Default for PassDetectorConfig {
             min_ahead_frames: 3,
             min_ahead_after_beside_frames: 15,
             min_beside_duration_overtook_ego_ms: 1500.0,
+            min_beside_height_ratio_overtook_ego: 0.15, // v4.10: 15% of frame height
             min_behind_frames_for_reverse: 5, // v4.9b: ~167ms at 30fps
         }
     }
@@ -102,6 +109,7 @@ impl PassDetectorConfig {
             min_ahead_frames: 5,
             min_ahead_after_beside_frames: 20,
             min_beside_duration_overtook_ego_ms: 2000.0,
+            min_beside_height_ratio_overtook_ego: 0.18, // v4.10: 18% for mining (larger vehicles)
             min_behind_frames_for_reverse: 8,
         }
     }
@@ -165,6 +173,10 @@ struct PendingPass {
     beside_side: Option<PassSide>,
     beside_consecutive: u32,
     peak_beside_area: f32,
+    /// v4.10: Maximum bbox height / frame height observed during BESIDE.
+    /// Used to reject VehicleOvertookEgo for distant/oncoming vehicles
+    /// that were never actually alongside the ego vehicle.
+    peak_beside_height_ratio: f32,
     had_ahead: bool,
     beside_confirmed: bool,
     frames_since_beside: u32,
@@ -184,6 +196,7 @@ struct PendingPass {
     overtook_ego_confirmed: bool,
 
     // ── v4.9b: Reverse-pass tracking (BEHIND → BESIDE → AHEAD) ──
+
     /// Set true after the BEHIND handler's first EgoOvertook attempt.
     /// Prevents the handler from re-firing on every subsequent BEHIND
     /// frame, which inflated beside_duration and caused false positives
@@ -228,6 +241,7 @@ impl PendingPass {
             beside_side: None,
             beside_consecutive: 0,
             peak_beside_area: 0.0,
+            peak_beside_height_ratio: 0.0,
             had_ahead: false,
             beside_confirmed: false,
             frames_since_beside: 0,
@@ -270,16 +284,19 @@ pub struct PassDetector {
     /// v4.9: Track IDs for which we've already logged a
     /// disappeared-rejection. Prevents per-frame spam.
     rejected_disappeared_logged: HashSet<u32>,
+    /// v4.10: Frame height in pixels, for computing height ratios.
+    frame_height: f32,
 }
 
 impl PassDetector {
-    pub fn new(config: PassDetectorConfig) -> Self {
+    pub fn new(config: PassDetectorConfig, frame_height: f32) -> Self {
         Self {
             config,
             pending: HashMap::new(),
             completed_ids: HashSet::new(),
             recent_events: Vec::new(),
             rejected_disappeared_logged: HashSet::new(),
+            frame_height: if frame_height > 0.0 { frame_height } else { 720.0 },
         }
     }
 
@@ -348,11 +365,7 @@ impl PassDetector {
                                 "📍 Track {} AHEAD-after-BESIDE streak started at F{}{}",
                                 track.id,
                                 frame_id,
-                                if pending.came_from_behind {
-                                    " (reverse-pass)"
-                                } else {
-                                    ""
-                                }
+                                if pending.came_from_behind { " (reverse-pass)" } else { "" }
                             );
                         }
 
@@ -364,17 +377,21 @@ impl PassDetector {
                             pending.overtook_ego_confirmed = true;
                             info!(
                                 "✅ Track {} VehicleOvertookEgo confirmed: \
-                                 {} consecutive AHEAD frames after BESIDE (threshold={}){}",
+                                 {} consecutive AHEAD frames after BESIDE (threshold={}) \
+                                 peak_height_ratio={:.2} (min={:.2}){}",
                                 track.id,
                                 pending.ahead_consecutive_after_beside,
                                 self.config.min_ahead_after_beside_frames,
+                                pending.peak_beside_height_ratio,
+                                self.config.min_beside_height_ratio_overtook_ego,
                                 if pending.came_from_behind {
                                     " [BEHIND→BESIDE→AHEAD reverse-pass]"
                                 } else {
                                     ""
                                 }
                             );
-                            tracks_to_check_overtook_ego.push((track.id, (*track).clone()));
+                            tracks_to_check_overtook_ego
+                                .push((track.id, (*track).clone()));
                         }
                     }
 
@@ -395,8 +412,9 @@ impl PassDetector {
                     // If the track was just in BEHIND (with enough consecutive
                     // frames to not be jitter), this BESIDE phase is a reverse-
                     // pass candidate: the vehicle is emerging from behind.
-                    let is_transition_from_behind = pending.last_zone == Some(VehicleZone::Behind)
-                        && pending.behind_consecutive >= self.config.min_behind_frames_for_reverse;
+                    let is_transition_from_behind =
+                        pending.last_zone == Some(VehicleZone::Behind)
+                            && pending.behind_consecutive >= self.config.min_behind_frames_for_reverse;
 
                     if is_transition_from_behind && !pending.came_from_behind {
                         pending.came_from_behind = true;
@@ -479,6 +497,13 @@ impl PassDetector {
                     let area = track.area();
                     if area > pending.peak_beside_area {
                         pending.peak_beside_area = area;
+                    }
+
+                    // v4.10: Track peak height ratio for proximity validation
+                    let bbox_height = track.bbox[3] - track.bbox[1];
+                    let height_ratio = bbox_height / self.frame_height;
+                    if height_ratio > pending.peak_beside_height_ratio {
+                        pending.peak_beside_height_ratio = height_ratio;
                     }
 
                     if pending.beside_consecutive >= self.config.min_beside_frames {
@@ -652,9 +677,7 @@ impl PassDetector {
                     if first_rejection {
                         warn!(
                             "❌ Track {} rejected: beside_dur={:.0}ms < {:.0}ms min",
-                            track_id,
-                            beside_duration,
-                            self.config.min_beside_duration_disappeared_ms
+                            track_id, beside_duration, self.config.min_beside_duration_disappeared_ms
                         );
                         self.rejected_disappeared_logged.insert(track_id);
                     }
@@ -760,7 +783,9 @@ impl PassDetector {
                     debug!(
                         "❌ Pass rejected (track {}): not a VehicleOvertookEgo candidate \
                          (ahead_before_beside={}, came_from_behind={})",
-                        pending.track_id, pending.ahead_before_beside, pending.came_from_behind
+                        pending.track_id,
+                        pending.ahead_before_beside,
+                        pending.came_from_behind
                     );
                     return None;
                 }
@@ -772,6 +797,23 @@ impl PassDetector {
                         pending.track_id,
                         pending.ahead_consecutive_after_beside,
                         self.config.min_ahead_after_beside_frames
+                    );
+                    return None;
+                }
+                // v4.10: Proximity gate — vehicle must have been large enough
+                // during BESIDE to be genuinely alongside. Filters oncoming
+                // traffic and far-away detections that enter BESIDE from the
+                // frame edge while remaining small.
+                if pending.peak_beside_height_ratio
+                    < self.config.min_beside_height_ratio_overtook_ego
+                {
+                    warn!(
+                        "❌ Pass rejected (track {}): peak BESIDE height ratio {:.2} < {:.2} \
+                         — vehicle was never close enough to be alongside \
+                         (likely oncoming traffic or distant detection)",
+                        pending.track_id,
+                        pending.peak_beside_height_ratio,
+                        self.config.min_beside_height_ratio_overtook_ego
                     );
                     return None;
                 }
@@ -793,14 +835,15 @@ impl PassDetector {
         // current BESIDE phase start (after BEHIND) rather than the
         // first-ever BESIDE start. The original beside_since_ms includes
         // time spent in BEHIND/AHEAD between phases, inflating the duration.
-        let beside_start =
-            if direction == PassDirection::VehicleOvertookEgo && pending.came_from_behind {
-                pending
-                    .current_beside_phase_start_ms
-                    .unwrap_or_else(|| pending.beside_since_ms.unwrap_or(timestamp_ms))
-            } else {
+        let beside_start = if direction == PassDirection::VehicleOvertookEgo
+            && pending.came_from_behind
+        {
+            pending.current_beside_phase_start_ms.unwrap_or_else(|| {
                 pending.beside_since_ms.unwrap_or(timestamp_ms)
-            };
+            })
+        } else {
+            pending.beside_since_ms.unwrap_or(timestamp_ms)
+        };
 
         // v4.9: For VehicleOvertookEgo, beside_end = AHEAD streak start
         let beside_end = match direction {
@@ -1033,7 +1076,7 @@ mod tests {
     #[test]
     fn test_full_overtake_sequence() {
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1068,7 +1111,7 @@ mod tests {
     #[test]
     fn test_disappeared_without_ahead_rejected() {
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1083,10 +1126,7 @@ mod tests {
             events.extend(pass_det.update(&tracker.confirmed_tracks(), t, i));
         }
 
-        assert!(
-            events.is_empty(),
-            "BESIDE-only disappeared track should not fire"
-        );
+        assert!(events.is_empty(), "BESIDE-only disappeared track should not fire");
     }
 
     #[test]
@@ -1094,7 +1134,7 @@ mod tests {
         // v4.9b: The BEHIND handler should fire EgoOvertook check exactly
         // once, not every frame the track is in BEHIND.
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1139,7 +1179,7 @@ mod tests {
         // v4.9: BESIDE → brief AHEAD flicker → back to BESIDE.
         // Must NOT fire VehicleOvertookEgo.
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1173,7 +1213,7 @@ mod tests {
     fn test_genuine_vehicle_overtook_ego_from_beside() {
         // v4.9: Vehicle appears BESIDE, stably moves to AHEAD.
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1196,10 +1236,7 @@ mod tests {
             .iter()
             .filter(|e| e.direction == PassDirection::VehicleOvertookEgo)
             .collect();
-        assert!(
-            !overtook.is_empty(),
-            "Genuine VehicleOvertookEgo should fire"
-        );
+        assert!(!overtook.is_empty(), "Genuine VehicleOvertookEgo should fire");
         assert!(overtook[0].duration_ms > 1000.0);
     }
 
@@ -1211,7 +1248,7 @@ mod tests {
         //
         // This is the exact Track 5 bug from the mining video.
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1294,7 +1331,7 @@ mod tests {
         // v4.9b: VehicleOvertookEgo side should match the vehicle's
         // position, not be inverted like EgoOvertook.
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1328,7 +1365,7 @@ mod tests {
     fn test_vehicle_overtook_ego_duration_not_zero() {
         // v4.9: Duration must be meaningful (not 0.0s).
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let mut events = Vec::new();
         let fps = 30.0;
 
@@ -1360,7 +1397,7 @@ mod tests {
     #[test]
     fn test_rejection_spam_suppressed() {
         let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
-        let mut pass_det = PassDetector::new(PassDetectorConfig::default());
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
         let fps = 30.0;
 
         // BESIDE-only track
@@ -1378,5 +1415,94 @@ mod tests {
 
         assert!(!pass_det.rejected_disappeared_logged.is_empty());
     }
-}
 
+    #[test]
+    fn test_distant_vehicle_beside_then_ahead_rejected_by_height() {
+        // v4.10: Vehicle ID:6 scenario — small oncoming/distant vehicle
+        // enters BESIDE_LEFT (tiny bbox at left edge), then shifts to
+        // AHEAD as it approaches. Should NOT fire VehicleOvertookEgo
+        // because the vehicle was never large enough to be alongside.
+        //
+        // Vehicle bbox during BESIDE: ~[0, 30, 100, 80] → height=50px
+        // Frame height: 720px → height_ratio = 50/720 = 0.069 (< 0.15)
+        let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
+
+        let mut events = Vec::new();
+        let fps = 30.0;
+
+        // Phase 1 (0-2s): Small vehicle at left edge → BESIDE_LEFT
+        // Height ~50px on 720px frame = 6.9% — well below 15% threshold
+        for i in 0..60 {
+            let t = i as f64 * (1000.0 / fps);
+            let dets = vec![det_with_class(0.0, 30.0, 100.0, 80.0, 2)];
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
+            events.extend(e);
+        }
+
+        // Phase 2 (2-4s): Vehicle shifts to AHEAD (still small)
+        for i in 60..120 {
+            let t = i as f64 * (1000.0 / fps);
+            let dets = vec![det_with_class(400.0, 50.0, 520.0, 120.0, 2)];
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
+            events.extend(e);
+        }
+
+        let overtook: Vec<_> = events
+            .iter()
+            .filter(|e| e.direction == PassDirection::VehicleOvertookEgo)
+            .collect();
+        assert!(
+            overtook.is_empty(),
+            "Distant/oncoming vehicle (height ratio {:.2}) should NOT trigger \
+             VehicleOvertookEgo. Got {} events",
+            50.0 / 720.0,
+            overtook.len()
+        );
+    }
+
+    #[test]
+    fn test_large_vehicle_beside_then_ahead_accepted() {
+        // v4.10: Genuine alongside vehicle — large bbox in BESIDE.
+        // Height ~300px on 720px = 41.7% → well above 15% threshold.
+        let mut tracker = VehicleTracker::new(TrackerConfig::default(), 1280.0, 720.0);
+        let mut pass_det = PassDetector::new(PassDetectorConfig::default(), 720.0);
+
+        let mut events = Vec::new();
+        let fps = 30.0;
+
+        // Phase 1 (0-3s): Large truck in BESIDE_RIGHT zone
+        for i in 0..90 {
+            let t = i as f64 * (1000.0 / fps);
+            let dets = vec![det(900.0, 250.0, 1250.0, 550.0)];
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
+            events.extend(e);
+        }
+
+        // Phase 2 (3-5s): Moves stably to AHEAD
+        for i in 90..150 {
+            let t = i as f64 * (1000.0 / fps);
+            let dets = vec![det(500.0, 150.0, 780.0, 350.0)];
+            tracker.update(&dets, t, i);
+            let tracks = tracker.confirmed_tracks();
+            let e = pass_det.update(&tracks, t, i);
+            events.extend(e);
+        }
+
+        let overtook: Vec<_> = events
+            .iter()
+            .filter(|e| e.direction == PassDirection::VehicleOvertookEgo)
+            .collect();
+        assert!(
+            !overtook.is_empty(),
+            "Large vehicle (height ratio {:.2}) alongside should trigger VehicleOvertookEgo",
+            300.0 / 720.0
+        );
+    }
+}
