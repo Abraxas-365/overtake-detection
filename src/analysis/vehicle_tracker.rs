@@ -610,7 +610,7 @@ impl VehicleTracker {
             matched_det_indices[*di] = true;
 
             let track_state = self.tracks[*ti].state;
-            debug!(
+            info!(
                 "🔗 Centroid rescue: Track {} ({:?}) ↔ det (dist={:.0}px, class={}, IoU < {:.2})",
                 self.tracks[*ti].id,
                 track_state,
@@ -637,7 +637,7 @@ impl VehicleTracker {
         for (di, matched) in matched_det_indices.iter().enumerate() {
             if !matched {
                 let track = Track::new(self.next_id, valid[di], timestamp_ms, frame_id);
-                debug!(
+                info!(
                     "🆕 New track T{} created: class={}, bbox=[{:.0},{:.0},{:.0},{:.0}]",
                     self.next_id,
                     track.class_id,
@@ -669,14 +669,14 @@ impl VehicleTracker {
         let min_hits = self.config.min_hits_to_confirm;
         self.tracks.retain(|t| {
             if t.frames_since_hit > max_coast {
-                debug!(
+                info!(
                     "🗑️  Track {} pruned (coasted {} frames)",
                     t.id, t.frames_since_hit
                 );
                 return false;
             }
             if t.state == TrackState::Tentative && t.age > min_hits * 3 {
-                debug!(
+                info!(
                     "🗑️  Track {} pruned (tentative too long: age={})",
                     t.id, t.age
                 );
