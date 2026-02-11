@@ -231,7 +231,9 @@ impl ManeuverPipeline {
             if let Some(gray) = input.gray_frame {
                 let estimate = self.ego_motion.update(gray);
                 self.last_ego_estimate = estimate;
-                self.classifier.feed_ego_motion(estimate);
+
+                self.classifier
+                    .feed_ego_motion(estimate, input.timestamp_ms);
                 estimate.lateral_velocity_px
             } else {
                 0.0
