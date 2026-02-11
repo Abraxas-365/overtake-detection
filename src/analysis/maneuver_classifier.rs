@@ -224,7 +224,9 @@ pub struct ManeuverClassifier {
     pass_buffer: VecDeque<BufferedPass>,
     shift_buffer: VecDeque<BufferedShift>,
     current_ego_motion: EgoMotionEstimate,
-    ego_motion_during_window: VecDeque<f32>,
+    /// v4.10: Timestamped ego motion samples (timestamp_ms, velocity_px).
+    /// Used for time-window queries during pass event validation.
+    ego_motion_during_window: VecDeque<(f64, f32)>,
     recent_events: Vec<ManeuverEvent>,
     total_maneuvers: u64,
     latest_markings: MarkingSnapshot,
@@ -237,7 +239,7 @@ impl ManeuverClassifier {
             pass_buffer: VecDeque::with_capacity(20),
             shift_buffer: VecDeque::with_capacity(20),
             current_ego_motion: EgoMotionEstimate::none(),
-            ego_motion_during_window: VecDeque::with_capacity(150),
+            ego_motion_during_window: VecDeque::with_capacity(900), // ~30s at 30fps
             recent_events: Vec::new(),
             total_maneuvers: 0,
             latest_markings: MarkingSnapshot::default(),
@@ -258,11 +260,11 @@ impl ManeuverClassifier {
         });
     }
 
-    pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate) {
+    pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
         self.current_ego_motion = estimate;
         self.ego_motion_during_window
-            .push_back(estimate.lateral_velocity_px);
-        if self.ego_motion_during_window.len() > 150 {
+            .push_back((timestamp_ms, estimate.lateral_velocity_px));
+        if self.ego_motion_during_window.len() > 900 {
             self.ego_motion_during_window.pop_front();
         }
     }
@@ -443,19 +445,31 @@ impl ManeuverClassifier {
                 let had_any_lateral_shift = self.shift_buffer.iter().any(|s| !s.correlated);
 
                 if !ego_confirms && !had_any_lateral_shift {
-                    let peak_ego = self
-                        .ego_motion_during_window
-                        .iter()
-                        .rev()
-                        .take(60)
-                        .map(|v| v.abs())
-                        .fold(0.0f32, |a, b| a.max(b));
+                    // v4.10: Check ego motion during the MANEUVER's time window,
+                    // not just "the last 60 frames". The ego lane change may have
+                    // happened seconds before the pass event fires (the pass fires
+                    // when the vehicle disappears, which can be long after the ego
+                    // completed its lane change).
+                    //
+                    // Window: from ahead_start_ms (or beside_start - 10s) to now.
+                    // This captures the lane change that preceded the alongside phase.
+                    let pass_event = &self.pass_buffer[pass_idx].event;
+                    let window_start = pass_event
+                        .ahead_start_ms
+                        .min(pass_event.beside_start_ms - 10000.0)
+                        .max(0.0);
+                    let window_end = timestamp_ms;
+
+                    let peak_ego = self.peak_ego_motion_in_window(window_start, window_end);
 
                     if peak_ego < self.config.min_ego_motion_for_single_source {
                         warn!(
                             "  ❌ REJECTED single-source pass (track {}): no lateral motion \
+                             in maneuver window [{:.1}s..{:.1}s] \
                              (peak_ego={:.2} < {:.2}, ego_confirms={}, shifts={})",
                             self.pass_buffer[pass_idx].event.vehicle_track_id,
+                            window_start / 1000.0,
+                            window_end / 1000.0,
                             peak_ego,
                             self.config.min_ego_motion_for_single_source,
                             ego_confirms,
@@ -743,6 +757,28 @@ impl ManeuverClassifier {
         }
     }
 
+    /// v4.10: Query peak ego lateral velocity within a time window.
+    /// Returns peak absolute velocity during [start_ms, end_ms].
+    /// Falls back to the full buffer if the window is empty.
+    fn peak_ego_motion_in_window(&self, start_ms: f64, end_ms: f64) -> f32 {
+        let in_window = self
+            .ego_motion_during_window
+            .iter()
+            .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms)
+            .map(|(_, v)| v.abs())
+            .fold(0.0f32, |a, b| a.max(b));
+
+        if in_window > 0.0 {
+            return in_window;
+        }
+
+        // Fallback: window empty (timestamps not aligned), check full buffer
+        self.ego_motion_during_window
+            .iter()
+            .map(|(_, v)| v.abs())
+            .fold(0.0f32, |a, b| a.max(b))
+    }
+
     fn ego_motion_confirms_lateral(&self) -> bool {
         if self.ego_motion_during_window.len() < 5 {
             return false;
@@ -752,7 +788,7 @@ impl ManeuverClassifier {
             .iter()
             .rev()
             .take(30)
-            .map(|v| v.abs())
+            .map(|(_, v)| v.abs())
             .fold(0.0f32, |a, b| a.max(b));
 
         peak >= self.config.ego_motion_threshold
@@ -798,7 +834,7 @@ impl ManeuverClassifier {
             .iter()
             .rev()
             .take(90)
-            .copied()
+            .map(|(_, v)| *v)
             .collect();
 
         match pass.side {
