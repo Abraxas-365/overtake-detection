@@ -45,6 +45,14 @@ pub struct LateralDetectorConfig {
     pub ego_only_confidence_penalty: f32,
     /// Max shift duration for ego-started shifts (shorter than lane-started)
     pub ego_shift_max_frames: u32,
+
+    // ── v4.10: Lane measurement caching ─────────────────────────
+    /// Max frames to reuse the last valid lane measurement during brief dropouts.
+    /// The cached measurement has its offset adjusted by ego motion each frame
+    /// and its confidence decayed, so it degrades gracefully.
+    pub lane_cache_max_frames: u32,
+    /// Confidence decay per cached frame (multiplied each frame)
+    pub lane_cache_confidence_decay: f32,
 }
 
 impl Default for LateralDetectorConfig {
@@ -69,6 +77,10 @@ impl Default for LateralDetectorConfig {
             ego_px_per_norm_unit: 600.0,  // ~lane_width, rough conversion
             ego_only_confidence_penalty: 0.2,
             ego_shift_max_frames: 180, // 6s max for ego-started shifts
+
+            // v4.10 lane cache defaults
+            lane_cache_max_frames: 4,          // ~133ms at 30fps
+            lane_cache_confidence_decay: 0.75, // 0.8 → 0.6 → 0.45 → 0.34
         }
     }
 }
@@ -205,6 +217,10 @@ pub struct LateralShiftDetector {
 
     // History for smoothing
     offset_history: VecDeque<f32>,
+
+    // v4.10: Lane measurement cache for brief dropouts
+    cached_measurement: Option<LaneMeasurement>,
+    cached_measurement_age: u32,
 }
 
 impl LateralShiftDetector {
@@ -231,6 +247,8 @@ impl LateralShiftDetector {
             ego_estimated_offset: 0.0,
             ego_last_velocity: 0.0,
             offset_history: VecDeque::with_capacity(30),
+            cached_measurement: None,
+            cached_measurement_age: 0,
         }
     }
 
@@ -265,16 +283,66 @@ impl LateralShiftDetector {
             self.frames_without_lanes = 0;
             self.last_lane_width_px = m.lane_width_px;
             self.ego_bridge_frames = 0; // lanes back, bridge ends
+                                        // v4.10: Update cache with fresh measurement
+            self.cached_measurement = Some(*m);
+            self.cached_measurement_age = 0;
         } else {
             self.frames_without_lanes += 1;
+            // v4.10: Age the cache
+            self.cached_measurement_age += 1;
         }
 
-        // ── NO LANES PATH ───────────────────────────────────────
-        if valid_meas.is_none() {
+        // ── v4.10: LANE CACHE — bridge brief dropouts ───────────
+        // If no fresh lanes but we have a recent cached measurement,
+        // synthesize a measurement with ego-compensated offset and
+        // decayed confidence. This keeps the lane-based path active
+        // through 1-4 frame dropouts instead of falling into
+        // handle_no_lanes which loses lane context.
+        let effective_meas = if valid_meas.is_some() {
+            valid_meas
+        } else if let Some(ref cached) = self.cached_measurement {
+            if self.cached_measurement_age <= self.config.lane_cache_max_frames {
+                // Ego-compensate: shift the cached offset by accumulated ego motion
+                let ego_offset_delta = ego.lateral_velocity * self.cached_measurement_age as f32;
+                let compensated_offset = cached.lateral_offset_px + ego_offset_delta;
+                let decayed_confidence = cached.confidence
+                    * self
+                        .config
+                        .lane_cache_confidence_decay
+                        .powi(self.cached_measurement_age as i32);
+
+                if self.cached_measurement_age == 1 {
+                    debug!(
+                        "📋 Using cached lane measurement (age={}f): offset={:.1}px → {:.1}px (ego_comp={:.1}px) | conf={:.2} → {:.2}",
+                        self.cached_measurement_age,
+                        cached.lateral_offset_px,
+                        compensated_offset,
+                        ego_offset_delta,
+                        cached.confidence,
+                        decayed_confidence,
+                    );
+                }
+
+                Some(LaneMeasurement {
+                    lateral_offset_px: compensated_offset,
+                    lane_width_px: cached.lane_width_px,
+                    confidence: decayed_confidence,
+                    both_lanes: cached.both_lanes,
+                })
+            } else {
+                // Cache expired — invalidate and fall through to no-lanes
+                None
+            }
+        } else {
+            None
+        };
+
+        // ── NO LANES PATH (neither fresh nor cached) ────────────
+        if effective_meas.is_none() {
             return self.handle_no_lanes(ego, timestamp_ms, frame_id);
         }
 
-        let meas = valid_meas.unwrap();
+        let meas = effective_meas.unwrap();
 
         // ── NORMALIZE ───────────────────────────────────────────
         let normalized = meas.lateral_offset_px / meas.lane_width_px;
@@ -879,6 +947,8 @@ impl LateralShiftDetector {
         self.ego_active_frames = 0;
         self.ego_last_velocity = 0.0;
         self.offset_history.clear();
+        self.cached_measurement = None;
+        self.cached_measurement_age = 0;
         self.reset_shift();
     }
 
@@ -1256,6 +1326,73 @@ mod tests {
         // Should be shifting via ego-preempt despite offset < threshold
         assert_eq!(det.state, State::Shifting);
         assert_eq!(det.shift_direction, Some(ShiftDirection::Left));
+    }
+
+    #[test]
+    fn test_lane_cache_bridges_brief_dropout() {
+        // v4.10: Brief lane dropout should use cached measurement
+        // instead of falling into handle_no_lanes.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            min_shift_frames: 5,
+            shift_start_threshold: 0.22,
+            lane_cache_max_frames: 4,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Start a shift with a big offset
+        det.update(meas(-200.0, w, 0.8), ego(-4.0), 20.0 * 33.3, 20);
+        assert_eq!(det.state, State::Shifting);
+
+        // Lanes drop for 3 frames (within cache window)
+        for i in 21..24 {
+            det.update(None, ego(-4.0), i as f64 * 33.3, i);
+        }
+
+        // Should still be shifting (NOT ego-bridged), because cached
+        // measurement kept the lane-based path active
+        assert_eq!(det.state, State::Shifting);
+        // After lanes come back, should be LaneBased (cache kept it from
+        // ever transitioning to EgoBridged for a 3-frame dropout)
+        det.update(meas(-250.0, w, 0.8), ego(-4.0), 24.0 * 33.3, 24);
+        assert_eq!(det.state, State::Shifting);
+        assert_eq!(det.shift_source, ShiftSource::LaneBased);
+    }
+
+    #[test]
+    fn test_lane_cache_expires_after_max_frames() {
+        // v4.10: Cache should expire and fall through to handle_no_lanes
+        // after lane_cache_max_frames.
+        let cfg = LateralDetectorConfig {
+            baseline_warmup_frames: 10,
+            lane_cache_max_frames: 3,
+            occlusion_reset_frames: 10,
+            ..Default::default()
+        };
+        let mut det = LateralShiftDetector::new(cfg);
+        let w = 800.0;
+
+        // Warmup
+        for i in 0..20 {
+            det.update(meas(0.0, w, 0.8), ego(0.0), i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Lanes drop for longer than cache window
+        for i in 20..35 {
+            det.update(None, no_ego(), i as f64 * 33.3, i);
+        }
+
+        // Should be occluded (cache expired, no ego motion)
+        assert_eq!(det.state, State::Occluded);
     }
 }
 
