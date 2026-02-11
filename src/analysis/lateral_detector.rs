@@ -759,7 +759,7 @@ impl LateralShiftDetector {
 
         info!(
             "✅ Lateral shift completed: {} | peak={:.1}% | dur={:.1}s | conf={:.2} | \
-             source={:?} | ego_cum={:.1}px | lane_frames={}/{}",
+             source={:?} | ego_cum={:.1}px | lane_frames={}",
             evt.direction.as_str(),
             evt.peak_offset * 100.0,
             evt.duration_ms / 1000.0,
@@ -1185,4 +1185,3 @@ mod tests {
         assert_ne!(det.state, State::Shifting);
     }
 }
-
