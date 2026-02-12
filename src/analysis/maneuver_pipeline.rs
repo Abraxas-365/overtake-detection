@@ -14,6 +14,7 @@
 // v4.4: Reordered steps so ego-motion is computed BEFORE lateral detection.
 //       This allows the lateral detector to use ego motion for bridging
 //       through lane detection dropout.
+// v4.11: Added curve-aware mining tuning for boundary coherence + adaptive baseline.
 
 use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
 use super::lateral_detector::{
@@ -114,6 +115,15 @@ impl ManeuverPipelineConfig {
                 ego_px_per_norm_unit: 800.0,
                 ego_only_confidence_penalty: 0.20,
                 ego_shift_max_frames: 150,
+                // v4.11: curve-aware lane change suppression (mining-tuned)
+                // More aggressive than defaults — wide trucks on curvy haul roads
+                // need faster activation and stronger suppression.
+                curve_coherence_threshold: 0.60, // vs 0.65 default — activate sooner
+                curve_shift_threshold_multiplier: 2.0, // vs 1.8 — stronger suppression for wide trucks
+                curve_min_sustained_frames: 4, // vs 5 — faster activation on curvy mining roads
+                adaptive_baseline_alpha_max: 0.05, // vs 0.04 — track curves faster (25× base α)
+                adaptive_baseline_max_variance: 0.002, // vs 0.0015 — looser for bumpier roads
+                adaptive_baseline_min_drift: 0.0015, // vs 0.002 — trigger on smaller drifts
                 ..LateralDetectorConfig::default()
             },
             ego_motion: EgoMotionConfig {
@@ -146,7 +156,7 @@ pub struct ManeuverPipeline {
     enable_ego_motion: bool,
     frame_count: u64,
     last_ego_estimate: EgoMotionEstimate,
-    last_tracked_count: usize, // 🆕 Add this
+    last_tracked_count: usize,
 }
 
 impl ManeuverPipeline {
@@ -166,7 +176,7 @@ impl ManeuverPipeline {
             enable_ego_motion: config.enable_ego_motion,
             frame_count: 0,
             last_ego_estimate: EgoMotionEstimate::none(),
-            last_tracked_count: 0, // 🆕 Initialize to 0
+            last_tracked_count: 0,
         }
     }
 
@@ -175,12 +185,11 @@ impl ManeuverPipeline {
         self.frame_count += 1;
 
         // ══════════════════════════════════════════════════════════════════
-        // 🆕 DIAGNOSTIC: Count raw detections before filtering
+        // DIAGNOSTIC: Count raw detections before filtering
         // ══════════════════════════════════════════════════════════════════
         let raw_det_count = input.vehicle_detections.len();
 
         // Count valid detections (would pass tracker's filters)
-        // This replicates the filtering logic from VehicleTracker::update()
         let valid_det_count = input
             .vehicle_detections
             .iter()
@@ -198,13 +207,13 @@ impl ManeuverPipeline {
         let tracked_count = self.tracker.confirmed_count();
         let tracks = self.tracker.confirmed_tracks();
 
-        // 🆕 DIAGNOSTIC: Track IDs and zones
+        // DIAGNOSTIC: Track IDs and zones
         let track_info: Vec<String> = tracks
             .iter()
             .map(|t| format!("T{}:{}", t.id, t.zone.as_str()))
             .collect();
 
-        // 🆕 DIAGNOSTIC: Class ID distribution in raw detections
+        // DIAGNOSTIC: Class ID distribution in raw detections
         let mut class_counts: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
         for det in input.vehicle_detections {
@@ -285,7 +294,7 @@ impl ManeuverPipeline {
         // 7. PERIODIC DIAGNOSTICS (ENHANCED)
         // ══════════════════════════════════════════════════════════════════
 
-        // 🆕 Always log critical tracking failures
+        // Always log critical tracking failures
         if raw_det_count > 0 && tracked_count == 0 {
             warn!(
             "⚠️  F{}: TRACKING FAILURE | raw_dets={} | valid_dets={} | tracks={} | classes={:?}",
@@ -297,7 +306,7 @@ impl ManeuverPipeline {
         );
         }
 
-        // 🆕 Enhanced periodic diagnostics
+        // Enhanced periodic diagnostics
         if self.frame_count % 150 == 0 {
             info!(
             "📊 Pipeline v2 (F{}): raw_dets={} | valid_dets={} | tracks={} [{}] | passes={} | lateral={} | ego={:.2}px/f | maneuvers={}",
@@ -317,7 +326,7 @@ impl ManeuverPipeline {
             }
         }
 
-        // 🆕 Log when tracks appear/disappear
+        // Log when tracks appear/disappear
         if tracked_count != self.last_tracked_count {
             if tracked_count > self.last_tracked_count {
                 info!(

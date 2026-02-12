@@ -27,19 +27,17 @@ const LANE_LINE_CLASS_IDS: [usize; 8] = [4, 5, 6, 7, 8, 9, 10, 99];
 // ---------------------------------------------------------------------------
 // Ego lane boundary estimation constants (v2)
 // ---------------------------------------------------------------------------
-/// Detections whose center_x is closer than this fraction of frame width
-/// are considered the same physical line and get merged before pairing.
 const MERGE_THRESHOLD_RATIO: f32 = 0.06;
 const MIN_LANE_WIDTH: f32 = 200.0;
 const MAX_LANE_WIDTH: f32 = 900.0;
-/// Preferred lane width — scoring penalises pairs that deviate from this.
 const IDEAL_LANE_WIDTH: f32 = 450.0;
-/// Fallback when we have zero width history.
 const DEFAULT_SINGLE_MARKING_WIDTH: f32 = 450.0;
-/// How many successful two-boundary measurements we remember.
 const WIDTH_HISTORY_SIZE: usize = 20;
-/// Confidence multiplier when we had to fabricate one boundary.
 const SINGLE_BOUNDARY_CONFIDENCE_PENALTY: f32 = 0.65;
+
+/// v4.11 (Fix 1): Minimum boundary movement (pixels/frame) to compute coherence.
+/// Below this, boundary deltas are noise — coherence is meaningless.
+const MIN_BOUNDARY_DELTA: f32 = 0.5;
 
 // ===========================================================================
 // CROSSING SIDE
@@ -186,7 +184,7 @@ fn class_id_to_name(class_id: usize) -> &'static str {
         8 => "solid_double_yellow",
         9 => "dashed_single_white",
         10 => "dashed_single_yellow",
-        99 => "mixed_double_yellow", // Custom ID for mixed lines
+        99 => "mixed_double_yellow",
         _ => "other_marking",
     }
 }
@@ -267,7 +265,6 @@ fn verify_line_color(
     let r_b_ratio = if avg_b > 1.0 { avg_r / avg_b } else { 2.0 };
     let g_b_ratio = if avg_b > 1.0 { avg_g / avg_b } else { 2.0 };
 
-    // Thresholds calibrated for faint yellow
     let is_yellow = avg_b > 1.0
         && r_b_ratio > 1.08
         && g_b_ratio > 1.05
@@ -277,9 +274,9 @@ fn verify_line_color(
 
     if is_yellow {
         let new_class = match marking.class_id {
-            4 => 5,  // solid_single_white → solid_single_yellow
-            7 => 8,  // solid_double_white → solid_double_yellow
-            9 => 10, // dashed_single_white → dashed_single_yellow
+            4 => 5,
+            7 => 8,
+            9 => 10,
             _ => marking.class_id,
         };
 
@@ -304,7 +301,6 @@ fn verify_line_color(
 // MERGE COMPOSITE LINES (FIX FOR MIXED LINES)
 // ===========================================================================
 
-/// Merges "Solid Double" and "Dashed Single" detections into a "Mixed" line
 fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMarking> {
     let mut merged = Vec::new();
     let mut used_indices = HashSet::new();
@@ -314,7 +310,6 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
             continue;
         }
         let a = &dets[i];
-
         let mut found_partner = false;
 
         for j in 0..dets.len() {
@@ -326,14 +321,12 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
             let is_pair_double_dashed = (matches!(a.class_id, 7 | 8)
                 && matches!(b.class_id, 9 | 10))
                 || (matches!(a.class_id, 9 | 10) && matches!(b.class_id, 7 | 8));
-
             let is_pair_solid_dashed = (matches!(a.class_id, 4 | 5)
                 && matches!(b.class_id, 9 | 10))
                 || (matches!(a.class_id, 9 | 10) && matches!(b.class_id, 4 | 5));
 
             if is_pair_double_dashed || is_pair_solid_dashed {
                 let iou = calculate_iou_arr(&a.bbox, &b.bbox);
-
                 let cx_a = (a.bbox[0] + a.bbox[2]) / 2.0;
                 let cx_b = (b.bbox[0] + b.bbox[2]) / 2.0;
                 let dist_x = (cx_a - cx_b).abs();
@@ -344,14 +337,12 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
                     } else {
                         (a, b)
                     };
-
                     let solid_cx = (solid_part.bbox[0] + solid_part.bbox[2]) / 2.0;
                     let dashed_cx = (dashed_part.bbox[0] + dashed_part.bbox[2]) / 2.0;
 
                     let mut new_marking = solid_part.clone();
                     new_marking.class_id = 99;
                     new_marking.confidence = (a.confidence + b.confidence) / 2.0;
-
                     new_marking.bbox = [
                         a.bbox[0].min(b.bbox[0]),
                         a.bbox[1].min(b.bbox[1]),
@@ -389,25 +380,14 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
 // MERGED MARKING POSITION (for boundary estimation v2)
 // ===========================================================================
 
-/// A spatially-merged lane line position derived from one or more overlapping
-/// YOLO-seg detections. When the model detects both "dashed_single_white" and
-/// "solid_single_white" for the same physical center line, we merge them here
-/// so the boundary estimator sees one logical marking, not two.
 #[derive(Debug, Clone)]
 struct MergedMarkingPosition {
     center_x: f32,
     confidence: f32,
     class_name: String,
-    /// How many raw detections contributed to this position.
     source_count: u32,
 }
 
-/// Merge spatially-close lane line detections into logical marking positions.
-///
-/// On desert highways the model frequently fires both "dashed_single_white(39%)"
-/// and "solid_single_white(54%)" for the same physical center line. Without
-/// merging, the old code saw two LEFT-of-center detections → no right candidate
-/// → boundary estimation failed.
 fn merge_nearby_markings(
     markings: &[&DetectedRoadMarking],
     merge_threshold: f32,
@@ -426,13 +406,11 @@ fn merge_nearby_markings(
     for (cx, conf, name) in &sorted {
         if let Some(last) = merged.last_mut() {
             if (*cx - last.center_x).abs() < merge_threshold {
-                // Same physical line — weighted average position
                 let w_old = last.confidence * last.source_count as f32;
                 let w_new = *conf;
                 last.center_x = (last.center_x * w_old + cx * w_new) / (w_old + w_new);
                 last.confidence = (w_old + w_new) / (last.source_count as f32 + 1.0);
                 last.source_count += 1;
-                // Keep the higher-confidence class name
                 if *conf > last.confidence {
                     last.class_name = name.to_string();
                 }
@@ -458,12 +436,15 @@ pub struct LaneLegalityDetector {
     session: Session,
     ego_bbox_ratio: [f32; 4],
     temporal_filter: TemporalViolationFilter,
-    // Lane width memory for single-boundary fallback
     lane_width_history: VecDeque<f32>,
     last_valid_width: Option<f32>,
 
     last_left_lane_x: Option<f32>,
     last_right_lane_x: Option<f32>,
+
+    /// v4.11 (Fix 1): Rolling coherence of left/right boundary movement.
+    /// +1 = boundaries co-moving (curve), -1 = diverging (lane change), <-0.5 = no data.
+    last_boundary_coherence: f32,
 }
 
 impl LaneLegalityDetector {
@@ -482,9 +463,9 @@ impl LaneLegalityDetector {
             temporal_filter: TemporalViolationFilter::new(2, 6),
             lane_width_history: VecDeque::with_capacity(WIDTH_HISTORY_SIZE),
             last_valid_width: None,
-            // 🆕 Initialize these to None:
             last_left_lane_x: None,
             last_right_lane_x: None,
+            last_boundary_coherence: -1.0, // v4.11: no data yet
         })
     }
 
@@ -492,7 +473,6 @@ impl LaneLegalityDetector {
     // WIDTH MEMORY
     // -----------------------------------------------------------------------
 
-    /// Record a successful two-boundary lane width measurement.
     fn record_lane_width(&mut self, width: f32) {
         if width >= MIN_LANE_WIDTH && width <= MAX_LANE_WIDTH {
             self.lane_width_history.push_back(width);
@@ -503,8 +483,6 @@ impl LaneLegalityDetector {
         }
     }
 
-    /// Best estimate for lane width: median of recent measurements,
-    /// falling back to last single measurement, then to the default.
     fn estimated_lane_width(&self) -> f32 {
         if self.lane_width_history.len() >= 3 {
             let mut sorted: Vec<f32> = self.lane_width_history.iter().copied().collect();
@@ -527,9 +505,8 @@ impl LaneLegalityDetector {
 
         if let Some((l, r, c)) = raw_estimate {
             // PRODUCTION FIX: Temporal dampening of the YOLO box jump
-            // Prevents the false 'HighVelocity' triggers in the state machine
             let smooth_l = match self.last_left_lane_x {
-                Some(prev) => prev * 0.7 + l * 0.3, // 70% history weight
+                Some(prev) => prev * 0.7 + l * 0.3,
                 None => l,
             };
             let smooth_r = match self.last_right_lane_x {
@@ -537,34 +514,79 @@ impl LaneLegalityDetector {
                 None => r,
             };
 
+            // ═══════════════════════════════════════════════════════
+            // v4.11 (Fix 1): Compute boundary coherence from per-frame deltas
+            // ═══════════════════════════════════════════════════════
+            //
+            // On a curve: both boundaries shift in the SAME direction
+            //   dl and dr have the same sign → coherence ≈ +1.0
+            //
+            // On a lane change: one boundary approaches, the other recedes
+            //   dl and dr have OPPOSITE signs → coherence ≈ -1.0
+            //
+            self.last_boundary_coherence = if let (Some(prev_l), Some(prev_r)) =
+                (self.last_left_lane_x, self.last_right_lane_x)
+            {
+                let dl = smooth_l - prev_l;
+                let dr = smooth_r - prev_r;
+                let abs_dl = dl.abs();
+                let abs_dr = dr.abs();
+
+                if abs_dl < MIN_BOUNDARY_DELTA && abs_dr < MIN_BOUNDARY_DELTA {
+                    // Both static — neutral
+                    0.0
+                } else if abs_dl < MIN_BOUNDARY_DELTA || abs_dr < MIN_BOUNDARY_DELTA {
+                    // Only one moved — inconclusive
+                    0.0
+                } else {
+                    // Both have meaningful movement
+                    let direction_sign = (dl * dr).signum();
+                    let mag_ratio = abs_dl.min(abs_dr) / abs_dl.max(abs_dr);
+                    let raw_coherence = direction_sign * mag_ratio;
+
+                    // EWMA smoothing
+                    let prev_coherence = self.last_boundary_coherence;
+                    if prev_coherence < -0.5 {
+                        raw_coherence // no previous data
+                    } else {
+                        0.6 * raw_coherence + 0.4 * prev_coherence
+                    }
+                }
+            } else {
+                -1.0 // No previous boundaries
+            };
+
             self.last_left_lane_x = Some(smooth_l);
             self.last_right_lane_x = Some(smooth_r);
             return Ok(Some((smooth_l, smooth_r, c)));
         }
+
+        // No boundaries this frame — decay coherence
+        if self.last_boundary_coherence > -0.5 {
+            self.last_boundary_coherence *= 0.8;
+        }
+
         Ok(None)
+    }
+
+    /// v4.11 (Fix 1): Get the current boundary coherence metric.
+    ///
+    /// Returns a value in [-1, +1]:
+    ///   +1.0 = boundaries co-moving (curve)
+    ///   -1.0 = boundaries diverging (lane change)
+    ///    0.0 = inconclusive / static
+    ///   < -0.5 = no data available
+    ///
+    /// Call after `estimate_ego_lane_boundaries_stable()` and pass into
+    /// `LaneMeasurement.boundary_coherence` for the lateral detector.
+    pub fn boundary_coherence(&self) -> f32 {
+        self.last_boundary_coherence
     }
 
     // -----------------------------------------------------------------------
     // EGO LANE BOUNDARY ESTIMATION  v2
     // -----------------------------------------------------------------------
-    //
-    // v1 problem:
-    //   Split markings into left/right of `vehicle_center_x` and required one
-    //   on each side. On Peruvian desert curves the center line AND the road
-    //   edge can both sit LEFT of frame center → right_candidate = None → MISS.
-    //   Single-boundary fallback used hardcoded 500px and then rejected the
-    //   result via `right_x > width * 0.95`.
-    //
-    // v2 approach:
-    //   1. Merge spatially-close detections (same physical line detected as
-    //      two different classes, e.g. solid + dashed).
-    //   2. Score every pair of merged positions by (width plausibility,
-    //      center alignment, confidence) — no rigid left/right split.
-    //   3. Single-boundary fallback uses width memory (median of recent
-    //      two-boundary measurements) instead of a fixed 500px.
-    //   4. No harsh edge-of-frame rejection — on curves the road edge
-    //      legitimately sits near the frame edge.
-    //
+
     pub fn estimate_ego_lane_boundaries(
         &mut self,
         frame: &[u8],
@@ -578,7 +600,6 @@ impl LaneLegalityDetector {
             return Ok(None);
         }
 
-        // Filter to lane line classes only
         let lane_lines: Vec<&DetectedRoadMarking> = markings
             .iter()
             .filter(|m| is_lane_line_class(m.class_id))
@@ -607,14 +628,12 @@ impl LaneLegalityDetector {
                 .join(", ")
         );
 
-        // ── ATTEMPT 1: best pair of markings forming a valid lane ──
         if merged.len() >= 2 {
             if let Some(result) = self.find_best_lane_pair(&merged, vehicle_center_x, width) {
                 return Ok(Some(result));
             }
         }
 
-        // ── ATTEMPT 2: single marking + width memory ──
         if let Some(result) = self.single_marking_fallback(&merged, vehicle_center_x, width) {
             return Ok(Some(result));
         }
@@ -626,15 +645,12 @@ impl LaneLegalityDetector {
         Ok(None)
     }
 
-    /// Try every pair of merged marking positions and pick the one that forms
-    /// the most plausible lane around `vehicle_center_x`.
     fn find_best_lane_pair(
         &mut self,
         merged: &[MergedMarkingPosition],
         vehicle_center_x: f32,
         frame_width: usize,
     ) -> Option<(f32, f32, f32)> {
-        // (left_x, right_x, conf, composite_score)
         let mut best: Option<(f32, f32, f32, f32)> = None;
 
         for i in 0..merged.len() {
@@ -650,14 +666,10 @@ impl LaneLegalityDetector {
                 let lane_center = (left_x + right_x) / 2.0;
                 let center_offset = (lane_center - vehicle_center_x).abs();
 
-                // 1. Width plausibility — prefer widths near IDEAL_LANE_WIDTH
                 let width_score =
                     1.0 - ((lane_width - IDEAL_LANE_WIDTH).abs() / IDEAL_LANE_WIDTH).min(1.0);
-                // 2. Center alignment — prefer pairs that straddle vehicle center
                 let center_score = 1.0 - (center_offset / (frame_width as f32 * 0.35)).min(1.0);
-                // 3. Detection confidence
                 let conf = (merged[i].confidence + merged[j].confidence) / 2.0;
-
                 let score = width_score * 0.25 + center_score * 0.40 + conf * 0.35;
 
                 if best.is_none() || score > best.unwrap().3 {
@@ -669,7 +681,6 @@ impl LaneLegalityDetector {
         if let Some((left_x, right_x, conf, score)) = best {
             let lane_width = right_x - left_x;
             self.record_lane_width(lane_width);
-
             debug!(
                 "✅ YOLO boundary (pair): L={:.0}, R={:.0}, W={:.0}, conf={:.2}, score={:.2}",
                 left_x, right_x, lane_width, conf, score
@@ -680,15 +691,12 @@ impl LaneLegalityDetector {
         }
     }
 
-    /// When only one marking is visible (or no valid pair exists), estimate
-    /// the missing boundary using the median of recent two-boundary widths.
     fn single_marking_fallback(
         &self,
         merged: &[MergedMarkingPosition],
         vehicle_center_x: f32,
         frame_width: usize,
     ) -> Option<(f32, f32, f32)> {
-        // Pick the marking closest to vehicle center
         let best = merged.iter().min_by(|a, b| {
             let da = (a.center_x - vehicle_center_x).abs();
             let db = (b.center_x - vehicle_center_x).abs();
@@ -699,11 +707,7 @@ impl LaneLegalityDetector {
         let conf = best.confidence * SINGLE_BOUNDARY_CONFIDENCE_PENALTY;
 
         if best.center_x < vehicle_center_x {
-            // Marking is LEFT of vehicle → treat as left boundary (center line)
             let right_x = best.center_x + est_width;
-
-            // Soft clamp instead of hard rejection — on curves the edge CAN
-            // sit near the frame boundary.
             let right_x = if right_x > frame_width as f32 {
                 debug!(
                     "⚠️ YOLO boundary (left-only): est_R={:.0} > frame_w={}, clamping",
@@ -713,22 +717,18 @@ impl LaneLegalityDetector {
             } else {
                 right_x
             };
-
             let effective_conf = if right_x >= frame_width as f32 - 10.0 {
-                conf * 0.8 // extra penalty for clamped edge
+                conf * 0.8
             } else {
                 conf
             };
-
             debug!(
                 "⚠️ YOLO boundary (left-only): L={:.0} ({}), est_R={:.0}, est_W={:.0}, conf={:.2}",
                 best.center_x, best.class_name, right_x, est_width, effective_conf
             );
             Some((best.center_x, right_x, effective_conf))
         } else {
-            // Marking is RIGHT of vehicle → treat as right boundary (road edge)
             let left_x = best.center_x - est_width;
-
             let left_x = if left_x < 0.0 {
                 debug!(
                     "⚠️ YOLO boundary (right-only): est_L={:.0} < 0, clamping",
@@ -738,9 +738,7 @@ impl LaneLegalityDetector {
             } else {
                 left_x
             };
-
             let effective_conf = if left_x <= 10.0 { conf * 0.8 } else { conf };
-
             debug!(
                 "⚠️ YOLO boundary (right-only): est_L={:.0}, R={:.0} ({}), est_W={:.0}, conf={:.2}",
                 left_x, best.center_x, best.class_name, est_width, effective_conf
@@ -749,7 +747,6 @@ impl LaneLegalityDetector {
         }
     }
 
-    /// Get all detected road markings for a frame (for cross-validation)
     pub fn get_markings_only(
         &mut self,
         frame: &[u8],
@@ -759,7 +756,6 @@ impl LaneLegalityDetector {
     ) -> Result<Vec<DetectedRoadMarking>> {
         let (input, scale, pad_x, pad_y) = self.preprocess(frame, width, height)?;
         let (box_output, mask_proto, _) = self.infer(&input)?;
-
         self.postprocess(
             &box_output,
             &mask_proto,
@@ -832,7 +828,6 @@ impl LaneLegalityDetector {
             width,
             height,
         );
-
         let ego_intersects_marking = crossing_line.is_some();
         let (verdict, intersecting_line) = match crossing_line {
             Some(marking) => {
@@ -884,10 +879,8 @@ impl LaneLegalityDetector {
             {
                 continue;
             }
-
             let marking_center_x = (marking.bbox[0] + marking.bbox[2]) / 2.0;
             let distance = (marking_center_x - boundary_x).abs();
-
             if distance < tolerance {
                 if best_match.is_none() || distance < best_match.unwrap().0 {
                     best_match = Some((distance, marking));
@@ -913,7 +906,6 @@ impl LaneLegalityDetector {
 
         let resized = resize_bilinear(src, src_w, src_h, scaled_w, scaled_h);
         let mut canvas = vec![114u8; target * target * 3];
-
         for y in 0..scaled_h {
             for x in 0..scaled_w {
                 let src_idx = (y * scaled_w + x) * 3;
@@ -975,7 +967,6 @@ impl LaneLegalityDetector {
 
             let mut max_conf = 0.0f32;
             let mut best_class = 0;
-
             for c in 0..NUM_CLASSES {
                 let conf = output[num_detections * (4 + c) + i];
                 if conf > max_conf {
@@ -983,7 +974,6 @@ impl LaneLegalityDetector {
                     best_class = c;
                 }
             }
-
             if max_conf < conf_thresh {
                 continue;
             }
@@ -1023,7 +1013,6 @@ impl LaneLegalityDetector {
 
         let detections = merge_composite_lines(detections);
         let detections = nms_markings(detections, 0.45);
-
         Ok(detections)
     }
 
@@ -1058,7 +1047,6 @@ fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: 
     let mut dst = vec![0u8; dst_h * dst_w * 3];
     let x_ratio = src_w as f32 / dst_w as f32;
     let y_ratio = src_h as f32 / dst_h as f32;
-
     for dy in 0..dst_h {
         for dx in 0..dst_w {
             let sx = dx as f32 * x_ratio;
@@ -1069,7 +1057,6 @@ fn resize_bilinear(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: 
             let sy1 = (sy0 + 1).min(src_h - 1);
             let fx = sx - sx0 as f32;
             let fy = sy - sy0 as f32;
-
             for c in 0..3 {
                 let p00 = src[(sy0 * src_w + sx0) * 3 + c] as f32;
                 let p10 = src[(sy0 * src_w + sx1) * 3 + c] as f32;
@@ -1091,28 +1078,23 @@ fn nms_markings(mut dets: Vec<DetectedRoadMarking>, iou_thresh: f32) -> Vec<Dete
         return dets;
     }
     dets.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
     let mut keep = Vec::new();
     let mut suppressed_indices = HashSet::new();
-
     for i in 0..dets.len() {
         if suppressed_indices.contains(&i) {
             continue;
         }
         let current = &dets[i];
         let mut should_keep_current = true;
-
         for j in 0..dets.len() {
             if i == j || suppressed_indices.contains(&j) {
                 continue;
             }
             let other = &dets[j];
             let iou = calculate_iou_arr(&current.bbox, &other.bbox);
-
             if iou > iou_thresh {
                 let is_curr_mixed = current.class_id == 99;
                 let is_other_mixed = other.class_id == 99;
-
                 if is_other_mixed && !is_curr_mixed {
                     should_keep_current = false;
                     break;
