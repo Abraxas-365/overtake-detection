@@ -399,8 +399,8 @@ fn run_lane_detection(
                 lane_width_px,
                 confidence: conf,
                 both_lanes: true,
+                boundary_coherence: detector.boundary_coherence(), // v4.11
             });
-
             // Update last vehicle state
             ps.last_vehicle_state = Some(VehicleState {
                 lateral_offset: lateral_offset_px,
