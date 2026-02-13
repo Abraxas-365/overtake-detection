@@ -144,8 +144,8 @@ impl Default for LateralDetectorConfig {
             curve_coherence_threshold: 0.65,
             curve_shift_threshold_multiplier: 1.8,
             curve_min_sustained_frames: 5,
-            curve_ego_velocity_multiplier: 2.0, // v4.12: double ego thresholds on curves
-            curve_ego_cooldown_frames: 15,      // v4.12: ~500ms at 30fps
+            curve_ego_velocity_multiplier: 2.0,  // v4.12: double ego thresholds on curves
+            curve_ego_cooldown_frames: 15,        // v4.12: ~500ms at 30fps
 
             // v4.11 adaptive baseline defaults
             adaptive_baseline_alpha_max: 0.04,
@@ -323,10 +323,29 @@ pub struct LateralShiftDetector {
     curve_sustained_frames: u32,      // consecutive frames above coherence threshold
     in_curve_mode: bool,              // whether thresholds are currently raised
     // v4.12: Curve ego suppression
-    frames_since_curve_mode: u32, // frames since curve mode was last active
+    frames_since_curve_mode: u32,     // frames since curve mode was last active
     // v4.13b: Whether curve mode was active at ANY point during the current shift.
     // Catches false positives that start/complete during brief curve-mode gaps.
     shift_saw_curve_mode: bool,
+
+    // v4.13b: Post-lane-change return expectation.
+    //
+    // After a confirmed lane change (e.g. LEFT), the return in the opposite
+    // direction (RIGHT) is overwhelmingly likely within ~30s. On curvy roads
+    // the curve ego veto can incorrectly block this return because:
+    //   1. Ego flow is unreliable on low-texture terrain (desert) — reports
+    //      high confidence but near-zero velocity during real lateral motion
+    //   2. The return happens during sustained curve mode, keeping thresholds
+    //      elevated and vetoes active
+    //
+    // When a return is expected, the curve ego veto is bypassed for the
+    // expected direction. This is safe because:
+    //   - A confirmed LC establishes strong prior for the return
+    //   - The lane detection itself (offset crossing threshold) is evidence
+    //   - False positives from curves are typically in the SAME direction
+    //     as the curve distortion, not alternating LEFT→RIGHT→LEFT
+    pending_return_direction: Option<ShiftDirection>,
+    pending_return_deadline_ms: f64, // timestamp after which expectation expires
 }
 
 impl LateralShiftDetector {
@@ -364,6 +383,8 @@ impl LateralShiftDetector {
             in_curve_mode: false,
             frames_since_curve_mode: u32::MAX, // start with no recent curve
             shift_saw_curve_mode: false,
+            pending_return_direction: None,
+            pending_return_deadline_ms: 0.0,
         }
     }
 
@@ -435,9 +456,8 @@ impl LateralShiftDetector {
         // the multi-frame lag that let early-curve false positives through.
         if curvature_says_curve && curvature.unwrap().confidence > 0.5 {
             self.in_curve_mode = true;
-            self.curve_sustained_frames = self
-                .curve_sustained_frames
-                .max(self.config.curve_min_sustained_frames);
+            self.curve_sustained_frames =
+                self.curve_sustained_frames.max(self.config.curve_min_sustained_frames);
         } else {
             // Standard sustained-frame gate for coherence-only path
             self.in_curve_mode =
@@ -452,20 +472,12 @@ impl LateralShiftDetector {
         }
 
         if self.in_curve_mode && !was_curve {
-            let source = if curvature_says_curve {
-                "poly_curvature"
-            } else {
-                "coherence"
-            };
+            let source = if curvature_says_curve { "poly_curvature" } else { "coherence" };
             let curv_info = curvature
-                .map(|c| {
-                    format!(
-                        "agree={:.2} mean_a={:.6} dir={}",
-                        c.curvature_agreement,
-                        c.mean_curvature,
-                        c.curve_direction.as_str()
-                    )
-                })
+                .map(|c| format!(
+                    "agree={:.2} mean_a={:.6} dir={}",
+                    c.curvature_agreement, c.mean_curvature, c.curve_direction.as_str()
+                ))
                 .unwrap_or_else(|| "N/A".to_string());
             info!(
                 "🔄 Curve mode ACTIVATED [{}]: coherence={:.2} sustained={}f | curv=[{}] | thresholds ×{:.1} | ego ×{:.1}",
@@ -502,11 +514,32 @@ impl LateralShiftDetector {
     }
 
     /// Effective shift_confirm_threshold accounting for curve mode.
+    /// v4.13b: Uses base threshold (no curve multiplier) when the current
+    /// shift direction matches the expected return direction.
     fn effective_shift_confirm_threshold(&self) -> f32 {
+        // During return window, use base threshold for confirm too
+        if self.is_in_return_window() {
+            return self.config.shift_confirm_threshold;
+        }
         if self.in_curve_mode {
             self.config.shift_confirm_threshold * self.config.curve_shift_threshold_multiplier
         } else {
             self.config.shift_confirm_threshold
+        }
+    }
+
+    /// v4.13b: Whether the current shift is in the expected return direction
+    /// and within the return time window.
+    fn is_in_return_window(&self) -> bool {
+        if let (Some(pending_dir), Some(shift_dir)) =
+            (self.pending_return_direction, self.shift_direction)
+        {
+            // Note: We can't check timestamp here (no parameter), but the
+            // pending_return_direction is cleared when expired or consumed,
+            // so if it's set, we're still in the window.
+            shift_dir == pending_dir
+        } else {
+            false
         }
     }
 
@@ -544,6 +577,16 @@ impl LateralShiftDetector {
             self.ego_preempt_cooldown -= 1;
         }
 
+        // v4.13b: Expire pending return expectation
+        if self.pending_return_direction.is_some()
+            && timestamp_ms > self.pending_return_deadline_ms
+        {
+            debug!(
+                "🔄 Return expectation expired (no return detected within window)"
+            );
+            self.pending_return_direction = None;
+        }
+
         // Track sustained ego motion for ego-start detection
         if ego.confidence > 0.3 && ego.lateral_velocity.abs() >= self.config.ego_motion_min_velocity
         {
@@ -565,7 +608,7 @@ impl LateralShiftDetector {
             self.frames_without_lanes = 0;
             self.last_lane_width_px = m.lane_width_px;
             self.ego_bridge_frames = 0; // lanes back, bridge ends
-                                        // v4.10: Update cache with fresh measurement
+            // v4.10: Update cache with fresh measurement
             self.cached_measurement = Some(m.clone());
             self.cached_measurement_age = 0;
         } else {
@@ -673,10 +716,38 @@ impl LateralShiftDetector {
                 let abs_dev = deviation.abs();
 
                 // v4.11: Use effective thresholds that account for curve mode
-                let eff_start = self.effective_shift_start_threshold();
+                let mut eff_start = self.effective_shift_start_threshold();
+
+                // v4.13b: If a return is expected and the deviation is in the
+                // return direction, use base threshold (ignore curve multiplier).
+                // The return after a confirmed LC is overwhelmingly likely to be
+                // real, and the raised curve threshold blocks gradual returns.
+                let dev_direction = if deviation < 0.0 {
+                    ShiftDirection::Left
+                } else {
+                    ShiftDirection::Right
+                };
+                let in_return_window = self.pending_return_direction == Some(dev_direction)
+                    && timestamp_ms <= self.pending_return_deadline_ms;
+
+                if in_return_window && self.in_curve_mode {
+                    // Use base threshold for the return direction — curve
+                    // multiplier would block the gradual return.
+                    eff_start = self.config.shift_start_threshold;
+                }
 
                 if abs_dev < eff_start {
-                    self.update_baseline(normalized);
+                    // v4.13b: During return window, slow baseline adaptation by 4x
+                    // so the return deviation can build up against a more stable
+                    // baseline. Normal alpha chases the offset too aggressively
+                    // for gradual returns on curves.
+                    if in_return_window {
+                        if frame_id % 4 == 0 {
+                            self.update_baseline(normalized);
+                        }
+                    } else {
+                        self.update_baseline(normalized);
+                    }
                 }
 
                 if abs_dev >= eff_start {
@@ -695,15 +766,27 @@ impl LateralShiftDetector {
                         frame_id,
                     );
 
-                    info!(
-                        "🔀 Lateral shift started: {} | dev={:.1}% | baseline={:.1}% | ego={:.2}px/f | curve_mode={} eff_thresh={:.1}%",
-                        direction.as_str(),
-                        abs_dev * 100.0,
-                        self.baseline * 100.0,
-                        ego.lateral_velocity,
-                        self.in_curve_mode,
-                        eff_start * 100.0,
-                    );
+                    if in_return_window {
+                        info!(
+                            "🔀 Lateral shift started: {} | dev={:.1}% | baseline={:.1}% | ego={:.2}px/f | curve_mode={} eff_thresh={:.1}% [RETURN WINDOW: base threshold]",
+                            direction.as_str(),
+                            abs_dev * 100.0,
+                            self.baseline * 100.0,
+                            ego.lateral_velocity,
+                            self.in_curve_mode,
+                            eff_start * 100.0,
+                        );
+                    } else {
+                        info!(
+                            "🔀 Lateral shift started: {} | dev={:.1}% | baseline={:.1}% | ego={:.2}px/f | curve_mode={} eff_thresh={:.1}%",
+                            direction.as_str(),
+                            abs_dev * 100.0,
+                            self.baseline * 100.0,
+                            ego.lateral_velocity,
+                            self.in_curve_mode,
+                            eff_start * 100.0,
+                        );
+                    }
                 }
                 // ── v4.10: Ego-motion pre-empt with lanes present ───
                 // When lanes are present but offset hasn't crossed the
@@ -989,7 +1072,10 @@ impl LateralShiftDetector {
         let eff_confirm = self.effective_shift_confirm_threshold();
 
         if let Some(current_dir) = self.shift_direction {
-            if self.shift_frames <= 30 && lane_direction != current_dir && abs_dev > eff_confirm {
+            if self.shift_frames <= 30
+                && lane_direction != current_dir
+                && abs_dev > eff_confirm
+            {
                 // Lane says opposite direction. Check ego.
                 let ego_direction = if self.ego_cumulative_px < 0.0 {
                     ShiftDirection::Left
@@ -1248,10 +1334,22 @@ impl LateralShiftDetector {
         };
         let ego_trustworthy = ego_confidence_ratio >= CURVE_EGO_MIN_CONFIDENCE_RATIO;
 
+        // v4.13b: Check if this shift matches the expected return direction.
+        // After a confirmed LC, the return is overwhelmingly likely to be real,
+        // not a curve artifact. Bypass the veto for expected returns.
+        let is_expected_return = if let (Some(pending_dir), Some(shift_dir)) =
+            (self.pending_return_direction, self.shift_direction)
+        {
+            shift_dir == pending_dir && end_ms <= self.pending_return_deadline_ms
+        } else {
+            false
+        };
+
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
             && ego_trustworthy
             && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
+            && !is_expected_return
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
@@ -1279,31 +1377,44 @@ impl LateralShiftDetector {
             return None;
         }
 
-        // v4.13b: Log when veto WOULD have fired but ego was untrustworthy.
-        // This helps diagnose whether bypassed vetoes were correct (real lane
-        // changes with bad ego) or false negatives (curve artifacts that slipped).
+        // v4.13b: Diagnostic logs for when veto WOULD have fired but was bypassed.
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
-            && !ego_trustworthy
             && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
         {
-            warn!(
-                "⚠️ Curve veto BYPASSED (ego untrustworthy): shift {} | \
-                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
-                 ego_conf={}/{} ({:.0}%) < {:.0}% min → allowing despite curve, \
-                 ego estimator had insufficient confidence",
-                self.shift_direction
-                    .unwrap_or(ShiftDirection::Left)
-                    .as_str(),
-                self.shift_peak_offset * 100.0,
-                self.ego_cumulative_px,
-                self.ego_cumulative_peak_px,
-                curve_ego_threshold,
-                self.ego_shift_confident_frames,
-                self.shift_frames,
-                ego_confidence_ratio * 100.0,
-                CURVE_EGO_MIN_CONFIDENCE_RATIO * 100.0,
-            );
+            if is_expected_return {
+                warn!(
+                    "⚠️ Curve veto BYPASSED (expected return): shift {} | \
+                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
+                     return expected after prior LC → allowing",
+                    self.shift_direction
+                        .unwrap_or(ShiftDirection::Left)
+                        .as_str(),
+                    self.shift_peak_offset * 100.0,
+                    self.ego_cumulative_px,
+                    self.ego_cumulative_peak_px,
+                    curve_ego_threshold,
+                );
+                // Consume the return expectation — only one bypass allowed
+                self.pending_return_direction = None;
+            } else if !ego_trustworthy {
+                warn!(
+                    "⚠️ Curve veto BYPASSED (ego untrustworthy): shift {} | \
+                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
+                     ego_conf={}/{} ({:.0}%) < {:.0}% min → allowing despite curve",
+                    self.shift_direction
+                        .unwrap_or(ShiftDirection::Left)
+                        .as_str(),
+                    self.shift_peak_offset * 100.0,
+                    self.ego_cumulative_px,
+                    self.ego_cumulative_peak_px,
+                    curve_ego_threshold,
+                    self.ego_shift_confident_frames,
+                    self.shift_frames,
+                    ego_confidence_ratio * 100.0,
+                    CURVE_EGO_MIN_CONFIDENCE_RATIO * 100.0,
+                );
+            }
         }
 
         // ── FINAL DIRECTION VALIDATION (v4.4, v4.10b) ────────────
@@ -1381,6 +1492,24 @@ impl LateralShiftDetector {
             } else {
                 0.0
             },
+        );
+
+        // v4.13b: Set return expectation — after a confirmed lane change,
+        // expect the opposite direction within 30s. This allows the curve
+        // veto to be bypassed for the return on roads where ego flow is
+        // unreliable (desert, low-texture terrain).
+        const RETURN_WINDOW_MS: f64 = 30_000.0;
+        let return_dir = match evt.direction {
+            ShiftDirection::Left => ShiftDirection::Right,
+            ShiftDirection::Right => ShiftDirection::Left,
+        };
+        self.pending_return_direction = Some(return_dir);
+        self.pending_return_deadline_ms = end_ms + RETURN_WINDOW_MS;
+        debug!(
+            "🔄 Return expected: {} within {:.0}s (deadline {:.1}s)",
+            return_dir.as_str(),
+            RETURN_WINDOW_MS / 1000.0,
+            self.pending_return_deadline_ms / 1000.0,
         );
 
         self.state = State::Stable;
@@ -1584,8 +1713,8 @@ impl LateralShiftDetector {
             let signed_deltas: Vec<f32> = recent.windows(2).map(|w| w[0] - w[1]).collect();
             let positive_count = signed_deltas.iter().filter(|d| **d > 0.0).count();
             let negative_count = signed_deltas.iter().filter(|d| **d < 0.0).count();
-            let direction_consistency =
-                positive_count.max(negative_count) as f32 / signed_deltas.len().max(1) as f32;
+            let direction_consistency = positive_count.max(negative_count) as f32
+                / signed_deltas.len().max(1) as f32;
 
             if variance < self.config.adaptive_baseline_max_variance
                 && avg_drift > self.config.adaptive_baseline_min_drift
@@ -1595,9 +1724,11 @@ impl LateralShiftDetector {
                 let drift_factor = ((avg_drift - self.config.adaptive_baseline_min_drift)
                     / (self.config.adaptive_baseline_min_drift * 5.0))
                     .min(1.0);
-                let variance_factor =
-                    (1.0 - variance / self.config.adaptive_baseline_max_variance).max(0.0);
-                let consistency_factor = ((direction_consistency - 0.6) / 0.4).min(1.0);
+                let variance_factor = (1.0
+                    - variance / self.config.adaptive_baseline_max_variance)
+                    .max(0.0);
+                let consistency_factor =
+                    ((direction_consistency - 0.6) / 0.4).min(1.0);
 
                 let boost = drift_factor * variance_factor * consistency_factor;
                 let adaptive_alpha =
@@ -2035,4 +2166,3 @@ mod tests {
         );
     }
 }
-
