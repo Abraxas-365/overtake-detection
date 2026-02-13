@@ -211,6 +211,11 @@ pub struct ManeuverEvent {
 struct BufferedPass {
     event: PassEvent,
     correlated: bool,
+    /// v4.13b: VehicleOvertookEgo passes suppressed by the curve gate are
+    /// deferred rather than consumed. This allows later re-interpretation
+    /// as an OVERTAKE if a corroborating ego lateral shift appears.
+    /// (Ego's lane change caused the zone transition, not the vehicle overtaking.)
+    curve_deferred: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +266,7 @@ impl ManeuverClassifier {
         self.pass_buffer.push_back(BufferedPass {
             event,
             correlated: false,
+            curve_deferred: false,
         });
     }
 
@@ -572,12 +578,111 @@ impl ManeuverClassifier {
             }
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // v4.13b: CURVE-DEFERRED VehicleOvertookEgo + SHIFT → OVERTAKE
+        //
+        // When the curve gate defers a VehicleOvertookEgo (no corroborating
+        // shift at the time), a subsequent ego lateral shift may reveal that
+        // the zone transition was actually caused by the ego overtaking the
+        // vehicle, not the vehicle overtaking the ego.
+        //
+        // Pattern: ego LEFT shift + vehicle on RIGHT side (BESIDE_R→AHEAD)
+        //   = ego moved to opposite lane to pass the vehicle
+        //
+        // The VehicleOvertookEgo zone sequence (BESIDE→AHEAD) is actually
+        // the perspective effect of the ego's own lane change — the vehicle
+        // appeared to shift zones because the camera moved, not the vehicle.
+        // ══════════════════════════════════════════════════════════════════
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
+            }
+            if !self.pass_buffer[pass_idx].curve_deferred {
+                continue;
+            }
+
+            let pass = &self.pass_buffer[pass_idx].event;
+
+            let mut best_shift_idx: Option<usize> = None;
+            let mut best_time_gap = f64::MAX;
+
+            for (si, shift) in self.shift_buffer.iter().enumerate() {
+                if shift.correlated {
+                    continue;
+                }
+
+                // Ego moved OPPOSITE to the vehicle's side:
+                //   vehicle on RIGHT + ego shifted LEFT = ego overtook
+                //   vehicle on LEFT  + ego shifted RIGHT = ego overtook
+                let ego_overtook = matches!(
+                    (pass.side, shift.event.direction),
+                    (PassSide::Right, ShiftDirection::Left)
+                        | (PassSide::Left, ShiftDirection::Right)
+                );
+
+                if !ego_overtook {
+                    continue;
+                }
+
+                // Use extended window: pass's beside phase through a generous
+                // post-ahead window, since the ego shift often starts well after
+                // the vehicle's zone transitions due to tracking delays.
+                let pass_window_end =
+                    pass.beside_end_ms.max(pass.ahead_start_ms) + self.config.correlation_window_ms;
+
+                let time_gap = temporal_gap(
+                    pass.beside_start_ms,
+                    pass_window_end,
+                    shift.event.start_ms,
+                    shift.event.end_ms,
+                );
+
+                if time_gap < gap && time_gap < best_time_gap {
+                    best_shift_idx = Some(si);
+                    best_time_gap = time_gap;
+                }
+            }
+
+            if let Some(si) = best_shift_idx {
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let shift_event = self.shift_buffer[si].event.clone();
+
+                let maneuver =
+                    self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+
+                if maneuver.confidence >= self.config.min_combined_confidence {
+                    info!(
+                        "🚗 OVERTAKE (ego passed vehicle): Track {} re-interpreted \
+                         VehicleOvertookEgo + {} shift | conf={:.2} | legality={:?}",
+                        pass_event.vehicle_track_id,
+                        shift_event.direction.as_str(),
+                        maneuver.confidence,
+                        maneuver.legality,
+                    );
+
+                    self.recent_events.push(maneuver);
+                    self.total_maneuvers += 1;
+
+                    self.pass_buffer[pass_idx].correlated = true;
+                    self.shift_buffer[si].correlated = true;
+                }
+            }
+        }
+
         // ── BEING OVERTAKEN ─────────────────────────────────────
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
                 continue;
             }
             if self.pass_buffer[pass_idx].event.direction == PassDirection::VehicleOvertookEgo {
+                // v4.13b: Skip passes deferred by the curve gate — they're
+                // waiting for potential re-interpretation as ego-overtakes.
+                // If no corroborating shift appears, they'll expire from the
+                // buffer naturally (not emitted as false being_overtaken).
+                if self.pass_buffer[pass_idx].curve_deferred {
+                    continue;
+                }
+
                 // v4.12: Ego-motion-induced VehicleOvertookEgo gate
                 if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
                     warn!(
@@ -617,14 +722,17 @@ impl ManeuverClassifier {
 
                     if !has_corroborating_shift {
                         warn!(
-                            "  ❌ REJECTED VehicleOvertookEgo (track {}): curve-induced \
-                             zone oscillation (BESIDE→AHEAD flip on curve, no lateral \
-                             shift corroboration) | curve_active={} frames_since={}",
+                            "  ⏳ DEFERRED VehicleOvertookEgo (track {}): curve-induced \
+                             zone oscillation suspected (BESIDE→AHEAD flip on curve, no lateral \
+                             shift corroboration YET) | curve_active={} frames_since={}",
                             self.pass_buffer[pass_idx].event.vehicle_track_id,
                             self.curve_mode_active,
                             self.frames_since_curve_mode,
                         );
-                        self.pass_buffer[pass_idx].correlated = true;
+                        // v4.13b: Defer instead of consuming. If a lateral shift
+                        // appears later, this can be re-interpreted as an OVERTAKE
+                        // (ego's lane change caused the zone transition).
+                        self.pass_buffer[pass_idx].curve_deferred = true;
                         continue;
                     }
                 }
