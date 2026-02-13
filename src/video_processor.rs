@@ -306,8 +306,9 @@ pub fn draw_lanes_v2(
                 };
 
                 let mut overlay = output.try_clone()?;
-                let pts_mat = Mat::from_slice(&poly_pts)?;
-                let pts_vec = Vector::<Mat>::from(vec![pts_mat]);
+                let mut pts_vec = Vector::<Vector<core::Point>>::new();
+                let inner: Vector<core::Point> = Vector::from_iter(poly_pts.into_iter());
+                pts_vec.push(inner);
                 imgproc::fill_poly(
                     &mut overlay,
                     &pts_vec,
@@ -479,7 +480,6 @@ pub fn draw_lanes_v2(
         let label_h = size1.height + size2.height + 12;
 
         let bg_pt1 = core::Point::new(bbox[0] as i32 - 2, label_y - label_h);
-        let bg_pt2 = core::Point::new(bbox[0] as i32 + label_w, label_y + 4);
 
         // Semi-transparent label background
         draw_filled_rect_alpha(&mut output, bg_pt1.x, bg_pt1.y, label_w, label_h + 4, 0.75)?;
@@ -556,8 +556,8 @@ pub fn draw_lanes_v2(
         core::Point::new(ego_x - 12, ego_y + 10),
         core::Point::new(ego_x + 12, ego_y + 10),
     ];
-    let tri_mat = Mat::from_slice(&tri_pts)?;
-    let tri_vec = Vector::<Mat>::from(vec![tri_mat]);
+    let mut tri_vec = Vector::<Vector<core::Point>>::new();
+    tri_vec.push(Vector::from_iter(tri_pts.into_iter()));
     imgproc::fill_poly(
         &mut output,
         &tri_vec,
@@ -647,8 +647,8 @@ pub fn draw_lanes_v2(
                 core::Point::new(icon_x, icon_y + 30),
                 core::Point::new(icon_x + 30, icon_y + 30),
             ];
-            let tri_m = Mat::from_slice(&tri)?;
-            let tri_v = Vector::<Mat>::from(vec![tri_m]);
+            let mut tri_v = Vector::<Vector<core::Point>>::new();
+            tri_v.push(Vector::from_iter(tri.into_iter()));
             imgproc::polylines(
                 &mut output,
                 &tri_v,
