@@ -552,34 +552,12 @@ impl ManeuverClassifier {
             }
         }
 
-        // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
-        for shift_idx in 0..self.shift_buffer.len() {
-            if self.shift_buffer[shift_idx].correlated {
-                continue;
-            }
-            if !self.shift_buffer[shift_idx].event.confirmed {
-                continue;
-            }
-
-            let shift_event = self.shift_buffer[shift_idx].event.clone();
-            let maneuver = self.build_lane_change(&shift_event, legality_buffer);
-
-            if maneuver.confidence >= self.config.min_combined_confidence {
-                info!(
-                    "🔀 LANE CHANGE: {} | conf={:.2} | legality={:?}",
-                    maneuver.side.as_str(),
-                    maneuver.confidence,
-                    maneuver.legality,
-                );
-
-                self.recent_events.push(maneuver);
-                self.total_maneuvers += 1;
-                self.shift_buffer[shift_idx].correlated = true;
-            }
-        }
-
         // ══════════════════════════════════════════════════════════════════
         // v4.13b: CURVE-DEFERRED VehicleOvertookEgo + SHIFT → OVERTAKE
+        //
+        // IMPORTANT: This MUST run BEFORE the lane change emission below.
+        // Otherwise the shift gets emitted as a standalone LANE_CHANGE first
+        // (marked correlated), and the reinterpretation loop can't claim it.
         //
         // When the curve gate defers a VehicleOvertookEgo (no corroborating
         // shift at the time), a subsequent ego lateral shift may reveal that
@@ -666,6 +644,34 @@ impl ManeuverClassifier {
                     self.pass_buffer[pass_idx].correlated = true;
                     self.shift_buffer[si].correlated = true;
                 }
+            }
+        }
+
+        // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
+        // Runs AFTER deferred reinterpretation so shifts consumed by
+        // the overtake path above won't also emit as lane changes.
+        for shift_idx in 0..self.shift_buffer.len() {
+            if self.shift_buffer[shift_idx].correlated {
+                continue;
+            }
+            if !self.shift_buffer[shift_idx].event.confirmed {
+                continue;
+            }
+
+            let shift_event = self.shift_buffer[shift_idx].event.clone();
+            let maneuver = self.build_lane_change(&shift_event, legality_buffer);
+
+            if maneuver.confidence >= self.config.min_combined_confidence {
+                info!(
+                    "🔀 LANE CHANGE: {} | conf={:.2} | legality={:?}",
+                    maneuver.side.as_str(),
+                    maneuver.confidence,
+                    maneuver.legality,
+                );
+
+                self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+                self.shift_buffer[shift_idx].correlated = true;
             }
         }
 
