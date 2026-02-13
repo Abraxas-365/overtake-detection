@@ -201,6 +201,13 @@ pub struct LateralShiftEvent {
     pub confidence: f32,
     /// Was the shift confirmed (peak exceeded confirm threshold)?
     pub confirmed: bool,
+    /// v4.13: Whether curve mode was active during this shift.
+    pub curve_mode: bool,
+    /// v4.13: Peak absolute ego cumulative displacement during shift (px).
+    /// Near zero = no physical lateral motion (perspective artifact if LaneBased).
+    pub ego_cumulative_peak_px: f32,
+    /// v4.13: Shift detection source (LaneBased / EgoBridged / EgoStarted).
+    pub source_label: &'static str,
 }
 
 /// Input from ego-motion estimator (optical flow based)
@@ -1162,6 +1169,47 @@ impl LateralShiftDetector {
     fn emit_shift_event(&mut self, end_ms: f64, end_frame: u64) -> Option<LateralShiftEvent> {
         let duration_ms = end_ms - self.shift_start_ms;
 
+        // ══════════════════════════════════════════════════════════
+        // v4.13 FIX (Bug 2): Curve-mode ego cross-validation gate.
+        //
+        // On sharp curves, perspective distortion can produce arbitrarily
+        // large normalized offsets (162.9% seen in production). No scalar
+        // multiplier on shift thresholds can catch this because the
+        // distortion scales with curvature, not with a fixed factor.
+        //
+        // Gate: If curve_mode was active during this shift AND the shift
+        // was LaneBased (not ego-started), require minimum ego cumulative
+        // displacement to confirm the vehicle actually moved laterally.
+        // If the car didn't move (ego_cum ≈ 0), the "shift" is pure
+        // perspective artifact from the curve.
+        //
+        // Threshold: 10px cumulative ego displacement. A real lane change
+        // shows 50-150px+. Curve noise is typically <5px.
+        // ══════════════════════════════════════════════════════════
+        const CURVE_EGO_CONFIRMATION_MIN_PX: f32 = 10.0;
+
+        if self.in_curve_mode
+            && self.shift_source == ShiftSource::LaneBased
+            && self.ego_cumulative_peak_px.abs() < CURVE_EGO_CONFIRMATION_MIN_PX
+        {
+            warn!(
+                "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
+                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min | \
+                 dur={:.1}s | curve_mode=true → perspective distortion, not lane change",
+                self.shift_direction
+                    .unwrap_or(ShiftDirection::Left)
+                    .as_str(),
+                self.shift_peak_offset * 100.0,
+                self.ego_cumulative_px,
+                self.ego_cumulative_peak_px,
+                CURVE_EGO_CONFIRMATION_MIN_PX,
+                duration_ms / 1000.0,
+            );
+            self.state = State::Stable;
+            self.reset_shift();
+            return None;
+        }
+
         // ── FINAL DIRECTION VALIDATION (v4.4, v4.10b) ────────────
         // Ego cumulative displacement is the ground truth for direction.
         // If ego clearly moved one way, trust that over initial lane reading.
@@ -1196,6 +1244,12 @@ impl LateralShiftDetector {
             confidence = confidence.max(0.20);
         }
 
+        let source_label = match self.shift_source {
+            ShiftSource::LaneBased => "LaneBased",
+            ShiftSource::EgoBridged => "EgoBridged",
+            ShiftSource::EgoStarted => "EgoStarted",
+        };
+
         let evt = LateralShiftEvent {
             direction: validated_direction,
             peak_offset: self.shift_peak_offset,
@@ -1206,6 +1260,9 @@ impl LateralShiftDetector {
             duration_ms,
             confidence,
             confirmed: true,
+            curve_mode: self.in_curve_mode,
+            ego_cumulative_peak_px: self.ego_cumulative_peak_px,
+            source_label,
         };
 
         info!(
@@ -1699,6 +1756,83 @@ mod tests {
             "Deviation ({:.3}) should be below shift threshold ({:.3}) thanks to adaptive baseline",
             deviation,
             det.effective_shift_start_threshold(),
+        );
+    }
+
+    /// v4.13: On a sharp curve, perspective distortion can produce offsets
+    /// exceeding even the raised curve threshold (e.g. 162% peak). If ego
+    /// cumulative displacement is near zero, the shift must be vetoed as a
+    /// perspective artifact, not emitted as a lane change.
+    ///
+    /// Reproduces production Bug 2:
+    ///   curve_mode=true, source=LaneBased, ego_cum=-3.3px, peak=162.9%
+    #[test]
+    fn test_curve_ego_crossvalidation_veto() {
+        let config = default_mining_config();
+        let mut det = LateralShiftDetector::new(config);
+        let lane_w = 248.0; // From production bug: narrow lane
+
+        // Warmup: establish baseline
+        for i in 0..30 {
+            let m = make_measurement(0.0, lane_w, -1.0);
+            det.update(Some(m), None, i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Phase 1: Activate curve mode with sustained high coherence
+        for i in 0..8 {
+            let m = make_measurement(0.0, lane_w, 0.85);
+            let frame = 30 + i as u64;
+            det.update(Some(m), None, frame as f64 * 33.3, frame);
+        }
+        assert!(det.in_curve_mode, "Curve mode should be active");
+
+        // Phase 2: Sharp curve drives offset to 160%+ (beyond raised threshold)
+        // with zero ego motion — pure perspective distortion.
+        // Mining effective threshold = 35% × 2.0 = 70%.
+        // We ramp through 70% (shift starts) up to 160%+.
+        let ramp_frames = 30; // 1.0s
+        for i in 0..ramp_frames {
+            let t = i as f32 / ramp_frames as f32;
+            let offset_px = t * 1.63 * lane_w; // ramp to ~163%
+            let m = make_measurement(offset_px, lane_w, 0.80);
+            // Very small ego motion (matching production: -0.30 px/frame)
+            let ego = EgoMotionInput {
+                lateral_velocity: -0.30,
+                confidence: 0.5,
+            };
+            let frame = 38 + i as u64;
+            let result = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
+            // Shift should NOT be emitted yet (still ramping or still active)
+            // But it might start the shift state
+            assert!(
+                result.is_none(),
+                "Frame {}: unexpected shift emission during ramp",
+                frame
+            );
+        }
+
+        // Phase 3: Offset returns toward baseline — shift should try to complete.
+        // The ego cross-validation should VETO it since ego_cumulative_peak is tiny.
+        let return_frames = 25;
+        let mut any_shift_emitted = false;
+        for i in 0..return_frames {
+            let t = i as f32 / return_frames as f32;
+            let offset_px = (1.0 - t) * 1.63 * lane_w; // returning to 0
+            let m = make_measurement(offset_px, lane_w, 0.70);
+            let ego = EgoMotionInput {
+                lateral_velocity: -0.10,
+                confidence: 0.4,
+            };
+            let frame = 68 + i as u64;
+            if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
+                any_shift_emitted = true;
+            }
+        }
+
+        assert!(
+            !any_shift_emitted,
+            "Curve perspective distortion with no ego motion should be VETOED, not emitted"
         );
     }
 }
