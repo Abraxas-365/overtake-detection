@@ -642,14 +642,17 @@ impl ManeuverClassifier {
                     self.total_maneuvers += 1;
 
                     self.pass_buffer[pass_idx].correlated = true;
-                    self.shift_buffer[si].correlated = true;
+                    // NOTE: Intentionally NOT marking shift as correlated.
+                    // An overtake inherently includes a lane change — the
+                    // shift should still emit as a LANE_CHANGE event below.
                 }
             }
         }
 
         // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
-        // Runs AFTER deferred reinterpretation so shifts consumed by
-        // the overtake path above won't also emit as lane changes.
+        // Runs AFTER deferred reinterpretation. Shifts used for overtakes
+        // are intentionally left uncorrelated so they also emit as lane
+        // changes (an overtake always includes a lane change).
         for shift_idx in 0..self.shift_buffer.len() {
             if self.shift_buffer[shift_idx].correlated {
                 continue;
