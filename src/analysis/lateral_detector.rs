@@ -318,6 +318,9 @@ pub struct LateralShiftDetector {
     in_curve_mode: bool,              // whether thresholds are currently raised
     // v4.12: Curve ego suppression
     frames_since_curve_mode: u32, // frames since curve mode was last active
+    // v4.13b: Whether curve mode was active at ANY point during the current shift.
+    // Catches false positives that start/complete during brief curve-mode gaps.
+    shift_saw_curve_mode: bool,
 }
 
 impl LateralShiftDetector {
@@ -353,6 +356,7 @@ impl LateralShiftDetector {
             curve_sustained_frames: 0,
             in_curve_mode: false,
             frames_since_curve_mode: u32::MAX, // start with no recent curve
+            shift_saw_curve_mode: false,
         }
     }
 
@@ -798,7 +802,7 @@ impl LateralShiftDetector {
                 if has_ego && self.ego_bridge_frames < self.config.ego_bridge_max_frames {
                     self.ego_bridge_frames += 1;
                     self.shift_frames += 1;
-
+                    self.shift_saw_curve_mode |= self.in_curve_mode; // v4.13b
                     if self.shift_source == ShiftSource::LaneBased {
                         self.shift_source = ShiftSource::EgoBridged;
                         // Initialize estimated offset from last known lane position
@@ -947,6 +951,10 @@ impl LateralShiftDetector {
         if self.ego_cumulative_px.abs() > self.ego_cumulative_peak_px.abs() {
             self.ego_cumulative_peak_px = self.ego_cumulative_px;
         }
+
+        // v4.13b: Latch curve mode — if curve activates at ANY point during
+        // the shift, the flag stays true even if curve_mode deactivates later.
+        self.shift_saw_curve_mode |= self.in_curve_mode;
 
         if abs_dev > self.shift_peak_offset {
             self.shift_peak_offset = abs_dev;
@@ -1101,6 +1109,9 @@ impl LateralShiftDetector {
         self.ego_cumulative_px = 0.0;
         self.ego_bridge_frames = 0;
         self.ego_estimated_offset = 0.0;
+        // v4.13b: Latch curve mode at shift start. Will also be latched
+        // if curve_mode activates later during the shift.
+        self.shift_saw_curve_mode = self.in_curve_mode;
     }
 
     /// Settle an ego-bridged shift when ego velocity drops (vehicle stopped moving laterally).
@@ -1183,27 +1194,53 @@ impl LateralShiftDetector {
         // If the car didn't move (ego_cum ≈ 0), the "shift" is pure
         // perspective artifact from the curve.
         //
-        // Threshold: 10px cumulative ego displacement. A real lane change
-        // shows 50-150px+. Curve noise is typically <5px.
+        // Threshold: Duration-scaled ego displacement.
+        //
+        // A flat 10px threshold is too low for longer shifts — on curves,
+        // optical flow accumulates at ~5-15px/s from road rotation alone.
+        // A real lane change produces ≥15px/s of true lateral displacement
+        // regardless of duration (3.5m lateral / ~3s ≈ 50-150px total).
+        //
+        // Formula: max(10.0, duration_s × 15.0)
+        //   0.5s → 10px (floor)     |  LC2 prod: 1.1px / 1.1s → 16.5px min → VETOED
+        //   2.5s → 37.5px           |  LC1 prod: 31.5px / 2.5s → 37.5px min → VETOED
+        //   3.0s → 45px             |  LC3 prod: 116.8px / 3.0s → 45px min → PASSES
+        //
+        // v4.13b: Use shift_saw_curve_mode (latched during shift lifetime)
+        // instead of only in_curve_mode at emit time. Curve mode chatters
+        // on curvy roads — shifts that start/complete during brief off-gaps
+        // escaped the gate. Latching catches them.
         // ══════════════════════════════════════════════════════════
-        const CURVE_EGO_CONFIRMATION_MIN_PX: f32 = 10.0;
+        const CURVE_EGO_MIN_FLOOR_PX: f32 = 10.0;
+        const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 15.0;
 
-        if self.in_curve_mode
+        let duration_s = (duration_ms / 1000.0) as f32;
+        let curve_ego_threshold =
+            CURVE_EGO_MIN_FLOOR_PX.max(duration_s * CURVE_EGO_MIN_RATE_PX_PER_S);
+
+        let curve_tainted = self.in_curve_mode || self.shift_saw_curve_mode;
+
+        if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
-            && self.ego_cumulative_peak_px.abs() < CURVE_EGO_CONFIRMATION_MIN_PX
+            && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
-                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min | \
-                 dur={:.1}s | curve_mode=true → perspective distortion, not lane change",
+                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}) | \
+                 dur={:.1}s | curve_now={} curve_saw={} → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),
                 self.shift_peak_offset * 100.0,
                 self.ego_cumulative_px,
                 self.ego_cumulative_peak_px,
-                CURVE_EGO_CONFIRMATION_MIN_PX,
+                curve_ego_threshold,
+                CURVE_EGO_MIN_FLOOR_PX,
+                duration_s,
+                CURVE_EGO_MIN_RATE_PX_PER_S,
                 duration_ms / 1000.0,
+                self.in_curve_mode,
+                self.shift_saw_curve_mode,
             );
             self.state = State::Stable;
             self.reset_shift();
@@ -1260,7 +1297,7 @@ impl LateralShiftDetector {
             duration_ms,
             confidence,
             confirmed: true,
-            curve_mode: self.in_curve_mode,
+            curve_mode: self.in_curve_mode || self.shift_saw_curve_mode,
             ego_cumulative_peak_px: self.ego_cumulative_peak_px,
             source_label,
         };
@@ -1537,6 +1574,7 @@ impl LateralShiftDetector {
         self.ego_bridge_frames = 0;
         self.ego_estimated_offset = 0.0;
         self.ego_preempt_originated = false;
+        self.shift_saw_curve_mode = false;
     }
 
     fn is_deviation_stable(&self) -> bool {
@@ -1833,6 +1871,100 @@ mod tests {
         assert!(
             !any_shift_emitted,
             "Curve perspective distortion with no ego motion should be VETOED, not emitted"
+        );
+    }
+
+    /// v4.13b: Curve mode chatters on curvy roads (activating for a few frames,
+    /// deactivating for a few). A shift that starts during a brief off-gap and
+    /// completes while curve is off again must STILL be vetoed if curve was
+    /// active at any point during the shift (shift_saw_curve_mode).
+    ///
+    /// Reproduces production false positives LC1 & LC2:
+    ///   LC2: peak=58.3%, dur=1.1s, ego_cum=-1.1px, curve_mode=false (at emit)
+    ///   LC1: peak=99.0%, dur=2.5s, ego_cum=-31.5px, curve_mode=false (at emit)
+    #[test]
+    fn test_curve_chatter_veto_via_saw_curve_mode() {
+        let config = default_mining_config();
+        let mut det = LateralShiftDetector::new(config);
+        let lane_w = 400.0;
+
+        // Warmup: establish baseline
+        for i in 0..30 {
+            let m = make_measurement(0.0, lane_w, -1.0);
+            det.update(Some(m), None, i as f64 * 33.3, i);
+        }
+        assert_eq!(det.state, State::Stable);
+
+        // Phase 1: Brief curve mode activation, then deactivation (chatter)
+        for i in 0..6 {
+            let m = make_measurement(0.0, lane_w, 0.85);
+            let frame = 30 + i as u64;
+            det.update(Some(m), None, frame as f64 * 33.3, frame);
+        }
+        assert!(det.in_curve_mode, "Curve mode should activate");
+
+        // Deactivate curve mode (low coherence)
+        for i in 0..4 {
+            let m = make_measurement(0.0, lane_w, 0.1);
+            let frame = 36 + i as u64;
+            det.update(Some(m), None, frame as f64 * 33.3, frame);
+        }
+        assert!(!det.in_curve_mode, "Curve mode should have deactivated");
+
+        // Phase 2: Shift starts while curve_mode=false (the gap).
+        // Offset ramps to 60% — above base 35% threshold but below raised 70%.
+        let ramp_frames = 20;
+        for i in 0..ramp_frames {
+            let t = i as f32 / ramp_frames as f32;
+            let offset_px = t * 0.60 * lane_w;
+            // Low coherence — curve mode stays off
+            let m = make_measurement(offset_px, lane_w, 0.2);
+            let ego = EgoMotionInput {
+                lateral_velocity: -0.15, // tiny, curve-induced
+                confidence: 0.4,
+            };
+            let frame = 40 + i as u64;
+            det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
+        }
+
+        // Phase 3: Curve mode re-activates briefly during the shift
+        for i in 0..5 {
+            let offset_px = 0.55 * lane_w; // holding near peak
+            let m = make_measurement(offset_px, lane_w, 0.85);
+            let ego = EgoMotionInput {
+                lateral_velocity: -0.10,
+                confidence: 0.3,
+            };
+            let frame = 60 + i as u64;
+            det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
+        }
+        // shift_saw_curve_mode should now be latched true
+
+        // Phase 4: Curve mode off again, offset returns to baseline.
+        // Shift should try to complete but be vetoed by saw_curve_mode + low ego.
+        let return_frames = 25;
+        let mut any_shift_emitted = false;
+        for i in 0..return_frames {
+            let t = i as f32 / return_frames as f32;
+            let offset_px = (1.0 - t) * 0.55 * lane_w;
+            let m = make_measurement(offset_px, lane_w, 0.1); // curve mode off
+            let ego = EgoMotionInput {
+                lateral_velocity: 0.05,
+                confidence: 0.3,
+            };
+            let frame = 65 + i as u64;
+            if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
+                any_shift_emitted = true;
+            }
+        }
+
+        assert!(
+            !det.in_curve_mode,
+            "Curve mode should be OFF at emit time (reproducing the chatter gap)"
+        );
+        assert!(
+            !any_shift_emitted,
+            "Shift during curve chatter gap with near-zero ego should be VETOED via shift_saw_curve_mode"
         );
     }
 }
