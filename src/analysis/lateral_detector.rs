@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
+use super::curvature_estimator::CurvatureEstimate;
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -82,6 +84,15 @@ pub struct LateralDetectorConfig {
     pub curve_shift_threshold_multiplier: f32,
     /// Consecutive frames of above-threshold coherence needed to activate curve mode.
     pub curve_min_sustained_frames: u32,
+    /// v4.12: Multiplier applied to ego velocity thresholds during curve mode.
+    /// On curves, optical flow shows genuine lateral pixel displacement (road
+    /// surface rotates in camera frame), but it's rotational, not translational.
+    /// Raising the bar prevents ego-preempt and ego-start from triggering on curves.
+    pub curve_ego_velocity_multiplier: f32,
+    /// v4.12: Frames after curve mode deactivates during which ego-only shift
+    /// starts remain suppressed. Curves often cause brief coherence drops when
+    /// one boundary is temporarily lost, so we carry the suppression forward.
+    pub curve_ego_cooldown_frames: u32,
 
     // ── v4.11: Adaptive baseline alpha (smooth drift tracking) ──
     /// Maximum baseline alpha when smooth drift is detected.
@@ -133,6 +144,8 @@ impl Default for LateralDetectorConfig {
             curve_coherence_threshold: 0.65,
             curve_shift_threshold_multiplier: 1.8,
             curve_min_sustained_frames: 5,
+            curve_ego_velocity_multiplier: 2.0, // v4.12: double ego thresholds on curves
+            curve_ego_cooldown_frames: 15,      // v4.12: ~500ms at 30fps
 
             // v4.11 adaptive baseline defaults
             adaptive_baseline_alpha_max: 0.04,
@@ -226,7 +239,7 @@ enum ShiftSource {
 }
 
 /// Input measurement from lane detection
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LaneMeasurement {
     /// Raw lateral offset in pixels
     pub lateral_offset_px: f32,
@@ -240,6 +253,10 @@ pub struct LaneMeasurement {
     /// +1.0 = boundaries co-moving (curve), -1.0 = diverging (lane change),
     /// 0.0 = inconclusive, < -0.5 = no data.
     pub boundary_coherence: f32,
+    /// v4.13: Polynomial curvature estimate from YOLO-seg mask geometry.
+    /// Direct geometric measurement — replaces boundary coherence as primary
+    /// curve signal when available. Boundary coherence remains as fallback.
+    pub curvature: Option<CurvatureEstimate>,
 }
 
 // ============================================================================
@@ -292,6 +309,8 @@ pub struct LateralShiftDetector {
     coherence_history: VecDeque<f32>, // recent boundary coherence values
     curve_sustained_frames: u32,      // consecutive frames above coherence threshold
     in_curve_mode: bool,              // whether thresholds are currently raised
+    // v4.12: Curve ego suppression
+    frames_since_curve_mode: u32, // frames since curve mode was last active
 }
 
 impl LateralShiftDetector {
@@ -326,54 +345,133 @@ impl LateralShiftDetector {
             coherence_history: VecDeque::with_capacity(20),
             curve_sustained_frames: 0,
             in_curve_mode: false,
+            frames_since_curve_mode: u32::MAX, // start with no recent curve
         }
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // v4.11: CURVE STATE MANAGEMENT
+    // v4.11/v4.13: CURVE STATE MANAGEMENT
     // ════════════════════════════════════════════════════════════════════
 
-    /// Update curve detection state from the latest boundary coherence value.
-    /// Call once per frame with the coherence from `LaneMeasurement`.
-    fn update_curve_state(&mut self, coherence: f32) {
-        // Ignore sentinel "no data" values
-        if coherence < -0.5 {
-            // No data — don't update sustained counter, let it decay
+    /// Update curve detection state from measurement data.
+    ///
+    /// v4.13: Uses polynomial curvature as PRIMARY signal when available.
+    /// Polynomial curvature is a direct geometric measurement from mask shapes —
+    /// it works on a single frame with zero temporal lag. Boundary coherence
+    /// (v4.11) is retained as FALLBACK when masks are too noisy for polynomial fit.
+    fn update_curve_state(&mut self, coherence: f32, curvature: Option<&CurvatureEstimate>) {
+        // ── v4.13: Polynomial curvature (primary signal) ──────────
+        //
+        // The curvature estimator fits x = ay² + by + c to each boundary's
+        // mask spine. If both boundaries have similar `a` coefficients
+        // (curvature_agreement > threshold), it's a road curve.
+        //
+        // This is INSTANT — no sustained-frame requirement. One good frame
+        // with both boundaries visible is enough to confirm a curve.
+        //
+        let curvature_says_curve = curvature
+            .map(|c| c.is_curve && c.confidence > 0.3)
+            .unwrap_or(false);
+
+        // ── v4.11: Boundary coherence (fallback signal) ──────────
+        let coherence_says_curve = if coherence < -0.5 {
+            None // no data
+        } else {
+            self.coherence_history.push_back(coherence);
+            if self.coherence_history.len() > 15 {
+                self.coherence_history.pop_front();
+            }
+            Some(coherence >= self.config.curve_coherence_threshold)
+        };
+
+        // ── Combined decision ────────────────────────────────────
+        //
+        // Curvature is authoritative when available (geometric, instant).
+        // Coherence fills in when curvature can't compute (poor masks).
+        // We still use the sustained-frame counter for coherence-only mode.
+        //
+        let frame_is_curve = if curvature.is_some() && curvature.unwrap().confidence > 0.2 {
+            // Curvature estimator had enough data to form an opinion
+            curvature_says_curve
+        } else {
+            // Fall back to coherence-based detection
+            coherence_says_curve.unwrap_or(false)
+        };
+
+        if frame_is_curve {
+            self.curve_sustained_frames += 1;
+        } else if coherence_says_curve == Some(false) && !curvature_says_curve {
+            // Both signals say not-curve — faster decay
+            self.curve_sustained_frames = self.curve_sustained_frames.saturating_sub(2);
+        } else {
+            // Ambiguous (no data) — slow decay
             if self.curve_sustained_frames > 0 {
                 self.curve_sustained_frames -= 1;
             }
-            return;
-        }
-
-        self.coherence_history.push_back(coherence);
-        if self.coherence_history.len() > 15 {
-            self.coherence_history.pop_front();
-        }
-
-        if coherence >= self.config.curve_coherence_threshold {
-            self.curve_sustained_frames += 1;
-        } else {
-            // Below threshold — fast decay but don't reset instantly
-            // (brief dips in coherence shouldn't kill curve mode)
-            self.curve_sustained_frames = self.curve_sustained_frames.saturating_sub(2);
         }
 
         let was_curve = self.in_curve_mode;
-        self.in_curve_mode = self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
+
+        // v4.13: If polynomial curvature confidently says curve, activate
+        // immediately without waiting for sustained frames. This eliminates
+        // the multi-frame lag that let early-curve false positives through.
+        if curvature_says_curve && curvature.unwrap().confidence > 0.5 {
+            self.in_curve_mode = true;
+            self.curve_sustained_frames = self
+                .curve_sustained_frames
+                .max(self.config.curve_min_sustained_frames);
+        } else {
+            // Standard sustained-frame gate for coherence-only path
+            self.in_curve_mode =
+                self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
+        }
+
+        // v4.12: Track how recently curve mode was active
+        if self.in_curve_mode {
+            self.frames_since_curve_mode = 0;
+        } else {
+            self.frames_since_curve_mode = self.frames_since_curve_mode.saturating_add(1);
+        }
 
         if self.in_curve_mode && !was_curve {
+            let source = if curvature_says_curve {
+                "poly_curvature"
+            } else {
+                "coherence"
+            };
+            let curv_info = curvature
+                .map(|c| {
+                    format!(
+                        "agree={:.2} mean_a={:.6} dir={}",
+                        c.curvature_agreement,
+                        c.mean_curvature,
+                        c.curve_direction.as_str()
+                    )
+                })
+                .unwrap_or_else(|| "N/A".to_string());
             info!(
-                "🔄 Curve mode ACTIVATED: coherence={:.2} sustained={}f | thresholds ×{:.1}",
+                "🔄 Curve mode ACTIVATED [{}]: coherence={:.2} sustained={}f | curv=[{}] | thresholds ×{:.1} | ego ×{:.1}",
+                source,
                 coherence,
                 self.curve_sustained_frames,
+                curv_info,
                 self.config.curve_shift_threshold_multiplier,
+                self.config.curve_ego_velocity_multiplier,
             );
         } else if !self.in_curve_mode && was_curve {
             info!(
-                "🔄 Curve mode DEACTIVATED: coherence={:.2} sustained={}f",
-                coherence, self.curve_sustained_frames,
+                "🔄 Curve mode DEACTIVATED: coherence={:.2} sustained={}f curvature_curve={}",
+                coherence, self.curve_sustained_frames, curvature_says_curve,
             );
         }
+    }
+
+    /// v4.12: Whether curve state should suppress ego-motion-initiated shifts.
+    /// True when in curve mode OR within the cooldown period after it.
+    /// On curves, optical flow shows genuine lateral displacement (road rotates),
+    /// but it's NOT a lane change — ego-start/preempt must be suppressed.
+    fn curve_suppresses_ego(&self) -> bool {
+        self.in_curve_mode || self.frames_since_curve_mode <= self.config.curve_ego_cooldown_frames
     }
 
     /// Effective shift_start_threshold accounting for curve mode.
@@ -436,9 +534,9 @@ impl LateralShiftDetector {
             self.ego_active_frames = 0;
         }
 
-        // ── v4.11: UPDATE CURVE STATE ───────────────────────────
+        // ── v4.11/v4.13: UPDATE CURVE STATE ─────────────────────
         if let Some(ref m) = measurement {
-            self.update_curve_state(m.boundary_coherence);
+            self.update_curve_state(m.boundary_coherence, m.curvature.as_ref());
         }
 
         // ── VALID LANE MEASUREMENT? ─────────────────────────────
@@ -450,7 +548,7 @@ impl LateralShiftDetector {
             self.last_lane_width_px = m.lane_width_px;
             self.ego_bridge_frames = 0; // lanes back, bridge ends
                                         // v4.10: Update cache with fresh measurement
-            self.cached_measurement = Some(*m);
+            self.cached_measurement = Some(m.clone());
             self.cached_measurement_age = 0;
         } else {
             self.frames_without_lanes += 1;
@@ -495,6 +593,7 @@ impl LateralShiftDetector {
                     confidence: decayed_confidence,
                     both_lanes: cached.both_lanes,
                     boundary_coherence: cached.boundary_coherence, // v4.11: preserve from cache
+                    curvature: cached.curvature.clone(), // v4.13: preserve curvature from cache
                 })
             } else {
                 // Cache expired — invalidate and fall through to no-lanes
@@ -597,8 +696,13 @@ impl LateralShiftDetector {
                 // clearly moving laterally.
                 // Uses a higher velocity threshold than no-lanes ego-start
                 // because we're overriding lane data — need stronger evidence.
+                //
+                // v4.12: On curves, optical flow shows genuine lateral displacement
+                // (road surface rotates), but it's NOT a lane change. Multiply the
+                // velocity threshold to prevent curve-induced ego-preempt triggers.
                 else if self.ego_preempt_cooldown == 0
                     && self.config.ego_preempt_min_velocity > 0.0
+                    && !self.curve_suppresses_ego()
                     && ego.lateral_velocity.abs() >= self.config.ego_preempt_min_velocity
                     && self.ego_active_frames >= self.config.ego_shift_start_frames
                 {
@@ -745,7 +849,12 @@ impl LateralShiftDetector {
 
             State::Stable => {
                 // ── NO LANES + STRONG EGO MOTION: Start ego-only shift ──
-                if has_ego && self.ego_active_frames >= self.config.ego_shift_start_frames {
+                // v4.12: Suppress if curve mode was recently active — lanes just
+                // dropped out on a curve, ego flow is rotational, not a lane change.
+                if has_ego
+                    && !self.curve_suppresses_ego()
+                    && self.ego_active_frames >= self.config.ego_shift_start_frames
+                {
                     let direction = if ego.lateral_velocity < 0.0 {
                         ShiftDirection::Left
                     } else {
@@ -1266,6 +1375,7 @@ impl LateralShiftDetector {
         self.coherence_history.clear();
         self.curve_sustained_frames = 0;
         self.in_curve_mode = false;
+        self.frames_since_curve_mode = u32::MAX;
         self.reset_shift();
     }
 
@@ -1441,6 +1551,7 @@ mod tests {
             confidence: 0.8,
             both_lanes: true,
             boundary_coherence: coherence,
+            curvature: None, // tests use coherence directly
         }
     }
 
@@ -1591,3 +1702,4 @@ mod tests {
         );
     }
 }
+

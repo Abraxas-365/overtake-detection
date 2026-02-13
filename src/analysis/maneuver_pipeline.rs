@@ -15,6 +15,7 @@
 //       This allows the lateral detector to use ego motion for bridging
 //       through lane detection dropout.
 // v4.11: Added curve-aware mining tuning for boundary coherence + adaptive baseline.
+// v4.13: Updated for polynomial curvature (LaneMeasurement now carries Option<CurvatureEstimate>).
 
 use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
 use super::lateral_detector::{
@@ -121,7 +122,10 @@ impl ManeuverPipelineConfig {
                 curve_coherence_threshold: 0.60, // vs 0.65 default — activate sooner
                 curve_shift_threshold_multiplier: 2.0, // vs 1.8 — stronger suppression for wide trucks
                 curve_min_sustained_frames: 4, // vs 5 — faster activation on curvy mining roads
-                adaptive_baseline_alpha_max: 0.05, // vs 0.04 — track curves faster (25× base α)
+                // v4.12: curve ego suppression (mining-tuned)
+                curve_ego_velocity_multiplier: 2.5, // vs 2.0 — stronger suppression for mining curves
+                curve_ego_cooldown_frames: 20,      // vs 15 — longer cooldown on curvy roads
+                adaptive_baseline_alpha_max: 0.05,  // vs 0.04 — track curves faster (25× base α)
                 adaptive_baseline_max_variance: 0.002, // vs 0.0015 — looser for bumpier roads
                 adaptive_baseline_min_drift: 0.0015, // vs 0.002 — trigger on smaller drifts
                 ..LateralDetectorConfig::default()
@@ -374,3 +378,4 @@ impl ManeuverPipeline {
         self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
+

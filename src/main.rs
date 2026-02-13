@@ -1,6 +1,8 @@
 // src/main.rs
 //
 // Production overtake detection pipeline v4.2 — Maneuver Detection v2
+// v4.11: Wires boundary_coherence into LaneMeasurement for curve-aware detection
+// v4.13: Wires polynomial curvature from YOLO-seg masks for direct geometric curve detection
 //
 // Minimal implementation focused on the new signal-fusion architecture
 
@@ -394,13 +396,17 @@ fn run_lane_detection(
             let lane_width_px = (right_x - left_x).abs();
             let lateral_offset_px = center_x - (left_x + lane_width_px / 2.0);
 
+            // v4.11: Wire boundary coherence from legality detector into LaneMeasurement.
+            // v4.13: Wire polynomial curvature from YOLO-seg mask geometry.
             lane_measurement = Some(LaneMeasurement {
                 lateral_offset_px,
                 lane_width_px,
                 confidence: conf,
                 both_lanes: true,
-                boundary_coherence: detector.boundary_coherence(), // v4.11
+                boundary_coherence: detector.boundary_coherence(), // v4.11: curve awareness
+                curvature: detector.curvature_estimate().cloned(), // v4.13: geometric curve detection
             });
+
             // Update last vehicle state
             ps.last_vehicle_state = Some(VehicleState {
                 lateral_offset: lateral_offset_px,

@@ -1,5 +1,12 @@
 // src/lane_legality.rs
+//
+// v4.13: Added polynomial curvature estimation from YOLO-seg masks.
+//        Stores raw lane markings per frame and computes per-boundary
+//        polynomial fits for direct geometric curve detection.
 
+use crate::analysis::curvature_estimator::{
+    self, CurvatureEstimate, MaskInput, MaskTransformParams,
+};
 use anyhow::Result;
 use ort::{
     execution_providers::CUDAExecutionProvider,
@@ -445,6 +452,14 @@ pub struct LaneLegalityDetector {
     /// v4.11 (Fix 1): Rolling coherence of left/right boundary movement.
     /// +1 = boundaries co-moving (curve), -1 = diverging (lane change), <-0.5 = no data.
     last_boundary_coherence: f32,
+
+    /// v4.13: Raw lane-line markings from the last boundary estimation call.
+    /// Stored so the curvature estimator can access their masks without re-running inference.
+    last_lane_markings: Vec<DetectedRoadMarking>,
+    /// v4.13: Original image dimensions from the last call (for mask coordinate conversion).
+    last_image_dims: (usize, usize),
+    /// v4.13: Polynomial curvature estimate from mask geometry.
+    last_curvature: Option<CurvatureEstimate>,
 }
 
 impl LaneLegalityDetector {
@@ -466,6 +481,9 @@ impl LaneLegalityDetector {
             last_left_lane_x: None,
             last_right_lane_x: None,
             last_boundary_coherence: -1.0, // v4.11: no data yet
+            last_lane_markings: Vec::new(),
+            last_image_dims: (0, 0),
+            last_curvature: None,
         })
     }
 
@@ -558,6 +576,18 @@ impl LaneLegalityDetector {
 
             self.last_left_lane_x = Some(smooth_l);
             self.last_right_lane_x = Some(smooth_r);
+
+            // ═══════════════════════════════════════════════════════
+            // v4.13: Polynomial curvature from YOLO-seg mask geometry
+            // ═══════════════════════════════════════════════════════
+            //
+            // Extract mask spines for the markings closest to our selected
+            // L/R boundaries, fit polynomials, and compare curvatures.
+            // This is a DIRECT geometric measurement — not a temporal proxy
+            // like boundary coherence — so it works on a single frame.
+            //
+            self.last_curvature = self.compute_mask_curvature(l, r);
+
             return Ok(Some((smooth_l, smooth_r, c)));
         }
 
@@ -583,6 +613,101 @@ impl LaneLegalityDetector {
         self.last_boundary_coherence
     }
 
+    /// v4.13: Get the polynomial curvature estimate from the last frame.
+    ///
+    /// Returns None if no valid polynomial fit was possible (insufficient
+    /// mask points, poor fit quality, or no lane markings detected).
+    pub fn curvature_estimate(&self) -> Option<&CurvatureEstimate> {
+        self.last_curvature.as_ref()
+    }
+
+    /// v4.13: Compute polynomial curvature from stored mask data.
+    ///
+    /// Finds the markings whose bbox centers are closest to the selected
+    /// left/right boundary positions, extracts their mask spines, fits
+    /// quadratic polynomials, and compares curvatures.
+    fn compute_mask_curvature(
+        &self,
+        raw_left_x: f32,
+        raw_right_x: f32,
+    ) -> Option<CurvatureEstimate> {
+        if self.last_lane_markings.is_empty() || self.last_image_dims == (0, 0) {
+            return None;
+        }
+
+        let (orig_w, orig_h) = self.last_image_dims;
+        let params = MaskTransformParams::from_image_dims(orig_w, orig_h);
+
+        // Find the marking closest to each selected boundary position.
+        // A marking's center_x is (bbox[0] + bbox[2]) / 2.0.
+        let left_marking = self.find_closest_marking(raw_left_x);
+        let right_marking = self.find_closest_marking(raw_right_x);
+
+        // Don't use the same marking for both boundaries
+        let (left_input, right_input) = match (left_marking, right_marking) {
+            (Some(lm), Some(rm)) => {
+                let same = std::ptr::eq(lm, rm);
+                if same {
+                    // Only one marking — assign to whichever side is closer
+                    let lcx = (lm.bbox[0] + lm.bbox[2]) / 2.0;
+                    if (lcx - raw_left_x).abs() < (lcx - raw_right_x).abs() {
+                        (Some(lm), None)
+                    } else {
+                        (None, Some(rm))
+                    }
+                } else {
+                    (Some(lm), Some(rm))
+                }
+            }
+            pair => pair,
+        };
+
+        let left_mi = left_input.map(|m| MaskInput {
+            mask: &m.mask,
+            mask_w: m.mask_width,
+            mask_h: m.mask_height,
+            bbox: m.bbox,
+            center_x: (m.bbox[0] + m.bbox[2]) / 2.0,
+        });
+        let right_mi = right_input.map(|m| MaskInput {
+            mask: &m.mask,
+            mask_w: m.mask_width,
+            mask_h: m.mask_height,
+            bbox: m.bbox,
+            center_x: (m.bbox[0] + m.bbox[2]) / 2.0,
+        });
+
+        let est = curvature_estimator::estimate_curvature_from_masks(
+            left_mi.as_ref(),
+            right_mi.as_ref(),
+            &params,
+        );
+
+        // Only return if we got at least one valid polynomial
+        if est.left_poly.is_some() || est.right_poly.is_some() {
+            Some(est)
+        } else {
+            None
+        }
+    }
+
+    /// Find the marking whose bbox center-x is closest to `target_x`.
+    /// Returns None if no markings are stored or closest is > 100px away.
+    fn find_closest_marking(&self, target_x: f32) -> Option<&DetectedRoadMarking> {
+        const MAX_MATCH_DISTANCE: f32 = 100.0;
+
+        self.last_lane_markings
+            .iter()
+            .map(|m| {
+                let cx = (m.bbox[0] + m.bbox[2]) / 2.0;
+                let dist = (cx - target_x).abs();
+                (m, dist)
+            })
+            .filter(|(_, dist)| *dist < MAX_MATCH_DISTANCE)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(m, _)| m)
+    }
+
     // -----------------------------------------------------------------------
     // EGO LANE BOUNDARY ESTIMATION  v2
     // -----------------------------------------------------------------------
@@ -606,8 +731,13 @@ impl LaneLegalityDetector {
             .collect();
 
         if lane_lines.is_empty() {
+            self.last_lane_markings.clear(); // v4.13
             return Ok(None);
         }
+
+        // v4.13: Store raw markings for curvature estimation (needs mask data).
+        self.last_lane_markings = lane_lines.iter().map(|m| (*m).clone()).collect();
+        self.last_image_dims = (width, height);
 
         let merge_threshold = width as f32 * MERGE_THRESHOLD_RATIO;
         let merged = merge_nearby_markings(&lane_lines, merge_threshold);
@@ -1125,3 +1255,4 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
+

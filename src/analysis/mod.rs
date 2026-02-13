@@ -1,15 +1,10 @@
 // src/analysis/mod.rs
 //
-// Maneuver detection v2 pipeline modules.
+// Analysis modules for maneuver detection pipeline.
 //
-// Signal flow:
-//   YOLO Detections → vehicle_tracker → pass_detector ─┐
-//   UFLDv2 Lanes    → lateral_detector ─────────────────┼→ maneuver_classifier → ManeuverEvent
-//   Raw Frame       → ego_motion ───────────────────────┘
-//   YOLO-seg Markings → maneuver_classifier.update_markings()
-//
-// Orchestrated by maneuver_pipeline::ManeuverPipeline.
+// v4.13: Added curvature_estimator for polynomial curve detection from YOLO-seg masks.
 
+pub mod curvature_estimator;
 pub mod ego_motion;
 pub mod lateral_detector;
 pub mod maneuver_classifier;
