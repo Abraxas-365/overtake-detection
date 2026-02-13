@@ -1,156 +1,111 @@
+// src/analysis/maneuver_classifier.rs
+//
+// Fusion layer: combines vehicle tracking, lateral shift detection,
+// and ego-motion estimation to classify maneuvers.
+//
+// v4.3 FIX: Ego-motion gate for single-source (tracking-only) passes.
+//           A real overtake REQUIRES the ego vehicle to move laterally.
+//           If there's no lateral shift and no ego motion, the "pass"
+//           is almost certainly a zone misclassification.
+//
+// v4.8 FIX: Raised single-source confidence thresholds for mining.
+//           Added pass quality gate (min_pass_confidence_single_source).
+//
+// v4.10 FIX: Ego-motion-induced pass rejection (INVERSE ego-motion gate).
+//            When the ego vehicle is actively changing lanes, vehicles in
+//            the original lane appear to shift through zones (AHEAD →
+//            BESIDE → BEHIND) WITHOUT any actual longitudinal passing.
+//            This creates false EgoOvertook events.
+//
+//            The fix detects when ego lateral velocity is strong enough
+//            in the direction that would produce the observed pass side
+//            as an apparent artifact, and rejects the pass. Applied to
+//            both correlated (pass+shift) and uncorrelated paths.
+//
+//            Direction mapping:
+//              Ego moves LEFT  → vehicles appear to shift RIGHT
+//                → AHEAD→BESIDE_RIGHT → PassSide::Left (false EgoOvertook)
+//              Ego moves RIGHT → vehicles appear to shift LEFT
+//                → AHEAD→BESIDE_LEFT → PassSide::Right (false EgoOvertook)
+
+// v4.12 FIX: Extended ego-motion-induced pass rejection to VehicleOvertookEgo.
+// v4.13 FIX (Bug 1): Drain consumed (correlated) buffer entries after classification.
+// v4.13 FIX (Bug 2): Curve ego cross-validation gate in lateral_detector.
+
+use super::ego_motion::EgoMotionEstimate;
+use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
+use super::pass_detector::{PassDirection, PassEvent, PassSide};
+use crate::lane_legality::{FusedLegalityResult, LineLegality};
+use crate::pipeline::legality_buffer::LegalityRingBuffer;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use tracing::{debug, info, warn};
-
-use super::curvature_estimator::CurvatureEstimate;
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct LateralDetectorConfig {
-    /// Minimum lane detection confidence to accept a measurement
-    pub min_lane_confidence: f32,
-    /// Consecutive valid frames needed before baseline is trusted
-    pub baseline_warmup_frames: u32,
-    /// EWMA alpha for baseline during stable driving
-    pub baseline_alpha_stable: f32,
-    /// EWMA alpha for baseline during fast recovery after occlusion
-    pub baseline_alpha_recovery: f32,
-    /// Normalized offset (|offset / lane_width|) threshold to start a shift
-    pub shift_start_threshold: f32,
-    /// Normalized offset threshold to confirm a shift (must exceed this at peak)
-    pub shift_confirm_threshold: f32,
-    /// Offset below this → shift ended (return to center)
-    pub shift_end_threshold: f32,
-    /// Frames the shift must persist to be reported
-    pub min_shift_frames: u32,
-    /// Maximum shift duration before auto-cancel (probably not a real shift)
-    pub max_shift_frames: u32,
-    /// After occlusion of this many frames (with no ego motion), reset baseline
-    pub occlusion_reset_frames: u32,
-    /// After baseline reset, freeze for this many frames before detecting
-    pub post_reset_freeze_frames: u32,
-
-    // ── v4.4: Ego-motion fusion ─────────────────────────────────
-    /// Minimum ego lateral velocity (px/frame) to consider as lateral motion
-    pub ego_motion_min_velocity: f32,
-    /// Consecutive frames of above-threshold ego motion to start an ego-only shift
-    pub ego_shift_start_frames: u32,
-    /// Max frames to bridge lane dropout using ego motion during an active shift
-    /// Beyond this, the ego-motion-only estimate degrades too much
-    pub ego_bridge_max_frames: u32,
-    /// During ego bridging: estimated px per normalized offset unit
-    /// (used to convert integrated ego px to approximate normalized offset)
-    pub ego_px_per_norm_unit: f32,
-    /// Confidence penalty for ego-motion-only portions of a shift
-    pub ego_only_confidence_penalty: f32,
-    /// Max shift duration for ego-started shifts (shorter than lane-started)
-    pub ego_shift_max_frames: u32,
-
-    // ── v4.10: Ego-preempt tuning ───────────────────────────────
-    /// Minimum ego lateral velocity to trigger ego-preempt when lanes ARE present.
-    /// Higher than ego_motion_min_velocity because we're overriding lane data and
-    /// need stronger evidence. Set to 0.0 to disable ego-preempt entirely.
-    pub ego_preempt_min_velocity: f32,
-    /// Minimum frames a shift must be active before shift_end_threshold is checked.
-    /// Prevents ego-preempt shifts from being immediately killed before the lane
-    /// offset has had time to develop (camera and lanes move together initially).
-    pub shift_end_grace_frames: u32,
-    /// Extended hold period for ego-preempt shifts: while ego is still active,
-    /// shift_end is suppressed for up to this many frames. Only after ego stops
-    /// AND this many frames have elapsed does the normal shift_end logic apply.
-    /// This prevents the ego-preempt oscillation bug where shifts get rejected
-    /// every 2 frames because lane offset is small.
-    pub ego_preempt_hold_frames: u32,
-    /// After an ego-preempt shift is rejected, suppress further ego-preempts
-    /// for this many frames to prevent oscillation.
-    pub ego_preempt_cooldown_frames: u32,
-
-    // ── v4.10: Lane measurement caching ─────────────────────────
-    /// Max frames to reuse the last valid lane measurement during brief dropouts.
-    /// The cached measurement has its offset adjusted by ego motion each frame
-    /// and its confidence decayed, so it degrades gracefully.
-    pub lane_cache_max_frames: u32,
-    /// Confidence decay per cached frame (multiplied each frame)
-    pub lane_cache_confidence_decay: f32,
-
-    // ── v4.11: Curve-aware false positive suppression ───────────
-    /// Boundary coherence above this → curve mode activates (after sustained frames).
-    /// Range: [0, 1]. Higher = more conservative (requires stronger co-movement).
-    pub curve_coherence_threshold: f32,
-    /// Multiplier applied to shift_start_threshold and shift_confirm_threshold
-    /// while in curve mode. E.g. 1.8 raises thresholds by 80%.
-    pub curve_shift_threshold_multiplier: f32,
-    /// Consecutive frames of above-threshold coherence needed to activate curve mode.
-    pub curve_min_sustained_frames: u32,
-    /// v4.12: Multiplier applied to ego velocity thresholds during curve mode.
-    /// On curves, optical flow shows genuine lateral pixel displacement (road
-    /// surface rotates in camera frame), but it's rotational, not translational.
-    /// Raising the bar prevents ego-preempt and ego-start from triggering on curves.
-    pub curve_ego_velocity_multiplier: f32,
-    /// v4.12: Frames after curve mode deactivates during which ego-only shift
-    /// starts remain suppressed. Curves often cause brief coherence drops when
-    /// one boundary is temporarily lost, so we carry the suppression forward.
-    pub curve_ego_cooldown_frames: u32,
-
-    // ── v4.11: Adaptive baseline alpha (smooth drift tracking) ──
-    /// Maximum baseline alpha when smooth drift is detected.
-    /// The actual alpha interpolates between baseline_alpha_stable and this value
-    /// based on how drift-like the offset history is.
-    pub adaptive_baseline_alpha_max: f32,
-    /// Maximum variance of recent offsets to qualify as "smooth drift".
-    /// Low variance + consistent drift = curve. High variance = noise/lane change.
-    pub adaptive_baseline_max_variance: f32,
-    /// Minimum absolute drift rate (normalized offset per frame) to boost alpha.
-    /// Below this, the offset is essentially stable and base alpha is fine.
-    pub adaptive_baseline_min_drift: f32,
+pub struct ClassifierConfig {
+    pub max_correlation_gap_ms: f64,
+    pub min_single_source_confidence: f32,
+    pub min_combined_confidence: f32,
+    pub ego_motion_threshold: f32,
+    pub weight_pass: f32,
+    pub weight_lateral: f32,
+    pub weight_ego_motion: f32,
+    pub correlation_window_ms: f64,
+    /// v4.3: Minimum peak ego lateral velocity (px/frame) required for
+    /// single-source (tracking-only) passes. Below this, the pass is
+    /// rejected as a zone misclassification.
+    pub min_ego_motion_for_single_source: f32,
+    /// v4.8: Minimum pass event confidence for single-source overtakes.
+    pub min_pass_confidence_single_source: f32,
+    /// v4.10: Minimum sustained ego lateral velocity (px/frame) above
+    /// which an EgoOvertook pass is rejected as ego-motion-induced.
+    /// When ego moves at this speed for enough frames, apparent zone
+    /// transitions are artifacts of the lane change, not real overtakes.
+    pub ego_induced_pass_velocity_threshold: f32,
+    /// v4.10: Minimum number of frames at or above the velocity threshold
+    /// to consider the ego lateral motion "sustained" (not just noise).
+    pub ego_induced_pass_min_sustained_frames: usize,
 }
 
-impl Default for LateralDetectorConfig {
+impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            min_lane_confidence: 0.25,
-            baseline_warmup_frames: 20,
-            baseline_alpha_stable: 0.005,
-            baseline_alpha_recovery: 0.03,
-            shift_start_threshold: 0.22,
-            shift_confirm_threshold: 0.30,
-            shift_end_threshold: 0.12,
-            min_shift_frames: 10,
-            max_shift_frames: 300,        // 10s at 30fps
-            occlusion_reset_frames: 45,   // 1.5s
-            post_reset_freeze_frames: 30, // 1s
+            max_correlation_gap_ms: 50000.0,
+            min_single_source_confidence: 0.35,
+            min_combined_confidence: 0.30,
+            ego_motion_threshold: 2.0,
+            weight_pass: 0.60,
+            weight_lateral: 0.25,
+            weight_ego_motion: 0.15,
+            correlation_window_ms: 60000.0,
+            min_ego_motion_for_single_source: 1.0,
+            min_pass_confidence_single_source: 0.55,
+            ego_induced_pass_velocity_threshold: 3.0, // v4.10: 3 px/frame
+            ego_induced_pass_min_sustained_frames: 8, // v4.10: ~267ms at 30fps
+        }
+    }
+}
 
-            // v4.4 ego-motion defaults
-            ego_motion_min_velocity: 1.5, // px/frame — clear lateral motion
-            ego_shift_start_frames: 8,    // ~270ms sustained motion
-            ego_bridge_max_frames: 120,   // 4s max bridge
-            ego_px_per_norm_unit: 600.0,  // ~lane_width, rough conversion
-            ego_only_confidence_penalty: 0.2,
-            ego_shift_max_frames: 180, // 6s max for ego-started shifts
-
-            // v4.10 ego-preempt tuning
-            ego_preempt_min_velocity: 3.5, // px/frame — stronger than ego_motion_min_velocity
-            shift_end_grace_frames: 15,    // ~500ms at 30fps — lane offset needs time to develop
-            ego_preempt_hold_frames: 75,   // ~2.5s at 30fps — keep shift alive while ego is active
-            ego_preempt_cooldown_frames: 60, // ~2s cooldown after rejection
-
-            // v4.10 lane cache defaults
-            lane_cache_max_frames: 4,          // ~133ms at 30fps
-            lane_cache_confidence_decay: 0.75, // 0.8 → 0.6 → 0.45 → 0.34
-
-            // v4.11 curve suppression defaults
-            curve_coherence_threshold: 0.65,
-            curve_shift_threshold_multiplier: 1.8,
-            curve_min_sustained_frames: 5,
-            curve_ego_velocity_multiplier: 2.0, // v4.12: double ego thresholds on curves
-            curve_ego_cooldown_frames: 15,      // v4.12: ~500ms at 30fps
-
-            // v4.11 adaptive baseline defaults
-            adaptive_baseline_alpha_max: 0.04,
-            adaptive_baseline_max_variance: 0.0015,
-            adaptive_baseline_min_drift: 0.002,
+impl ClassifierConfig {
+    /// Mining environment — more conservative thresholds.
+    pub fn mining() -> Self {
+        Self {
+            max_correlation_gap_ms: 50000.0,
+            min_single_source_confidence: 0.40,
+            min_combined_confidence: 0.35,
+            ego_motion_threshold: 2.0,
+            weight_pass: 0.60,
+            weight_lateral: 0.25,
+            weight_ego_motion: 0.15,
+            correlation_window_ms: 60000.0,
+            min_ego_motion_for_single_source: 1.2,
+            min_pass_confidence_single_source: 0.60,
+            ego_induced_pass_velocity_threshold: 2.5, // lower threshold in mining (dusty, noisy flow)
+            ego_induced_pass_min_sustained_frames: 6,
         }
     }
 }
@@ -159,1681 +114,840 @@ impl Default for LateralDetectorConfig {
 // TYPES
 // ============================================================================
 
-/// Direction of lateral shift
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShiftDirection {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManeuverType {
+    Overtake,
+    LaneChange,
+    BeingOvertaken,
+}
+
+impl ManeuverType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Overtake => "OVERTAKE",
+            Self::LaneChange => "LANE_CHANGE",
+            Self::BeingOvertaken => "BEING_OVERTAKEN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManeuverSide {
     Left,
     Right,
 }
 
-impl ShiftDirection {
+impl ManeuverSide {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Left => "LEFT",
             Self::Right => "RIGHT",
         }
     }
+}
 
-    pub fn opposite(&self) -> Self {
-        match self {
-            Self::Left => Self::Right,
-            Self::Right => Self::Left,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetectionSources {
+    pub vehicle_tracking: bool,
+    pub lane_detection: bool,
+    pub ego_motion: bool,
+}
+
+impl DetectionSources {
+    pub fn count(&self) -> u32 {
+        self.vehicle_tracking as u32 + self.lane_detection as u32 + self.ego_motion as u32
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.vehicle_tracking {
+            parts.push("VEH_TRACK");
         }
+        if self.lane_detection {
+            parts.push("LANE_DET");
+        }
+        if self.ego_motion {
+            parts.push("EGO_FLOW");
+        }
+        parts.join("+")
     }
 }
 
-/// A detected lateral shift event
-#[derive(Debug, Clone)]
-pub struct LateralShiftEvent {
-    pub direction: ShiftDirection,
-    /// Peak normalized offset from baseline (0.0 = no shift, 1.0 = full lane width)
-    pub peak_offset: f32,
-    /// Timestamp when shift started (ms)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarkingSnapshot {
+    pub left_name: Option<String>,
+    pub right_name: Option<String>,
+    pub frame_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManeuverEvent {
+    pub maneuver_type: ManeuverType,
+    pub side: ManeuverSide,
+    pub legality: LineLegality,
+    #[serde(skip)]
+    pub legality_at_crossing: Option<FusedLegalityResult>,
+    pub confidence: f32,
+    pub sources: DetectionSources,
     pub start_ms: f64,
-    /// Timestamp when shift ended or was reported (ms)
     pub end_ms: f64,
-    /// Frame IDs
     pub start_frame: u64,
     pub end_frame: u64,
-    /// Duration in ms
     pub duration_ms: f64,
-    /// Confidence based on lane detection quality during the shift
-    pub confidence: f32,
-    /// Was the shift confirmed (peak exceeded confirm threshold)?
-    pub confirmed: bool,
-    /// v4.13: Whether curve mode was active during this shift.
-    pub curve_mode: bool,
-    /// v4.13: Peak absolute ego cumulative displacement during shift (px).
-    /// Near zero = no physical lateral motion (perspective artifact if LaneBased).
-    pub ego_cumulative_peak_px: f32,
-    /// v4.13: Shift detection source (LaneBased / EgoBridged / EgoStarted).
-    pub source_label: &'static str,
+    pub passed_vehicle_id: Option<u32>,
+    pub passed_vehicle_class: Option<u32>,
+    #[serde(skip)]
+    pub pass_event: Option<PassEvent>,
+    #[serde(skip)]
+    pub lateral_event: Option<LateralShiftEvent>,
+    pub marking_context: Option<MarkingSnapshot>,
 }
 
-/// Input from ego-motion estimator (optical flow based)
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EgoMotionInput {
-    /// Lateral velocity in pixels/frame (negative = leftward, positive = rightward)
-    pub lateral_velocity: f32,
-    /// Confidence of the ego-motion estimate [0, 1]
-    pub confidence: f32,
-}
+// ============================================================================
+// INTERNAL BUFFER ENTRIES
+// ============================================================================
 
-/// Current state of the detector
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Waiting for lanes / building baseline
-    Initializing,
-    /// Baseline established, watching for shifts
-    Stable,
-    /// Shift in progress (lane-based, ego-bridged, or ego-started)
-    Shifting,
-    /// Lanes lost AND no ego motion — no output
-    Occluded,
-    /// Just recovered from occlusion — rebuilding baseline
-    Recovering,
-}
-
-/// How the current shift is being tracked
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShiftSource {
-    /// Shift started and tracked via lane position
-    LaneBased,
-    /// Shift started via lanes but currently bridging through dropout via ego motion
-    EgoBridged,
-    /// Shift started entirely from ego motion (lanes were never available)
-    EgoStarted,
-}
-
-/// Input measurement from lane detection
 #[derive(Debug, Clone)]
-pub struct LaneMeasurement {
-    /// Raw lateral offset in pixels
-    pub lateral_offset_px: f32,
-    /// Detected lane width in pixels
-    pub lane_width_px: f32,
-    /// Detection confidence [0, 1]
-    pub confidence: f32,
-    /// Are both lane boundaries detected?
-    pub both_lanes: bool,
-    /// v4.11: Boundary coherence from lane_legality detector.
-    /// +1.0 = boundaries co-moving (curve), -1.0 = diverging (lane change),
-    /// 0.0 = inconclusive, < -0.5 = no data.
-    pub boundary_coherence: f32,
-    /// v4.13: Polynomial curvature estimate from YOLO-seg mask geometry.
-    /// Direct geometric measurement — replaces boundary coherence as primary
-    /// curve signal when available. Boundary coherence remains as fallback.
-    pub curvature: Option<CurvatureEstimate>,
+struct BufferedPass {
+    event: PassEvent,
+    correlated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BufferedShift {
+    event: LateralShiftEvent,
+    correlated: bool,
 }
 
 // ============================================================================
-// DETECTOR
+// CLASSIFIER
 // ============================================================================
 
-pub struct LateralShiftDetector {
-    config: LateralDetectorConfig,
-    state: State,
-
-    // Baseline tracking
-    baseline: f32,           // EWMA of normalized offset
-    baseline_samples: u32,   // Frames contributing to baseline
-    freeze_remaining: u32,   // Post-reset detection freeze
-    last_lane_width_px: f32, // Last known lane width for ego→norm conversion
-
-    // Occlusion tracking
-    frames_without_lanes: u32,
-
-    // Active shift tracking
-    shift_direction: Option<ShiftDirection>,
-    shift_source: ShiftSource,
-    shift_start_ms: f64,
-    shift_start_frame: u64,
-    shift_peak_offset: f32,
-    shift_frames: u32,
-    shift_confidence_sum: f32,
-    shift_lane_frames: u32, // frames with actual lane data during this shift
-
-    // v4.4: Ego-motion tracking
-    ego_cumulative_px: f32, // integrated ego lateral displacement during shift
-    ego_active_frames: u32, // consecutive frames with strong ego motion (for ego-start)
-    ego_bridge_frames: u32, // consecutive frames of ego-only bridging
-    ego_estimated_offset: f32, // interpolated normalized offset during bridge
-    ego_last_velocity: f32, // for logging
-
-    // History for smoothing
-    offset_history: VecDeque<f32>,
-
-    // v4.10: Lane measurement cache for brief dropouts
-    cached_measurement: Option<LaneMeasurement>,
-    cached_measurement_age: u32,
-
-    // v4.10: Ego-preempt anti-oscillation
-    ego_preempt_originated: bool, // whether current shift started via ego-preempt
-    ego_preempt_cooldown: u32,    // remaining cooldown frames after rejection
-    ego_cumulative_peak_px: f32, // peak |ego_cumulative_px| during shift (for direction validation)
-
-    // v4.11: Curve-aware suppression state
-    coherence_history: VecDeque<f32>, // recent boundary coherence values
-    curve_sustained_frames: u32,      // consecutive frames above coherence threshold
-    in_curve_mode: bool,              // whether thresholds are currently raised
-    // v4.12: Curve ego suppression
-    frames_since_curve_mode: u32, // frames since curve mode was last active
+pub struct ManeuverClassifier {
+    config: ClassifierConfig,
+    pass_buffer: VecDeque<BufferedPass>,
+    shift_buffer: VecDeque<BufferedShift>,
+    current_ego_motion: EgoMotionEstimate,
+    /// v4.10: Timestamped ego motion samples (timestamp_ms, velocity_px).
+    /// Used for time-window queries during pass event validation.
+    ego_motion_during_window: VecDeque<(f64, f32)>,
+    recent_events: Vec<ManeuverEvent>,
+    total_maneuvers: u64,
+    latest_markings: MarkingSnapshot,
 }
 
-impl LateralShiftDetector {
-    pub fn new(config: LateralDetectorConfig) -> Self {
+impl ManeuverClassifier {
+    pub fn new(config: ClassifierConfig) -> Self {
         Self {
             config,
-            state: State::Initializing,
-            baseline: 0.0,
-            baseline_samples: 0,
-            freeze_remaining: 0,
-            last_lane_width_px: 600.0,
-            frames_without_lanes: 0,
-            shift_direction: None,
-            shift_source: ShiftSource::LaneBased,
-            shift_start_ms: 0.0,
-            shift_start_frame: 0,
-            shift_peak_offset: 0.0,
-            shift_frames: 0,
-            shift_confidence_sum: 0.0,
-            shift_lane_frames: 0,
-            ego_cumulative_px: 0.0,
-            ego_active_frames: 0,
-            ego_bridge_frames: 0,
-            ego_estimated_offset: 0.0,
-            ego_last_velocity: 0.0,
-            offset_history: VecDeque::with_capacity(30),
-            cached_measurement: None,
-            cached_measurement_age: 0,
-            ego_preempt_originated: false,
-            ego_preempt_cooldown: 0,
-            ego_cumulative_peak_px: 0.0,
-            coherence_history: VecDeque::with_capacity(20),
-            curve_sustained_frames: 0,
-            in_curve_mode: false,
-            frames_since_curve_mode: u32::MAX, // start with no recent curve
+            pass_buffer: VecDeque::with_capacity(20),
+            shift_buffer: VecDeque::with_capacity(20),
+            current_ego_motion: EgoMotionEstimate::none(),
+            ego_motion_during_window: VecDeque::with_capacity(900), // ~30s at 30fps
+            recent_events: Vec::new(),
+            total_maneuvers: 0,
+            latest_markings: MarkingSnapshot::default(),
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // v4.11/v4.13: CURVE STATE MANAGEMENT
-    // ════════════════════════════════════════════════════════════════════
+    pub fn feed_pass(&mut self, event: PassEvent) {
+        self.pass_buffer.push_back(BufferedPass {
+            event,
+            correlated: false,
+        });
+    }
 
-    /// Update curve detection state from measurement data.
-    ///
-    /// v4.13: Uses polynomial curvature as PRIMARY signal when available.
-    /// Polynomial curvature is a direct geometric measurement from mask shapes —
-    /// it works on a single frame with zero temporal lag. Boundary coherence
-    /// (v4.11) is retained as FALLBACK when masks are too noisy for polynomial fit.
-    fn update_curve_state(&mut self, coherence: f32, curvature: Option<&CurvatureEstimate>) {
-        // ── v4.13: Polynomial curvature (primary signal) ──────────
-        //
-        // The curvature estimator fits x = ay² + by + c to each boundary's
-        // mask spine. If both boundaries have similar `a` coefficients
-        // (curvature_agreement > threshold), it's a road curve.
-        //
-        // This is INSTANT — no sustained-frame requirement. One good frame
-        // with both boundaries visible is enough to confirm a curve.
-        //
-        let curvature_says_curve = curvature
-            .map(|c| c.is_curve && c.confidence > 0.3)
-            .unwrap_or(false);
+    pub fn feed_shift(&mut self, event: LateralShiftEvent) {
+        self.shift_buffer.push_back(BufferedShift {
+            event,
+            correlated: false,
+        });
+    }
 
-        // ── v4.11: Boundary coherence (fallback signal) ──────────
-        let coherence_says_curve = if coherence < -0.5 {
-            None // no data
-        } else {
-            self.coherence_history.push_back(coherence);
-            if self.coherence_history.len() > 15 {
-                self.coherence_history.pop_front();
-            }
-            Some(coherence >= self.config.curve_coherence_threshold)
-        };
-
-        // ── Combined decision ────────────────────────────────────
-        //
-        // Curvature is authoritative when available (geometric, instant).
-        // Coherence fills in when curvature can't compute (poor masks).
-        // We still use the sustained-frame counter for coherence-only mode.
-        //
-        let frame_is_curve = if curvature.is_some() && curvature.unwrap().confidence > 0.2 {
-            // Curvature estimator had enough data to form an opinion
-            curvature_says_curve
-        } else {
-            // Fall back to coherence-based detection
-            coherence_says_curve.unwrap_or(false)
-        };
-
-        if frame_is_curve {
-            self.curve_sustained_frames += 1;
-        } else if coherence_says_curve == Some(false) && !curvature_says_curve {
-            // Both signals say not-curve — faster decay
-            self.curve_sustained_frames = self.curve_sustained_frames.saturating_sub(2);
-        } else {
-            // Ambiguous (no data) — slow decay
-            if self.curve_sustained_frames > 0 {
-                self.curve_sustained_frames -= 1;
-            }
-        }
-
-        let was_curve = self.in_curve_mode;
-
-        // v4.13: If polynomial curvature confidently says curve, activate
-        // immediately without waiting for sustained frames. This eliminates
-        // the multi-frame lag that let early-curve false positives through.
-        if curvature_says_curve && curvature.unwrap().confidence > 0.5 {
-            self.in_curve_mode = true;
-            self.curve_sustained_frames = self
-                .curve_sustained_frames
-                .max(self.config.curve_min_sustained_frames);
-        } else {
-            // Standard sustained-frame gate for coherence-only path
-            self.in_curve_mode =
-                self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
-        }
-
-        // v4.12: Track how recently curve mode was active
-        if self.in_curve_mode {
-            self.frames_since_curve_mode = 0;
-        } else {
-            self.frames_since_curve_mode = self.frames_since_curve_mode.saturating_add(1);
-        }
-
-        if self.in_curve_mode && !was_curve {
-            let source = if curvature_says_curve {
-                "poly_curvature"
-            } else {
-                "coherence"
-            };
-            let curv_info = curvature
-                .map(|c| {
-                    format!(
-                        "agree={:.2} mean_a={:.6} dir={}",
-                        c.curvature_agreement,
-                        c.mean_curvature,
-                        c.curve_direction.as_str()
-                    )
-                })
-                .unwrap_or_else(|| "N/A".to_string());
-            info!(
-                "🔄 Curve mode ACTIVATED [{}]: coherence={:.2} sustained={}f | curv=[{}] | thresholds ×{:.1} | ego ×{:.1}",
-                source,
-                coherence,
-                self.curve_sustained_frames,
-                curv_info,
-                self.config.curve_shift_threshold_multiplier,
-                self.config.curve_ego_velocity_multiplier,
-            );
-        } else if !self.in_curve_mode && was_curve {
-            info!(
-                "🔄 Curve mode DEACTIVATED: coherence={:.2} sustained={}f curvature_curve={}",
-                coherence, self.curve_sustained_frames, curvature_says_curve,
-            );
+    pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
+        self.current_ego_motion = estimate;
+        self.ego_motion_during_window
+            .push_back((timestamp_ms, estimate.lateral_velocity_px));
+        if self.ego_motion_during_window.len() > 900 {
+            self.ego_motion_during_window.pop_front();
         }
     }
 
-    /// v4.12: Whether curve state should suppress ego-motion-initiated shifts.
-    /// True when in curve mode OR within the cooldown period after it.
-    /// On curves, optical flow shows genuine lateral displacement (road rotates),
-    /// but it's NOT a lane change — ego-start/preempt must be suppressed.
-    fn curve_suppresses_ego(&self) -> bool {
-        self.in_curve_mode || self.frames_since_curve_mode <= self.config.curve_ego_cooldown_frames
+    pub fn update_markings(&mut self, snapshot: MarkingSnapshot) {
+        self.latest_markings = snapshot;
     }
 
-    /// Effective shift_start_threshold accounting for curve mode.
-    fn effective_shift_start_threshold(&self) -> f32 {
-        if self.in_curve_mode {
-            self.config.shift_start_threshold * self.config.curve_shift_threshold_multiplier
-        } else {
-            self.config.shift_start_threshold
-        }
-    }
-
-    /// Effective shift_confirm_threshold accounting for curve mode.
-    fn effective_shift_confirm_threshold(&self) -> f32 {
-        if self.in_curve_mode {
-            self.config.shift_confirm_threshold * self.config.curve_shift_threshold_multiplier
-        } else {
-            self.config.shift_confirm_threshold
-        }
-    }
-
-    /// Whether the detector is currently in curve suppression mode.
-    pub fn in_curve_mode(&self) -> bool {
-        self.in_curve_mode
-    }
-
-    /// Average boundary coherence over recent history (for diagnostics).
-    pub fn avg_boundary_coherence(&self) -> f32 {
-        if self.coherence_history.is_empty() {
-            return -1.0;
-        }
-        let sum: f32 = self.coherence_history.iter().sum();
-        sum / self.coherence_history.len() as f32
-    }
-
-    /// Process one frame. Returns a LateralShiftEvent if a shift just completed.
-    ///
-    /// v4.4: Now accepts optional ego-motion input for fusion.
-    /// Pass `None` for ego_motion if not available — detector falls back to
-    /// lane-only behavior identical to v4.3.
-    pub fn update(
+    pub fn classify(
         &mut self,
-        measurement: Option<LaneMeasurement>,
-        ego_motion: Option<EgoMotionInput>,
         timestamp_ms: f64,
-        frame_id: u64,
-    ) -> Option<LateralShiftEvent> {
-        let ego = ego_motion.unwrap_or_default();
-        self.ego_last_velocity = ego.lateral_velocity;
+        _frame_id: u64,
+        legality_buffer: Option<&LegalityRingBuffer>,
+    ) -> Vec<ManeuverEvent> {
+        self.recent_events.clear();
+
+        let window = self.config.correlation_window_ms;
+        self.pass_buffer
+            .retain(|p| timestamp_ms - p.event.beside_end_ms < window);
+        self.shift_buffer
+            .retain(|s| timestamp_ms - s.event.end_ms < window);
 
-        // v4.10: Decrement ego-preempt cooldown
-        if self.ego_preempt_cooldown > 0 {
-            self.ego_preempt_cooldown -= 1;
-        }
-
-        // Track sustained ego motion for ego-start detection
-        if ego.confidence > 0.3 && ego.lateral_velocity.abs() >= self.config.ego_motion_min_velocity
-        {
-            self.ego_active_frames += 1;
-        } else {
-            self.ego_active_frames = 0;
-        }
-
-        // ── v4.11/v4.13: UPDATE CURVE STATE ─────────────────────
-        if let Some(ref m) = measurement {
-            self.update_curve_state(m.boundary_coherence, m.curvature.as_ref());
-        }
-
-        // ── VALID LANE MEASUREMENT? ─────────────────────────────
-        let valid_meas = measurement
-            .filter(|m| m.confidence >= self.config.min_lane_confidence && m.lane_width_px > 50.0);
-
-        if let Some(m) = &valid_meas {
-            self.frames_without_lanes = 0;
-            self.last_lane_width_px = m.lane_width_px;
-            self.ego_bridge_frames = 0; // lanes back, bridge ends
-                                        // v4.10: Update cache with fresh measurement
-            self.cached_measurement = Some(m.clone());
-            self.cached_measurement_age = 0;
-        } else {
-            self.frames_without_lanes += 1;
-            // v4.10: Age the cache
-            self.cached_measurement_age += 1;
-        }
-
-        // ── v4.10: LANE CACHE — bridge brief dropouts ───────────
-        // If no fresh lanes but we have a recent cached measurement,
-        // synthesize a measurement with ego-compensated offset and
-        // decayed confidence. This keeps the lane-based path active
-        // through 1-4 frame dropouts instead of falling into
-        // handle_no_lanes which loses lane context.
-        let effective_meas = if valid_meas.is_some() {
-            valid_meas
-        } else if let Some(ref cached) = self.cached_measurement {
-            if self.cached_measurement_age <= self.config.lane_cache_max_frames {
-                // Ego-compensate: shift the cached offset by accumulated ego motion
-                let ego_offset_delta = ego.lateral_velocity * self.cached_measurement_age as f32;
-                let compensated_offset = cached.lateral_offset_px + ego_offset_delta;
-                let decayed_confidence = cached.confidence
-                    * self
-                        .config
-                        .lane_cache_confidence_decay
-                        .powi(self.cached_measurement_age as i32);
-
-                if self.cached_measurement_age == 1 {
-                    debug!(
-                        "📋 Using cached lane measurement (age={}f): offset={:.1}px → {:.1}px (ego_comp={:.1}px) | conf={:.2} → {:.2}",
-                        self.cached_measurement_age,
-                        cached.lateral_offset_px,
-                        compensated_offset,
-                        ego_offset_delta,
-                        cached.confidence,
-                        decayed_confidence,
-                    );
-                }
-
-                Some(LaneMeasurement {
-                    lateral_offset_px: compensated_offset,
-                    lane_width_px: cached.lane_width_px,
-                    confidence: decayed_confidence,
-                    both_lanes: cached.both_lanes,
-                    boundary_coherence: cached.boundary_coherence, // v4.11: preserve from cache
-                    curvature: cached.curvature.clone(), // v4.13: preserve curvature from cache
-                })
-            } else {
-                // Cache expired — invalidate and fall through to no-lanes
-                None
-            }
-        } else {
-            None
-        };
-
-        // ── NO LANES PATH (neither fresh nor cached) ────────────
-        if effective_meas.is_none() {
-            return self.handle_no_lanes(ego, timestamp_ms, frame_id);
-        }
-
-        let meas = effective_meas.unwrap();
-
-        // ── NORMALIZE ───────────────────────────────────────────
-        let normalized = meas.lateral_offset_px / meas.lane_width_px;
-
-        self.offset_history.push_back(normalized);
-        if self.offset_history.len() > 20 {
-            self.offset_history.pop_front();
-        }
-
-        // ── STATE MACHINE ───────────────────────────────────────
-        match self.state {
-            State::Occluded => {
-                info!(
-                    "🔄 Lateral detector: recovering from occlusion at offset={:.1}%",
-                    normalized * 100.0
-                );
-                self.baseline = normalized;
-                self.baseline_samples = 1;
-                self.freeze_remaining = self.config.post_reset_freeze_frames;
-                self.state = State::Recovering;
-                None
-            }
-
-            State::Initializing | State::Recovering => {
-                self.update_baseline(normalized);
-
-                if self.freeze_remaining > 0 {
-                    self.freeze_remaining -= 1;
-                    return None;
-                }
-
-                if self.baseline_samples >= self.config.baseline_warmup_frames {
-                    info!(
-                        "✅ Lateral baseline established at {:.1}%",
-                        self.baseline * 100.0
-                    );
-                    self.state = State::Stable;
-                }
-                None
-            }
-
-            State::Stable => {
-                let deviation = normalized - self.baseline;
-                let abs_dev = deviation.abs();
-
-                // v4.11: Use effective thresholds that account for curve mode
-                let eff_start = self.effective_shift_start_threshold();
-
-                if abs_dev < eff_start {
-                    self.update_baseline(normalized);
-                }
-
-                if abs_dev >= eff_start {
-                    let direction = if deviation < 0.0 {
-                        ShiftDirection::Left
-                    } else {
-                        ShiftDirection::Right
-                    };
-
-                    self.start_shift(
-                        direction,
-                        ShiftSource::LaneBased,
-                        abs_dev,
-                        meas.confidence,
-                        timestamp_ms,
-                        frame_id,
-                    );
-
-                    info!(
-                        "🔀 Lateral shift started: {} | dev={:.1}% | baseline={:.1}% | ego={:.2}px/f | curve_mode={} eff_thresh={:.1}%",
-                        direction.as_str(),
-                        abs_dev * 100.0,
-                        self.baseline * 100.0,
-                        ego.lateral_velocity,
-                        self.in_curve_mode,
-                        eff_start * 100.0,
-                    );
-                }
-                // ── v4.10: Ego-motion pre-empt with lanes present ───
-                // When lanes are present but offset hasn't crossed the
-                // threshold yet, strong sustained ego motion should still
-                // trigger a shift. This handles the case where the camera
-                // and lane markings move together initially during a lane
-                // change, keeping the lane offset small while the ego is
-                // clearly moving laterally.
-                // Uses a higher velocity threshold than no-lanes ego-start
-                // because we're overriding lane data — need stronger evidence.
-                //
-                // v4.12: On curves, optical flow shows genuine lateral displacement
-                // (road surface rotates), but it's NOT a lane change. Multiply the
-                // velocity threshold to prevent curve-induced ego-preempt triggers.
-                else if self.ego_preempt_cooldown == 0
-                    && self.config.ego_preempt_min_velocity > 0.0
-                    && !self.curve_suppresses_ego()
-                    && ego.lateral_velocity.abs() >= self.config.ego_preempt_min_velocity
-                    && self.ego_active_frames >= self.config.ego_shift_start_frames
-                {
-                    let direction = if ego.lateral_velocity < 0.0 {
-                        ShiftDirection::Left
-                    } else {
-                        ShiftDirection::Right
-                    };
-
-                    // Use ego-estimated deviation as initial offset since
-                    // lane offset hasn't caught up yet
-                    let est_dev = ego.lateral_velocity.abs() / self.last_lane_width_px
-                        * self.ego_active_frames as f32;
-
-                    self.start_shift(
-                        direction,
-                        ShiftSource::EgoStarted,
-                        est_dev.max(abs_dev),
-                        meas.confidence,
-                        timestamp_ms,
-                        frame_id,
-                    );
-                    self.ego_preempt_originated = true;
-
-                    info!(
-                        "🔀🚀 Ego-preempt shift (lanes present): {} | lane_dev={:.1}% < threshold {:.1}% \
-                         | ego={:.2}px/f sustained {}f | est_dev={:.1}%",
-                        direction.as_str(),
-                        abs_dev * 100.0,
-                        eff_start * 100.0,
-                        ego.lateral_velocity,
-                        self.ego_active_frames,
-                        est_dev * 100.0,
-                    );
-                }
-
-                None
-            }
-
-            State::Shifting => {
-                // Lanes are back during a shift — this is the primary tracking path.
-                // If we were ego-bridging, upgrade back to lane-based.
-                if self.shift_source == ShiftSource::EgoBridged {
-                    info!(
-                        "🔄 Lanes recovered during shift — resuming lane-based tracking \
-                         (bridged {} frames, ego_cum={:.1}px)",
-                        self.ego_bridge_frames, self.ego_cumulative_px
-                    );
-                    self.shift_source = ShiftSource::LaneBased;
-                }
-
-                // For ego-started shifts that now have lanes: upgrade
-                if self.shift_source == ShiftSource::EgoStarted {
-                    info!("🔄 Lanes appeared for ego-started shift — upgrading to lane-based");
-                    self.shift_source = ShiftSource::LaneBased;
-                }
-
-                self.shift_lane_frames += 1;
-                self.update_shift_with_lane(
-                    normalized,
-                    meas.confidence,
-                    ego,
-                    timestamp_ms,
-                    frame_id,
-                )
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // NO-LANES HANDLER (v4.4 core addition)
-    // ════════════════════════════════════════════════════════════════════
-
-    fn handle_no_lanes(
-        &mut self,
-        ego: EgoMotionInput,
-        timestamp_ms: f64,
-        frame_id: u64,
-    ) -> Option<LateralShiftEvent> {
-        let has_ego = ego.confidence > 0.3
-            && ego.lateral_velocity.abs() >= self.config.ego_motion_min_velocity;
-
-        match self.state {
-            State::Shifting => {
-                // ── ACTIVE SHIFT + NO LANES: Bridge with ego motion ──
-                if has_ego && self.ego_bridge_frames < self.config.ego_bridge_max_frames {
-                    self.ego_bridge_frames += 1;
-                    self.shift_frames += 1;
-
-                    if self.shift_source == ShiftSource::LaneBased {
-                        self.shift_source = ShiftSource::EgoBridged;
-                        // Initialize estimated offset from last known lane position
-                        self.ego_estimated_offset =
-                            self.offset_history.back().copied().unwrap_or(self.baseline)
-                                - self.baseline;
-
-                        info!(
-                            "🌉 Ego-bridging shift (lanes lost): starting from est_offset={:.1}% | ego={:.2}px/f",
-                            self.ego_estimated_offset * 100.0,
-                            ego.lateral_velocity,
-                        );
-                    }
-
-                    // Integrate ego motion into estimated offset
-                    let ego_norm_delta = ego.lateral_velocity / self.last_lane_width_px;
-                    self.ego_estimated_offset += ego_norm_delta;
-                    self.ego_cumulative_px += ego.lateral_velocity;
-
-                    let abs_est = self.ego_estimated_offset.abs();
-                    if abs_est > self.shift_peak_offset {
-                        self.shift_peak_offset = abs_est;
-                    }
-
-                    // Reduced confidence for ego-only frames
-                    self.shift_confidence_sum += (ego.confidence * 0.5).min(0.4);
-
-                    // Check if ego motion suggests we've settled (velocity dropped)
-                    if self.ego_bridge_frames > 30
-                        && ego.lateral_velocity.abs() < self.config.ego_motion_min_velocity * 0.5
-                    {
-                        return self.settle_shift_ego(timestamp_ms, frame_id);
-                    }
-
-                    return None;
-                }
-
-                // No ego motion OR bridge exhausted → go occluded, cancel shift
-                if self.frames_without_lanes >= self.config.occlusion_reset_frames {
-                    warn!(
-                        "🌫️  Shift lost: lanes gone and {} (bridge_frames={}/{})",
-                        if has_ego {
-                            "bridge exhausted"
-                        } else {
-                            "no ego motion"
-                        },
-                        self.ego_bridge_frames,
-                        self.config.ego_bridge_max_frames,
-                    );
-                    self.state = State::Occluded;
-                    self.reset_shift();
-                }
-                None
-            }
-
-            State::Stable => {
-                // ── NO LANES + STRONG EGO MOTION: Start ego-only shift ──
-                // v4.12: Suppress if curve mode was recently active — lanes just
-                // dropped out on a curve, ego flow is rotational, not a lane change.
-                if has_ego
-                    && !self.curve_suppresses_ego()
-                    && self.ego_active_frames >= self.config.ego_shift_start_frames
-                {
-                    let direction = if ego.lateral_velocity < 0.0 {
-                        ShiftDirection::Left
-                    } else {
-                        ShiftDirection::Right
-                    };
-
-                    let est_dev = ego.lateral_velocity.abs() / self.last_lane_width_px
-                        * self.ego_active_frames as f32;
-
-                    self.start_shift(
-                        direction,
-                        ShiftSource::EgoStarted,
-                        est_dev,
-                        0.3,
-                        timestamp_ms,
-                        frame_id,
-                    );
-                    self.ego_estimated_offset = est_dev
-                        * if ego.lateral_velocity < 0.0 {
-                            -1.0
-                        } else {
-                            1.0
-                        };
-                    self.ego_bridge_frames = 1;
-
-                    info!(
-                        "🔀🏗️ Ego-motion shift started: {} | ego={:.2}px/f sustained {}f | est_dev={:.1}%",
-                        direction.as_str(),
-                        ego.lateral_velocity,
-                        self.ego_active_frames,
-                        est_dev * 100.0,
-                    );
-
-                    return None;
-                }
-
-                // Just normal lane dropout, check for occlusion
-                if self.frames_without_lanes >= self.config.occlusion_reset_frames {
-                    if self.state != State::Occluded {
-                        warn!(
-                            "🌫️  Lateral detector: occluded ({:.1}s without lanes, ego={:.2}px/f)",
-                            self.frames_without_lanes as f64 / 30.0,
-                            ego.lateral_velocity,
-                        );
-                        self.state = State::Occluded;
-                    }
-                }
-                None
-            }
-
-            _ => {
-                // Occluded, Initializing, Recovering — just wait
-                if self.frames_without_lanes >= self.config.occlusion_reset_frames
-                    && self.state != State::Occluded
-                {
-                    self.state = State::Occluded;
-                    self.reset_shift();
-                }
-                None
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // SHIFTING STATE — LANE-BASED UPDATE
-    // ════════════════════════════════════════════════════════════════════
-
-    fn update_shift_with_lane(
-        &mut self,
-        normalized: f32,
-        lane_confidence: f32,
-        ego: EgoMotionInput,
-        timestamp_ms: f64,
-        frame_id: u64,
-    ) -> Option<LateralShiftEvent> {
-        let deviation = normalized - self.baseline;
-        let abs_dev = deviation.abs();
-        self.shift_frames += 1;
-        self.shift_confidence_sum += lane_confidence;
-        self.ego_cumulative_px += ego.lateral_velocity;
-
-        // v4.10: Track peak cumulative for direction validation at emit time
-        if self.ego_cumulative_px.abs() > self.ego_cumulative_peak_px.abs() {
-            self.ego_cumulative_peak_px = self.ego_cumulative_px;
-        }
-
-        if abs_dev > self.shift_peak_offset {
-            self.shift_peak_offset = abs_dev;
-        }
-
-        // ── DIRECTION VALIDATION (v4.4) ─────────────────────────
-        // If lane position says one direction but cumulative ego motion
-        // strongly disagrees, trust ego for direction.
-        // v4.10: Only allow correction in the first 30 frames — late flips
-        // are caused by the return-to-lane phase inflating cumulative.
-        let lane_direction = if deviation < 0.0 {
-            ShiftDirection::Left
-        } else {
-            ShiftDirection::Right
-        };
-
-        // v4.11: Use effective confirm threshold for all checks in this method
-        let eff_confirm = self.effective_shift_confirm_threshold();
-
-        if let Some(current_dir) = self.shift_direction {
-            if self.shift_frames <= 30 && lane_direction != current_dir && abs_dev > eff_confirm {
-                // Lane says opposite direction. Check ego.
-                let ego_direction = if self.ego_cumulative_px < 0.0 {
-                    ShiftDirection::Left
-                } else {
-                    ShiftDirection::Right
-                };
-
-                if ego_direction == lane_direction && self.ego_cumulative_px.abs() > 20.0 {
-                    // Both lane AND ego disagree with initial direction → flip
-                    warn!(
-                        "🔄 Direction corrected: {} → {} (lane_dev={:.1}%, ego_cum={:.1}px)",
-                        current_dir.as_str(),
-                        lane_direction.as_str(),
-                        deviation * 100.0,
-                        self.ego_cumulative_px,
-                    );
-                    self.shift_direction = Some(lane_direction);
-                }
-            }
-        }
-
-        // ── MAX DURATION ────────────────────────────────────────
-        let max_frames = match self.shift_source {
-            ShiftSource::EgoStarted => self.config.ego_shift_max_frames,
-            _ => self.config.max_shift_frames,
-        };
-
-        if self.shift_frames > max_frames {
-            warn!(
-                "❌ Lateral shift timeout after {} frames — settling into new baseline",
-                self.shift_frames
-            );
-            return self.force_settle(normalized, timestamp_ms, frame_id);
-        }
-
-        // ── SHIFT END (returned toward baseline) ────────────────
-        // v4.10: Grace period — don't check shift_end until the shift has been
-        // active for enough frames. This prevents ego-preempt shifts from being
-        // immediately killed before the lane offset has time to develop.
-        //
-        // For ego-preempt shifts, use extended hold period AND keep the shift
-        // alive while ego is still active (the whole point of ego-preempt is
-        // that lane offset lags behind ego motion).
-        let grace = if self.ego_preempt_originated {
-            self.config.ego_preempt_hold_frames
-        } else {
-            self.config.shift_end_grace_frames
-        };
-        let ego_holding = self.ego_preempt_originated
-            && self.ego_active_frames > 0
-            && self.shift_frames <= self.config.ego_preempt_hold_frames;
-
-        if !ego_holding && self.shift_frames > grace && abs_dev < self.config.shift_end_threshold {
-            let confirmed = self.shift_peak_offset >= eff_confirm
-                && self.shift_frames >= self.config.min_shift_frames;
-
-            return if confirmed {
-                self.emit_shift_event(timestamp_ms, frame_id)
-            } else {
-                debug!(
-                    "❌ Lateral shift rejected: peak={:.1}% (need {:.1}%), frames={} (need {})",
-                    self.shift_peak_offset * 100.0,
-                    eff_confirm * 100.0,
-                    self.shift_frames,
-                    self.config.min_shift_frames
-                );
-                // v4.10: Cooldown after ego-preempt rejection to prevent oscillation
-                if self.ego_preempt_originated {
-                    self.ego_preempt_cooldown = self.config.ego_preempt_cooldown_frames;
-                    debug!(
-                        "⏸️  Ego-preempt cooldown: {} frames after rejected shift",
-                        self.ego_preempt_cooldown,
-                    );
-                }
-                self.update_baseline(normalized);
-                self.state = State::Stable;
-                self.reset_shift();
-                None
-            };
-        }
-
-        // ── SETTLED IN NEW LANE ─────────────────────────────────
-        if self.shift_frames > 60 && self.is_deviation_stable() {
-            let confirmed = self.shift_peak_offset >= eff_confirm;
-
-            return if confirmed {
-                let evt = self.emit_shift_event(timestamp_ms, frame_id);
-                // Update baseline whether event was emitted or vetoed —
-                // the vehicle HAS settled in a new position regardless.
-                self.baseline = normalized;
-                self.baseline_samples = 1;
-                evt
-            } else {
-                self.baseline = normalized;
-                self.baseline_samples = 1;
-                self.state = State::Stable;
-                self.reset_shift();
-                None
-            };
-        }
-
-        None
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // SHIFT LIFECYCLE HELPERS
-    // ════════════════════════════════════════════════════════════════════
-
-    fn start_shift(
-        &mut self,
-        direction: ShiftDirection,
-        source: ShiftSource,
-        initial_dev: f32,
-        initial_confidence: f32,
-        timestamp_ms: f64,
-        frame_id: u64,
-    ) {
-        self.state = State::Shifting;
-        self.shift_direction = Some(direction);
-        self.shift_source = source;
-        self.shift_start_ms = timestamp_ms;
-        self.shift_start_frame = frame_id;
-        self.shift_peak_offset = initial_dev;
-        self.shift_frames = 1;
-        self.shift_confidence_sum = initial_confidence;
-        self.shift_lane_frames = if source == ShiftSource::EgoStarted {
-            0
-        } else {
-            1
-        };
-        self.ego_cumulative_px = 0.0;
-        self.ego_bridge_frames = 0;
-        self.ego_estimated_offset = 0.0;
-    }
-
-    /// Settle an ego-bridged shift when ego velocity drops (vehicle stopped moving laterally).
-    fn settle_shift_ego(&mut self, timestamp_ms: f64, frame_id: u64) -> Option<LateralShiftEvent> {
-        // v4.11: Use effective confirm threshold
-        let eff_confirm = self.effective_shift_confirm_threshold();
-        let confirmed = self.shift_peak_offset >= eff_confirm
-            && self.shift_frames >= self.config.min_shift_frames;
-
-        if confirmed {
-            info!(
-                "✅ Lateral shift settled via ego-motion: peak_est={:.1}% | ego_cum={:.1}px | dur={:.1}s",
-                self.shift_peak_offset * 100.0,
-                self.ego_cumulative_px,
-                (timestamp_ms - self.shift_start_ms) / 1000.0,
-            );
-            let evt = self.emit_shift_event(timestamp_ms, frame_id);
-            if evt.is_some() {
-                // Only transition to Recovering if the event was actually emitted
-                // (not vetoed by ego-direction disagreement).
-                self.baseline_samples = 0;
-                self.freeze_remaining = self.config.post_reset_freeze_frames;
-                self.state = State::Recovering;
-            }
-            return evt;
-        }
-
-        // Not enough evidence to confirm — just reset
         debug!(
-            "❌ Ego-bridged shift rejected: peak={:.1}%, frames={}",
-            self.shift_peak_offset * 100.0,
-            self.shift_frames,
-        );
-        self.state = State::Stable;
-        self.reset_shift();
-        None
-    }
-
-    /// Force-settle a shift that hit max duration.
-    fn force_settle(
-        &mut self,
-        current_normalized: f32,
-        timestamp_ms: f64,
-        frame_id: u64,
-    ) -> Option<LateralShiftEvent> {
-        // v4.11: Use effective confirm threshold
-        let confirmed = self.shift_peak_offset >= self.effective_shift_confirm_threshold();
-
-        let result = if confirmed {
-            // emit_shift_event handles state reset internally
-            self.emit_shift_event(timestamp_ms, frame_id)
-        } else {
-            self.state = State::Stable;
-            self.reset_shift();
-            None
-        };
-
-        // Update baseline to current position regardless of outcome
-        self.baseline = current_normalized;
-        self.baseline_samples = 1;
-        result
-    }
-
-    /// Build and emit the shift event, applying direction validation.
-    /// Returns None if the shift was vetoed by ego-direction disagreement.
-    fn emit_shift_event(&mut self, end_ms: f64, end_frame: u64) -> Option<LateralShiftEvent> {
-        let duration_ms = end_ms - self.shift_start_ms;
-
-        // ══════════════════════════════════════════════════════════
-        // v4.13 FIX (Bug 2): Curve-mode ego cross-validation gate.
-        //
-        // On sharp curves, perspective distortion can produce arbitrarily
-        // large normalized offsets (162.9% seen in production). No scalar
-        // multiplier on shift thresholds can catch this because the
-        // distortion scales with curvature, not with a fixed factor.
-        //
-        // Gate: If curve_mode was active during this shift AND the shift
-        // was LaneBased (not ego-started), require minimum ego cumulative
-        // displacement to confirm the vehicle actually moved laterally.
-        // If the car didn't move (ego_cum ≈ 0), the "shift" is pure
-        // perspective artifact from the curve.
-        //
-        // Threshold: 10px cumulative ego displacement. A real lane change
-        // shows 50-150px+. Curve noise is typically <5px.
-        // ══════════════════════════════════════════════════════════
-        const CURVE_EGO_CONFIRMATION_MIN_PX: f32 = 10.0;
-
-        if self.in_curve_mode
-            && self.shift_source == ShiftSource::LaneBased
-            && self.ego_cumulative_peak_px.abs() < CURVE_EGO_CONFIRMATION_MIN_PX
-        {
-            warn!(
-                "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
-                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min | \
-                 dur={:.1}s | curve_mode=true → perspective distortion, not lane change",
-                self.shift_direction
-                    .unwrap_or(ShiftDirection::Left)
-                    .as_str(),
-                self.shift_peak_offset * 100.0,
-                self.ego_cumulative_px,
-                self.ego_cumulative_peak_px,
-                CURVE_EGO_CONFIRMATION_MIN_PX,
-                duration_ms / 1000.0,
-            );
-            self.state = State::Stable;
-            self.reset_shift();
-            return None;
-        }
-
-        // ── FINAL DIRECTION VALIDATION (v4.4, v4.10b) ────────────
-        // Ego cumulative displacement is the ground truth for direction.
-        // If ego clearly moved one way, trust that over initial lane reading.
-        // v4.10b: Can return None to veto short shifts where ego disagrees.
-        let validated_direction = match self.validate_final_direction(duration_ms) {
-            Some(dir) => dir,
-            None => {
-                // Vetoed — ego disagrees with lane for a short shift.
-                // Reset and return to stable without emitting an event.
-                self.state = State::Stable;
-                self.reset_shift();
-                return None;
-            }
-        };
-
-        let avg_confidence = if self.shift_frames > 0 {
-            self.shift_confidence_sum / self.shift_frames as f32
-        } else {
-            0.3
-        };
-
-        let mut confidence = self.compute_confidence(avg_confidence);
-
-        // Apply ego-only penalty proportional to how much of the shift was ego-only
-        if self.shift_frames > 0 {
-            let ego_only_ratio = if self.shift_lane_frames > 0 {
-                1.0 - (self.shift_lane_frames as f32 / self.shift_frames as f32)
-            } else {
-                1.0
-            };
-            confidence -= self.config.ego_only_confidence_penalty * ego_only_ratio;
-            confidence = confidence.max(0.20);
-        }
-
-        let source_label = match self.shift_source {
-            ShiftSource::LaneBased => "LaneBased",
-            ShiftSource::EgoBridged => "EgoBridged",
-            ShiftSource::EgoStarted => "EgoStarted",
-        };
-
-        let evt = LateralShiftEvent {
-            direction: validated_direction,
-            peak_offset: self.shift_peak_offset,
-            start_ms: self.shift_start_ms,
-            end_ms,
-            start_frame: self.shift_start_frame,
-            end_frame: end_frame,
-            duration_ms,
-            confidence,
-            confirmed: true,
-            curve_mode: self.in_curve_mode,
-            ego_cumulative_peak_px: self.ego_cumulative_peak_px,
-            source_label,
-        };
-
-        info!(
-            "✅ Lateral shift completed: {} | peak={:.1}% | dur={:.1}s | conf={:.2} | \
-             source={:?} | ego_cum={:.1}px (peak={:.1}px) | lane_frames={}/{} | curve_mode={}",
-            evt.direction.as_str(),
-            evt.peak_offset * 100.0,
-            evt.duration_ms / 1000.0,
-            evt.confidence,
-            self.shift_source,
-            self.ego_cumulative_px,
-            self.ego_cumulative_peak_px,
-            self.shift_lane_frames,
-            self.shift_frames,
-            self.in_curve_mode,
+            "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
+            timestamp_ms / 1000.0,
+            self.pass_buffer.len(),
+            self.shift_buffer.len()
         );
 
-        self.state = State::Stable;
-        self.reset_shift();
-        Some(evt)
-    }
-
-    /// Validate shift direction using cumulative ego motion.
-    /// Returns the validated direction, or None if the shift should be vetoed
-    /// (ego strongly disagrees with lane direction for a short shift).
-    ///
-    /// v4.10: Uses peak cumulative (max absolute value during shift) instead of
-    /// final cumulative, because by shift end the vehicle has returned to its lane
-    /// and the cumulative has swung back toward zero or even the opposite direction.
-    ///
-    /// v4.10b: Duration-scaled override threshold. Short shifts (< 1.5s) need
-    /// far less ego evidence to override lane direction, because lane transients
-    /// are common (detector jumps, boundary misidentification) but ego motion
-    /// doesn't lie about which direction the vehicle moved.
-    fn validate_final_direction(&self, duration_ms: f64) -> Option<ShiftDirection> {
-        let initial_dir = self.shift_direction.unwrap_or(ShiftDirection::Left);
-
-        // Use peak cumulative — this captures the direction when ego motion
-        // was strongest (during the actual lane change), not after return.
-        let cum = if self.ego_cumulative_peak_px.abs() > self.ego_cumulative_px.abs() {
-            self.ego_cumulative_peak_px
-        } else {
-            self.ego_cumulative_px
-        };
-
-        // ── v4.10b: Duration-scaled ego threshold ────────────────
-        // For short shifts, lane data alone is unreliable (could be a
-        // detector transient). Lower the ego override bar proportionally.
-        //   < 1.0s: 3px  (very easy to override — short shifts are suspect)
-        //   1.0-2.0s: 5-10px (moderate)
-        //   > 3.0s: 15px (high bar — long shifts with consistent lane data are trustworthy)
-        let duration_s = (duration_ms / 1000.0) as f32;
-        let ego_override_threshold = if duration_s < 1.0 {
-            3.0
-        } else if duration_s < 2.0 {
-            3.0 + (duration_s - 1.0) * 7.0 // 3→10 linearly
-        } else if duration_s < 3.0 {
-            10.0 + (duration_s - 2.0) * 5.0 // 10→15 linearly
-        } else {
-            15.0
-        };
-
-        // If we don't have enough ego data, trust the lane-based direction
-        if cum.abs() < ego_override_threshold {
-            // ── v4.10b: Ego disagreement veto for very short shifts ──
-            // Even if ego cumulative is below the override threshold,
-            // if it's in the OPPOSITE direction for a very short shift,
-            // the shift is almost certainly a lane detector transient.
-            // Veto it entirely rather than emitting a wrong direction.
-            if duration_s < 1.5 && cum.abs() > 1.5 {
-                let ego_dir = if cum < 0.0 {
-                    ShiftDirection::Left
-                } else {
-                    ShiftDirection::Right
-                };
-                if ego_dir != initial_dir {
-                    warn!(
-                        "❌ Ego-direction veto: shift {} dur={:.1}s but ego_cum={:.1}px says {} \
-                         (below override threshold {:.0}px but disagrees) → REJECTING shift",
-                        initial_dir.as_str(),
-                        duration_s,
-                        cum,
-                        ego_dir.as_str(),
-                        ego_override_threshold,
-                    );
-                    return None; // Veto — don't emit this shift
-                }
-            }
-            return Some(initial_dir);
-        }
-
-        let ego_dir = if cum < 0.0 {
-            ShiftDirection::Left
-        } else {
-            ShiftDirection::Right
-        };
-
-        if ego_dir != initial_dir {
-            warn!(
-                "🔄 Direction validation: initial={} ego={} (peak_cum={:.1}px, final_cum={:.1}px, \
-                 threshold={:.0}px, dur={:.1}s) → using {}",
-                initial_dir.as_str(),
-                ego_dir.as_str(),
-                self.ego_cumulative_peak_px,
-                self.ego_cumulative_px,
-                ego_override_threshold,
-                duration_s,
-                ego_dir.as_str(),
+        for (i, p) in self.pass_buffer.iter().enumerate() {
+            debug!(
+                "  Pass[{}]: track={} side={:?} direction={:?} conf={:.2} correlated={} beside_end={:.1}s",
+                i, p.event.vehicle_track_id, p.event.side, p.event.direction,
+                p.event.confidence, p.correlated, p.event.beside_end_ms / 1000.0
             );
-            Some(ego_dir)
-        } else {
-            Some(initial_dir)
         }
-    }
 
-    // ════════════════════════════════════════════════════════════════════
-    // PUBLIC QUERIES
-    // ════════════════════════════════════════════════════════════════════
+        for (i, s) in self.shift_buffer.iter().enumerate() {
+            debug!(
+                "  Shift[{}]: dir={:?} conf={:.2} correlated={} end={:.1}s",
+                i,
+                s.event.direction,
+                s.event.confidence,
+                s.correlated,
+                s.event.end_ms / 1000.0
+            );
+        }
 
-    pub fn is_shifting(&self) -> bool {
-        self.state == State::Shifting
-    }
+        // ── CORRELATE PASS + SHIFT → OVERTAKE ───────────────────
+        let gap = self.config.max_correlation_gap_ms;
 
-    pub fn state_str(&self) -> &str {
-        match self.state {
-            State::Initializing => "INITIALIZING",
-            State::Stable => {
-                if self.in_curve_mode {
-                    "STABLE(curve)"
-                } else {
-                    "STABLE"
-                }
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
             }
-            State::Shifting => match self.shift_source {
-                ShiftSource::LaneBased => {
-                    if self.in_curve_mode {
-                        "SHIFTING(curve)"
-                    } else {
-                        "SHIFTING"
+            if self.pass_buffer[pass_idx].event.direction == PassDirection::VehicleOvertookEgo {
+                continue;
+            }
+
+            // ══════════════════════════════════════════════════════
+            // v4.10: REJECT EGO-MOTION-INDUCED PASSES (pre-check)
+            //
+            // If ego's own lane change explains the apparent zone
+            // transition, this pass is an artifact — skip correlation
+            // so the shift event becomes a LANE_CHANGE instead.
+            // ══════════════════════════════════════════════════════
+            if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
+                warn!(
+                    "  ❌ REJECTED pass (track {}, side={:?}): ego lateral motion \
+                     explains apparent zone transition (ego lane change artifact)",
+                    self.pass_buffer[pass_idx].event.vehicle_track_id,
+                    self.pass_buffer[pass_idx].event.side,
+                );
+                self.pass_buffer[pass_idx].correlated = true; // consume it
+                continue;
+            }
+
+            let mut best_shift_idx: Option<usize> = None;
+            let mut best_time_gap = f64::MAX;
+
+            for (si, shift) in self.shift_buffer.iter().enumerate() {
+                if shift.correlated {
+                    continue;
+                }
+
+                let time_gap = temporal_gap(
+                    self.pass_buffer[pass_idx].event.beside_start_ms,
+                    self.pass_buffer[pass_idx].event.beside_end_ms,
+                    shift.event.start_ms,
+                    shift.event.end_ms,
+                );
+
+                if time_gap < gap && time_gap < best_time_gap {
+                    if directions_agree(&self.pass_buffer[pass_idx].event, &shift.event) {
+                        best_shift_idx = Some(si);
+                        best_time_gap = time_gap;
                     }
                 }
-                ShiftSource::EgoBridged => "SHIFTING(ego-bridge)",
-                ShiftSource::EgoStarted => "SHIFTING(ego-start)",
-            },
-            State::Occluded => "OCCLUDED",
-            State::Recovering => "RECOVERING",
+            }
+
+            if let Some(si) = best_shift_idx {
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let shift_event = self.shift_buffer[si].event.clone();
+
+                let maneuver =
+                    self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+
+                info!(
+                    "🚗 OVERTAKE: {} | conf={:.2} | sources={} | legality={:?}",
+                    maneuver.side.as_str(),
+                    maneuver.confidence,
+                    maneuver.sources.summary(),
+                    maneuver.legality,
+                );
+
+                self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+
+                self.pass_buffer[pass_idx].correlated = true;
+                self.shift_buffer[si].correlated = true;
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // UNCORRELATED HIGH-CONFIDENCE PASSES → OVERTAKE
+        //
+        // v4.3: Ego-motion gate (reject if NO ego motion)
+        // v4.8: Pass quality gate (min_pass_confidence_single_source)
+        // v4.10: Ego-induced gate already applied above (correlated check).
+        //        Re-check here for passes that weren't consumed by the
+        //        correlated path.
+        // ══════════════════════════════════════════════════════════════════
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
+            }
+            if self.pass_buffer[pass_idx].event.direction == PassDirection::VehicleOvertookEgo {
+                continue;
+            }
+
+            let pass_conf = self.pass_buffer[pass_idx].event.confidence;
+
+            info!(
+                "🔍 Checking single-source pass: track={} side={:?} conf={:.2} \
+                 (min_single={:.2}, min_pass_conf={:.2})",
+                self.pass_buffer[pass_idx].event.vehicle_track_id,
+                self.pass_buffer[pass_idx].event.side,
+                pass_conf,
+                self.config.min_single_source_confidence,
+                self.config.min_pass_confidence_single_source,
+            );
+
+            // ── v4.10: Ego-motion-induced pass gate (redundant safety check) ──
+            // The pre-check above should have caught this, but if timing
+            // or buffer order caused it to slip through, catch it here.
+            if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
+                warn!(
+                    "  ❌ REJECTED single-source pass (track {}): ego lateral motion \
+                     explains apparent zone transition",
+                    self.pass_buffer[pass_idx].event.vehicle_track_id,
+                );
+                self.pass_buffer[pass_idx].correlated = true;
+                continue;
+            }
+
+            // ── v4.8: Pass event quality gate ──
+            if pass_conf < self.config.min_pass_confidence_single_source {
+                info!(
+                    "  ❌ Pass conf too low for single-source: {:.2} < {:.2}",
+                    pass_conf, self.config.min_pass_confidence_single_source
+                );
+                continue;
+            }
+
+            if pass_conf >= self.config.min_single_source_confidence {
+                // ── v4.3 EGO-MOTION GATE (absence check) ──
+                let ego_confirms = self.ego_motion_confirms_lateral();
+                let had_any_lateral_shift = self.shift_buffer.iter().any(|s| !s.correlated);
+
+                if !ego_confirms && !had_any_lateral_shift {
+                    // v4.10: Check ego motion during the MANEUVER's time window,
+                    // not just "the last 60 frames". The ego lane change may have
+                    // happened seconds before the pass event fires (the pass fires
+                    // when the vehicle disappears, which can be long after the ego
+                    // completed its lane change).
+                    //
+                    // Window: from ahead_start_ms (or beside_start - 10s) to now.
+                    // This captures the lane change that preceded the alongside phase.
+                    let pass_event = &self.pass_buffer[pass_idx].event;
+                    let window_start = pass_event
+                        .ahead_start_ms
+                        .min(pass_event.beside_start_ms - 10000.0)
+                        .max(0.0);
+                    let window_end = timestamp_ms;
+
+                    let peak_ego = self.peak_ego_motion_in_window(window_start, window_end);
+
+                    if peak_ego < self.config.min_ego_motion_for_single_source {
+                        warn!(
+                            "  ❌ REJECTED single-source pass (track {}): no lateral motion \
+                             in maneuver window [{:.1}s..{:.1}s] \
+                             (peak_ego={:.2} < {:.2}, ego_confirms={}, shifts={})",
+                            self.pass_buffer[pass_idx].event.vehicle_track_id,
+                            window_start / 1000.0,
+                            window_end / 1000.0,
+                            peak_ego,
+                            self.config.min_ego_motion_for_single_source,
+                            ego_confirms,
+                            had_any_lateral_shift
+                        );
+                        self.pass_buffer[pass_idx].correlated = true;
+                        continue;
+                    }
+                }
+
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let maneuver = self.build_overtake(&pass_event, None, legality_buffer);
+
+                info!(
+                    "  → Built overtake: conf={:.2} (min_combined={:.2}) sources={}",
+                    maneuver.confidence,
+                    self.config.min_combined_confidence,
+                    maneuver.sources.summary()
+                );
+
+                if maneuver.confidence >= self.config.min_combined_confidence {
+                    info!(
+                        "🚗 OVERTAKE (tracking-only): {} | conf={:.2} | ego={}",
+                        maneuver.side.as_str(),
+                        maneuver.confidence,
+                        self.ego_motion_confirms_lateral(),
+                    );
+
+                    self.recent_events.push(maneuver);
+                    self.total_maneuvers += 1;
+                    self.pass_buffer[pass_idx].correlated = true;
+                } else {
+                    info!(
+                        "  ❌ Rejected: conf={:.2} < min_combined={:.2}",
+                        maneuver.confidence, self.config.min_combined_confidence
+                    );
+                }
+            } else {
+                info!(
+                    "  ❌ Pass conf too low: {:.2} < {:.2}",
+                    pass_conf, self.config.min_single_source_confidence
+                );
+            }
+        }
+
+        // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
+        for shift_idx in 0..self.shift_buffer.len() {
+            if self.shift_buffer[shift_idx].correlated {
+                continue;
+            }
+            if !self.shift_buffer[shift_idx].event.confirmed {
+                continue;
+            }
+
+            let shift_event = self.shift_buffer[shift_idx].event.clone();
+            let maneuver = self.build_lane_change(&shift_event, legality_buffer);
+
+            if maneuver.confidence >= self.config.min_combined_confidence {
+                info!(
+                    "🔀 LANE CHANGE: {} | conf={:.2} | legality={:?}",
+                    maneuver.side.as_str(),
+                    maneuver.confidence,
+                    maneuver.legality,
+                );
+
+                self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+                self.shift_buffer[shift_idx].correlated = true;
+            }
+        }
+
+        // ── BEING OVERTAKEN ─────────────────────────────────────
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
+            }
+            if self.pass_buffer[pass_idx].event.direction == PassDirection::VehicleOvertookEgo {
+                // v4.12: Ego-motion-induced VehicleOvertookEgo gate
+                if self.ego_motion_explains_pass(&self.pass_buffer[pass_idx].event) {
+                    warn!(
+                        "  ❌ REJECTED VehicleOvertookEgo (track {}): ego lateral motion \
+                         explains apparent BESIDE→AHEAD zone transition \
+                         (ego lane change / curve artifact, not being overtaken)",
+                        self.pass_buffer[pass_idx].event.vehicle_track_id,
+                    );
+                    self.pass_buffer[pass_idx].correlated = true;
+                    continue;
+                }
+
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let maneuver = self.build_being_overtaken(&pass_event);
+
+                info!(
+                    "⚠️  BEING OVERTAKEN: track {} on {} | conf={:.2}",
+                    pass_event.vehicle_track_id,
+                    maneuver.side.as_str(),
+                    maneuver.confidence,
+                );
+
+                self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+                self.pass_buffer[pass_idx].correlated = true;
+            }
+        }
+
+        // v4.13 FIX (Bug 1): Drain consumed entries immediately.
+        // Prevents stale correlated passes from lingering in the buffer
+        // for the full correlation_window_ms, producing log spam every frame.
+        self.pass_buffer.retain(|p| !p.correlated);
+        self.shift_buffer.retain(|s| !s.correlated);
+
+        self.recent_events.clone()
+    }
+
+    // ── EVENT BUILDERS ──────────────────────────────────────────
+
+    fn build_overtake(
+        &self,
+        pass: &PassEvent,
+        shift: Option<&LateralShiftEvent>,
+        legality_buffer: Option<&LegalityRingBuffer>,
+    ) -> ManeuverEvent {
+        let side = match pass.side {
+            PassSide::Left => ManeuverSide::Left,
+            PassSide::Right => ManeuverSide::Right,
+        };
+
+        let (start_frame, end_frame) = self.compute_frame_range(pass, shift);
+
+        let legality_at_crossing =
+            legality_buffer.and_then(|buf| buf.worst_in_range(start_frame, end_frame));
+        let legality = legality_at_crossing
+            .as_ref()
+            .map(|r| r.verdict)
+            .unwrap_or(LineLegality::Unknown);
+
+        let ego_confirms = self.ego_motion_confirms_lateral();
+
+        let pass_weight = if shift.is_none() && !ego_confirms {
+            0.70
+        } else {
+            self.config.weight_pass
+        };
+
+        let pass_conf = pass.confidence * pass_weight;
+        let shift_conf = shift
+            .map(|s| s.confidence * self.config.weight_lateral)
+            .unwrap_or(0.0);
+        let ego_conf = if ego_confirms {
+            self.config.weight_ego_motion * 0.8
+        } else {
+            0.0
+        };
+
+        let sources = DetectionSources {
+            vehicle_tracking: true,
+            lane_detection: shift.is_some(),
+            ego_motion: ego_confirms,
+        };
+
+        let source_bonus = match sources.count() {
+            3 => 0.15,
+            2 => 0.08,
+            1 => 0.0,
+            _ => 0.0,
+        };
+
+        let confidence = (pass_conf + shift_conf + ego_conf + source_bonus).min(0.98);
+        let (start_ms, end_ms) = if let Some(s) = shift {
+            (
+                pass.ahead_start_ms.min(s.start_ms),
+                pass.beside_end_ms.max(s.end_ms),
+            )
+        } else {
+            (pass.ahead_start_ms, pass.beside_end_ms)
+        };
+
+        ManeuverEvent {
+            maneuver_type: ManeuverType::Overtake,
+            side,
+            legality,
+            legality_at_crossing,
+            confidence,
+            sources,
+            start_ms,
+            end_ms,
+            start_frame,
+            end_frame,
+            duration_ms: end_ms - start_ms,
+            passed_vehicle_id: Some(pass.vehicle_track_id),
+            passed_vehicle_class: Some(pass.vehicle_class_id),
+            pass_event: Some(pass.clone()),
+            lateral_event: shift.cloned(),
+            marking_context: Some(self.latest_markings.clone()),
         }
     }
 
-    pub fn baseline(&self) -> f32 {
-        self.baseline
+    fn build_lane_change(
+        &self,
+        shift: &LateralShiftEvent,
+        legality_buffer: Option<&LegalityRingBuffer>,
+    ) -> ManeuverEvent {
+        let side = match shift.direction {
+            ShiftDirection::Left => ManeuverSide::Left,
+            ShiftDirection::Right => ManeuverSide::Right,
+        };
+
+        let legality_at_crossing =
+            legality_buffer.and_then(|buf| buf.worst_in_range(shift.start_frame, shift.end_frame));
+        let legality = legality_at_crossing
+            .as_ref()
+            .map(|r| r.verdict)
+            .unwrap_or(LineLegality::Unknown);
+
+        let ego_confirms = self.ego_motion_confirms_lateral();
+
+        let shift_conf = shift.confidence * (self.config.weight_pass + self.config.weight_lateral);
+        let ego_conf = if ego_confirms {
+            self.config.weight_ego_motion * 0.8
+        } else {
+            0.0
+        };
+
+        let sources = DetectionSources {
+            vehicle_tracking: false,
+            lane_detection: true,
+            ego_motion: ego_confirms,
+        };
+
+        let confidence =
+            (shift_conf + ego_conf + if sources.count() >= 2 { 0.05 } else { 0.0 }).min(0.95);
+
+        ManeuverEvent {
+            maneuver_type: ManeuverType::LaneChange,
+            side,
+            legality,
+            legality_at_crossing,
+            confidence,
+            sources,
+            start_ms: shift.start_ms,
+            end_ms: shift.end_ms,
+            start_frame: shift.start_frame,
+            end_frame: shift.end_frame,
+            duration_ms: shift.duration_ms,
+            passed_vehicle_id: None,
+            passed_vehicle_class: None,
+            pass_event: None,
+            lateral_event: Some(shift.clone()),
+            marking_context: Some(self.latest_markings.clone()),
+        }
+    }
+
+    fn build_being_overtaken(&self, pass: &PassEvent) -> ManeuverEvent {
+        let side = match pass.side {
+            PassSide::Left => ManeuverSide::Left,
+            PassSide::Right => ManeuverSide::Right,
+        };
+
+        ManeuverEvent {
+            maneuver_type: ManeuverType::BeingOvertaken,
+            side,
+            legality: LineLegality::Unknown,
+            legality_at_crossing: None,
+            confidence: pass.confidence * 0.85,
+            sources: DetectionSources {
+                vehicle_tracking: true,
+                lane_detection: false,
+                ego_motion: false,
+            },
+            start_ms: pass.beside_start_ms,
+            end_ms: pass.beside_end_ms,
+            start_frame: pass
+                .frame_id
+                .saturating_sub((pass.duration_ms / 33.3) as u64),
+            end_frame: pass.frame_id,
+            duration_ms: pass.duration_ms,
+            passed_vehicle_id: Some(pass.vehicle_track_id),
+            passed_vehicle_class: Some(pass.vehicle_class_id),
+            pass_event: Some(pass.clone()),
+            lateral_event: None,
+            marking_context: None,
+        }
+    }
+
+    // ── HELPERS ──────────────────────────────────────────────────
+
+    fn compute_frame_range(
+        &self,
+        pass: &PassEvent,
+        shift: Option<&LateralShiftEvent>,
+    ) -> (u64, u64) {
+        if let Some(s) = shift {
+            (
+                s.start_frame.min(pass.frame_id.saturating_sub(100)),
+                pass.frame_id.max(s.end_frame),
+            )
+        } else {
+            (
+                pass.frame_id
+                    .saturating_sub((pass.duration_ms / 33.3) as u64),
+                pass.frame_id,
+            )
+        }
+    }
+
+    /// v4.10: Query peak ego lateral velocity within a time window.
+    /// Returns peak absolute velocity during [start_ms, end_ms].
+    /// Falls back to the full buffer if the window is empty.
+    fn peak_ego_motion_in_window(&self, start_ms: f64, end_ms: f64) -> f32 {
+        let in_window = self
+            .ego_motion_during_window
+            .iter()
+            .filter(|(ts, _)| *ts >= start_ms && *ts <= end_ms)
+            .map(|(_, v)| v.abs())
+            .fold(0.0f32, |a, b| a.max(b));
+
+        if in_window > 0.0 {
+            return in_window;
+        }
+
+        // Fallback: window empty (timestamps not aligned), check full buffer
+        self.ego_motion_during_window
+            .iter()
+            .map(|(_, v)| v.abs())
+            .fold(0.0f32, |a, b| a.max(b))
+    }
+
+    fn ego_motion_confirms_lateral(&self) -> bool {
+        if self.ego_motion_during_window.len() < 5 {
+            return false;
+        }
+        let peak = self
+            .ego_motion_during_window
+            .iter()
+            .rev()
+            .take(30)
+            .map(|(_, v)| v.abs())
+            .fold(0.0f32, |a, b| a.max(b));
+
+        peak >= self.config.ego_motion_threshold
+    }
+
+    /// v4.10: Determine if ego's own lateral motion could create the
+    /// apparent zone transition that generated this EgoOvertook pass event.
+    ///
+    /// When the ego vehicle changes lanes, vehicles that were AHEAD in
+    /// the original lane appear to shift laterally through zones:
+    ///
+    ///   Ego moves LEFT (negative velocity):
+    ///     Ahead vehicle appears to shift RIGHT
+    ///     → AHEAD → BESIDE_RIGHT → BEHIND
+    ///     → PassSide::Left (ego "passed on left") ← false positive
+    ///
+    ///   Ego moves RIGHT (positive velocity):
+    ///     Ahead vehicle appears to shift LEFT
+    ///     → AHEAD → BESIDE_LEFT → BEHIND
+    ///     → PassSide::Right (ego "passed on right") ← false positive
+    ///
+    /// Returns true if ego lateral motion is sustained and strong enough
+    /// in the direction that would produce the observed pass side.
+    fn ego_motion_explains_pass(&self, pass: &PassEvent) -> bool {
+        // v4.10/v4.12: Only EgoOvertook and VehicleOvertookEgo can be ego-induced.
+        if pass.direction != PassDirection::EgoOvertook
+            && pass.direction != PassDirection::VehicleOvertookEgo
+        {
+            return false;
+        }
+
+        if self.ego_motion_during_window.len() < 15 {
+            return false;
+        }
+
+        let threshold = self.config.ego_induced_pass_velocity_threshold;
+        let min_sustained = self.config.ego_induced_pass_min_sustained_frames;
+
+        // Examine ego motion over a window covering the pass.
+        // Use the last 90 samples (~3s at 30fps) to capture the lane
+        // change that produced the apparent zone transition.
+        let samples: Vec<f32> = self
+            .ego_motion_during_window
+            .iter()
+            .rev()
+            .take(90)
+            .map(|(_, v)| *v)
+            .collect();
+
+        // v4.12: Direction-aware ego motion check.
+        // EgoOvertook: same-direction ego creates artifact.
+        // VehicleOvertookEgo: opposite-direction ego creates artifact.
+        let (check_negative, check_positive) = match (pass.direction, pass.side) {
+            (PassDirection::EgoOvertook, PassSide::Left) => (true, false),
+            (PassDirection::EgoOvertook, PassSide::Right) => (false, true),
+            (PassDirection::VehicleOvertookEgo, PassSide::Right) => (true, false),
+            (PassDirection::VehicleOvertookEgo, PassSide::Left) => (false, true),
+        };
+
+        if check_negative {
+            let sustained_left = samples.iter().filter(|&&v| v < -threshold).count();
+            let peak_left = samples.iter().fold(0.0f32, |a, &b| a.min(b));
+            if sustained_left >= min_sustained {
+                info!(
+                    "  🔍 ego_motion_explains_pass: track={} dir={:?} side={:?} | \
+                     ego moving LEFT: peak={:.2} px/f, sustained={}/{} frames → EXPLAINS pass",
+                    pass.vehicle_track_id,
+                    pass.direction,
+                    pass.side,
+                    peak_left,
+                    sustained_left,
+                    min_sustained
+                );
+                return true;
+            }
+        }
+
+        if check_positive {
+            let sustained_right = samples.iter().filter(|&&v| v > threshold).count();
+            let peak_right = samples.iter().fold(0.0f32, |a, &b| a.max(b));
+            if sustained_right >= min_sustained {
+                info!(
+                    "  🔍 ego_motion_explains_pass: track={} dir={:?} side={:?} | \
+                     ego moving RIGHT: peak={:.2} px/f, sustained={}/{} frames → EXPLAINS pass",
+                    pass.vehicle_track_id,
+                    pass.direction,
+                    pass.side,
+                    peak_right,
+                    sustained_right,
+                    min_sustained
+                );
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn recent_events(&self) -> &[ManeuverEvent] {
+        &self.recent_events
+    }
+
+    pub fn total_maneuvers(&self) -> u64 {
+        self.total_maneuvers
     }
 
     pub fn reset(&mut self) {
-        self.state = State::Initializing;
-        self.baseline = 0.0;
-        self.baseline_samples = 0;
-        self.freeze_remaining = 0;
-        self.last_lane_width_px = 600.0;
-        self.frames_without_lanes = 0;
-        self.ego_active_frames = 0;
-        self.ego_last_velocity = 0.0;
-        self.offset_history.clear();
-        self.cached_measurement = None;
-        self.cached_measurement_age = 0;
-        self.ego_preempt_cooldown = 0;
-        self.coherence_history.clear();
-        self.curve_sustained_frames = 0;
-        self.in_curve_mode = false;
-        self.frames_since_curve_mode = u32::MAX;
-        self.reset_shift();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // PRIVATE HELPERS
-    // ════════════════════════════════════════════════════════════════════
-
-    /// v4.11 (Fix 2): Adaptive baseline alpha.
-    ///
-    /// Default alpha (baseline_alpha_stable) is intentionally slow to avoid
-    /// chasing noise. But on curves, the normalized offset drifts smoothly
-    /// and consistently — the baseline must track it or deviation accumulates
-    /// and triggers false lane-change detections.
-    ///
-    /// Detection of smooth drift:
-    ///   1. Compute variance of recent offset_history (last 12 frames)
-    ///   2. Compute drift rate (average per-frame delta from first differences)
-    ///   3. If variance < max AND drift > min → curve-like drift → boost alpha
-    ///   4. Interpolate alpha between base and adaptive_max
-    fn update_baseline(&mut self, normalized: f32) {
-        let base_alpha = if self.state == State::Recovering {
-            self.config.baseline_alpha_recovery
-        } else {
-            self.config.baseline_alpha_stable
-        };
-
-        // ── Compute adaptive boost (only in Stable state) ───────
-        let alpha = if self.state == State::Stable && self.offset_history.len() >= 12 {
-            let recent: Vec<f32> = self.offset_history.iter().rev().take(12).copied().collect();
-
-            // Variance of recent offsets
-            let mean = recent.iter().sum::<f32>() / recent.len() as f32;
-            let variance =
-                recent.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / recent.len() as f32;
-
-            // Drift rate: average absolute first-difference
-            let deltas: Vec<f32> = recent.windows(2).map(|w| (w[0] - w[1]).abs()).collect();
-            let avg_drift = if !deltas.is_empty() {
-                deltas.iter().sum::<f32>() / deltas.len() as f32
-            } else {
-                0.0
-            };
-
-            // Drift direction consistency: what fraction of deltas have the same sign?
-            // (smooth curve drift is monotonic; noise flips sign constantly)
-            let signed_deltas: Vec<f32> = recent.windows(2).map(|w| w[0] - w[1]).collect();
-            let positive_count = signed_deltas.iter().filter(|d| **d > 0.0).count();
-            let negative_count = signed_deltas.iter().filter(|d| **d < 0.0).count();
-            let direction_consistency =
-                positive_count.max(negative_count) as f32 / signed_deltas.len().max(1) as f32;
-
-            if variance < self.config.adaptive_baseline_max_variance
-                && avg_drift > self.config.adaptive_baseline_min_drift
-                && direction_consistency > 0.6
-            {
-                // Smooth, consistent drift detected — boost alpha
-                let drift_factor = ((avg_drift - self.config.adaptive_baseline_min_drift)
-                    / (self.config.adaptive_baseline_min_drift * 5.0))
-                    .min(1.0);
-                let variance_factor =
-                    (1.0 - variance / self.config.adaptive_baseline_max_variance).max(0.0);
-                let consistency_factor = ((direction_consistency - 0.6) / 0.4).min(1.0);
-
-                let boost = drift_factor * variance_factor * consistency_factor;
-                let adaptive_alpha =
-                    base_alpha + boost * (self.config.adaptive_baseline_alpha_max - base_alpha);
-
-                if boost > 0.3 {
-                    debug!(
-                        "📈 Adaptive baseline: alpha={:.4} (boost={:.2}) | var={:.5} drift={:.4} consistency={:.2}",
-                        adaptive_alpha, boost, variance, avg_drift, direction_consistency,
-                    );
-                }
-
-                adaptive_alpha
-            } else {
-                base_alpha
-            }
-        } else {
-            base_alpha
-        };
-
-        if self.baseline_samples == 0 {
-            self.baseline = normalized;
-        } else {
-            self.baseline = alpha * normalized + (1.0 - alpha) * self.baseline;
-        }
-        self.baseline_samples += 1;
-    }
-
-    fn reset_shift(&mut self) {
-        self.shift_direction = None;
-        self.shift_source = ShiftSource::LaneBased;
-        self.shift_start_ms = 0.0;
-        self.shift_start_frame = 0;
-        self.shift_peak_offset = 0.0;
-        self.shift_frames = 0;
-        self.shift_confidence_sum = 0.0;
-        self.shift_lane_frames = 0;
-        self.ego_cumulative_px = 0.0;
-        self.ego_cumulative_peak_px = 0.0;
-        self.ego_bridge_frames = 0;
-        self.ego_estimated_offset = 0.0;
-        self.ego_preempt_originated = false;
-    }
-
-    fn is_deviation_stable(&self) -> bool {
-        if self.offset_history.len() < 10 {
-            return false;
-        }
-        let recent: Vec<f32> = self.offset_history.iter().rev().take(10).copied().collect();
-        let mean = recent.iter().sum::<f32>() / recent.len() as f32;
-        let var = recent.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / recent.len() as f32;
-        var < 0.002
-    }
-
-    fn compute_confidence(&self, avg_lane_confidence: f32) -> f32 {
-        let mut conf: f32 = 0.5;
-
-        if avg_lane_confidence > 0.7 {
-            conf += 0.20;
-        } else if avg_lane_confidence > 0.5 {
-            conf += 0.10;
-        }
-
-        if self.shift_peak_offset > 0.50 {
-            conf += 0.15;
-        } else if self.shift_peak_offset > 0.35 {
-            conf += 0.10;
-        }
-
-        let dur_s = self.shift_frames as f32 / 30.0;
-        if dur_s >= 1.0 && dur_s <= 8.0 {
-            conf += 0.10;
-        }
-
-        conf.min(0.95)
+        self.pass_buffer.clear();
+        self.shift_buffer.clear();
+        self.ego_motion_during_window.clear();
+        self.current_ego_motion = EgoMotionEstimate::none();
+        self.recent_events.clear();
+        self.total_maneuvers = 0;
+        self.latest_markings = MarkingSnapshot::default();
     }
 }
 
 // ============================================================================
-// TESTS
+// UTILITY
 // ============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn default_mining_config() -> LateralDetectorConfig {
-        LateralDetectorConfig {
-            min_lane_confidence: 0.20,
-            shift_start_threshold: 0.35,
-            shift_confirm_threshold: 0.50,
-            shift_end_threshold: 0.20,
-            min_shift_frames: 15,
-            baseline_alpha_stable: 0.002,
-            baseline_warmup_frames: 25,
-            // v4.11 mining curve tuning
-            curve_coherence_threshold: 0.60,
-            curve_shift_threshold_multiplier: 2.0,
-            curve_min_sustained_frames: 4,
-            adaptive_baseline_alpha_max: 0.05,
-            adaptive_baseline_max_variance: 0.002,
-            adaptive_baseline_min_drift: 0.0015,
-            ..LateralDetectorConfig::default()
-        }
+fn temporal_gap(start_a: f64, end_a: f64, start_b: f64, end_b: f64) -> f64 {
+    if end_a < start_b {
+        start_b - end_a
+    } else if end_b < start_a {
+        start_a - end_b
+    } else {
+        0.0
     }
+}
 
-    fn make_measurement(offset_px: f32, lane_width: f32, coherence: f32) -> LaneMeasurement {
-        LaneMeasurement {
-            lateral_offset_px: offset_px,
-            lane_width_px: lane_width,
-            confidence: 0.8,
-            both_lanes: true,
-            boundary_coherence: coherence,
-            curvature: None, // tests use coherence directly
-        }
-    }
+fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
+    let strict_match = matches!(
+        (pass.side, shift.direction),
+        (PassSide::Left, ShiftDirection::Left) | (PassSide::Right, ShiftDirection::Right)
+    );
 
-    /// On a curve with high boundary coherence, a moderate offset swing
-    /// (e.g. -43.8% of lane width over 0.6s) should NOT trigger a shift
-    /// because thresholds are raised by the curve multiplier.
-    #[test]
-    fn test_curve_suppresses_false_shift() {
-        let config = default_mining_config();
-        let mut det = LateralShiftDetector::new(config);
-
-        let lane_w = 467.0;
-
-        // Warmup: establish baseline at ~0% offset
-        for i in 0..30 {
-            let m = make_measurement(0.0, lane_w, -1.0);
-            det.update(Some(m), None, i as f64 * 33.3, i);
-        }
-        assert_eq!(det.state, State::Stable);
-
-        // Simulate curve: high coherence sustained for several frames
-        // while offset drifts to -43.8%
-        let peak_offset_px = -204.4; // -43.8% of 467px
-        let num_frames = 18; // ~0.6s at 30fps
-        for i in 0..num_frames {
-            let t = i as f32 / num_frames as f32;
-            let offset_px = t * peak_offset_px;
-            // High coherence throughout (boundaries co-moving)
-            let m = make_measurement(offset_px, lane_w, 0.85);
-            let frame = 30 + i as u64;
-            let result = det.update(Some(m), None, frame as f64 * 33.3, frame);
-            // Should NOT produce a shift event
-            assert!(
-                result.is_none(),
-                "Frame {}: unexpected shift event during curve! offset={:.1}%",
-                frame,
-                (offset_px / lane_w) * 100.0,
-            );
-        }
-
-        // Verify curve mode was activated
-        assert!(det.in_curve_mode, "Curve mode should be active");
-        // With mining config: base threshold 35% × 2.0 = 70%.
-        // Peak was 43.8% which is below 70%, so no shift should have started.
-        assert_eq!(
-            det.state,
-            State::Stable,
-            "Should remain Stable, not Shifting"
-        );
-    }
-
-    /// A real lane change (2-3s, boundaries diverging = low/negative coherence)
-    /// should still be detected even when curve suppression is available.
-    #[test]
-    fn test_real_lane_change_not_suppressed() {
-        let config = default_mining_config();
-        let mut det = LateralShiftDetector::new(config);
-        let lane_w = 467.0;
-
-        // Warmup
-        for i in 0..30 {
-            let m = make_measurement(0.0, lane_w, -1.0);
-            det.update(Some(m), None, i as f64 * 33.3, i);
-        }
-
-        // Real lane change: LOW coherence (boundaries diverging),
-        // offset grows to 60% over 2.5 seconds
-        let peak_pct = 0.60;
-        let change_frames = 75; // 2.5s
-        let mut shift_started = false;
-        for i in 0..change_frames {
-            let t = (i as f32 / change_frames as f32).min(1.0);
-            let offset_px = t * peak_pct * lane_w;
-            // Low/negative coherence — boundaries diverging
-            let coherence = -0.3 + (0.2 * (i as f32 / 10.0).sin()); // oscillates around -0.3
-            let m = make_measurement(offset_px, lane_w, coherence);
-            let frame = 30 + i as u64;
-            det.update(Some(m), None, frame as f64 * 33.3, frame);
-            if det.state == State::Shifting {
-                shift_started = true;
-            }
-        }
-
-        assert!(
-            shift_started,
-            "Real lane change should have entered Shifting state"
-        );
-        assert!(
-            !det.in_curve_mode,
-            "Curve mode should NOT be active during a real lane change"
-        );
-    }
-
-    /// Adaptive baseline should track smooth drift, preventing deviation
-    /// buildup that would trigger a false shift.
-    #[test]
-    fn test_adaptive_baseline_tracks_smooth_drift() {
-        let config = default_mining_config();
-        let mut det = LateralShiftDetector::new(config);
-        let lane_w = 500.0;
-
-        // Warmup
-        for i in 0..30 {
-            let m = make_measurement(0.0, lane_w, -1.0);
-            det.update(Some(m), None, i as f64 * 33.3, i);
-        }
-        let baseline_after_warmup = det.baseline;
-
-        // Smooth drift: offset increases by ~0.15% per frame for 100 frames
-        // Total drift = 15% of lane width. Without adaptive alpha, baseline
-        // barely moves (alpha=0.002). With adaptive alpha, it should track.
-        let drift_rate_px = 0.75; // px/frame → 0.15% of 500px lane
-        for i in 0..100 {
-            let offset_px = drift_rate_px * i as f32;
-            // Moderate coherence (boundaries co-moving during curve)
-            let m = make_measurement(offset_px, lane_w, 0.5);
-            let frame = 30 + i as u64;
-            let result = det.update(Some(m), None, frame as f64 * 33.3, frame);
-            assert!(
-                result.is_none(),
-                "Frame {}: smooth drift should not produce shift event",
-                frame
-            );
-        }
-
-        // After 100 frames of drift, the normalized offset is 0.15 (15%).
-        // With base alpha only (0.002), baseline would barely move from 0.
-        // With adaptive alpha, baseline should have tracked significantly.
-        let final_offset_norm = (drift_rate_px * 100.0) / lane_w;
-        let baseline_drift = det.baseline - baseline_after_warmup;
-
-        // Baseline should have tracked at least 40% of the actual drift
-        assert!(
-            baseline_drift > final_offset_norm * 0.4,
-            "Adaptive baseline should track smooth drift: baseline_drift={:.4} vs expected>{:.4}",
-            baseline_drift,
-            final_offset_norm * 0.4,
-        );
-
-        // And the deviation from baseline should be small (< shift_start)
-        let current_normalized = (drift_rate_px * 100.0) / lane_w;
-        let deviation = (current_normalized - det.baseline).abs();
-        assert!(
-            deviation < det.effective_shift_start_threshold(),
-            "Deviation ({:.3}) should be below shift threshold ({:.3}) thanks to adaptive baseline",
-            deviation,
-            det.effective_shift_start_threshold(),
-        );
-    }
-
-    /// v4.13: On a sharp curve, perspective distortion can produce offsets
-    /// exceeding even the raised curve threshold (e.g. 162% peak). If ego
-    /// cumulative displacement is near zero, the shift must be vetoed as a
-    /// perspective artifact, not emitted as a lane change.
-    ///
-    /// Reproduces production Bug 2:
-    ///   curve_mode=true, source=LaneBased, ego_cum=-3.3px, peak=162.9%
-    #[test]
-    fn test_curve_ego_crossvalidation_veto() {
-        let config = default_mining_config();
-        let mut det = LateralShiftDetector::new(config);
-        let lane_w = 248.0; // From production bug: narrow lane
-
-        // Warmup: establish baseline
-        for i in 0..30 {
-            let m = make_measurement(0.0, lane_w, -1.0);
-            det.update(Some(m), None, i as f64 * 33.3, i);
-        }
-        assert_eq!(det.state, State::Stable);
-
-        // Phase 1: Activate curve mode with sustained high coherence
-        for i in 0..8 {
-            let m = make_measurement(0.0, lane_w, 0.85);
-            let frame = 30 + i as u64;
-            det.update(Some(m), None, frame as f64 * 33.3, frame);
-        }
-        assert!(det.in_curve_mode, "Curve mode should be active");
-
-        // Phase 2: Sharp curve drives offset to 160%+ (beyond raised threshold)
-        // with zero ego motion — pure perspective distortion.
-        // Mining effective threshold = 35% × 2.0 = 70%.
-        // We ramp through 70% (shift starts) up to 160%+.
-        let ramp_frames = 30; // 1.0s
-        for i in 0..ramp_frames {
-            let t = i as f32 / ramp_frames as f32;
-            let offset_px = t * 1.63 * lane_w; // ramp to ~163%
-            let m = make_measurement(offset_px, lane_w, 0.80);
-            // Very small ego motion (matching production: -0.30 px/frame)
-            let ego = EgoMotionInput {
-                lateral_velocity: -0.30,
-                confidence: 0.5,
-            };
-            let frame = 38 + i as u64;
-            let result = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
-            // Shift should NOT be emitted yet (still ramping or still active)
-            // But it might start the shift state
-            assert!(
-                result.is_none(),
-                "Frame {}: unexpected shift emission during ramp",
-                frame
-            );
-        }
-
-        // Phase 3: Offset returns toward baseline — shift should try to complete.
-        // The ego cross-validation should VETO it since ego_cumulative_peak is tiny.
-        let return_frames = 25;
-        let mut any_shift_emitted = false;
-        for i in 0..return_frames {
-            let t = i as f32 / return_frames as f32;
-            let offset_px = (1.0 - t) * 1.63 * lane_w; // returning to 0
-            let m = make_measurement(offset_px, lane_w, 0.70);
-            let ego = EgoMotionInput {
-                lateral_velocity: -0.10,
-                confidence: 0.4,
-            };
-            let frame = 68 + i as u64;
-            if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
-                any_shift_emitted = true;
-            }
-        }
-
-        assert!(
-            !any_shift_emitted,
-            "Curve perspective distortion with no ego motion should be VETOED, not emitted"
-        );
-    }
+    strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
 
