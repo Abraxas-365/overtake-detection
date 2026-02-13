@@ -3,7 +3,7 @@
 // Analysis modules for maneuver detection pipeline.
 //
 // v4.13: Added curvature_estimator for polynomial curve detection from YOLO-seg masks.
-
+pub mod curvature_estimator;
 pub mod curvature_estimator;
 pub mod ego_motion;
 pub mod lateral_detector;
