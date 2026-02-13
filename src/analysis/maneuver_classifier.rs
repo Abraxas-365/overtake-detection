@@ -1017,5 +1017,18 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
     );
 
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
-}
-
+} 
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    

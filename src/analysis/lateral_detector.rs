@@ -299,6 +299,12 @@ pub struct LateralShiftDetector {
     ego_bridge_frames: u32, // consecutive frames of ego-only bridging
     ego_estimated_offset: f32, // interpolated normalized offset during bridge
     ego_last_velocity: f32, // for logging
+    // v4.13b: Ego confidence accumulation during active shift.
+    // Tracks how many frames had confident ego readings (conf > 0.3).
+    // If too few frames had confident readings, the ego "no motion"
+    // conclusion is unreliable (estimator failure, not vehicle stillness)
+    // and should not be used to veto lane changes.
+    ego_shift_confident_frames: u32,
 
     // History for smoothing
     offset_history: VecDeque<f32>,
@@ -346,6 +352,7 @@ impl LateralShiftDetector {
             ego_bridge_frames: 0,
             ego_estimated_offset: 0.0,
             ego_last_velocity: 0.0,
+            ego_shift_confident_frames: 0,
             offset_history: VecDeque::with_capacity(30),
             cached_measurement: None,
             cached_measurement_age: 0,
@@ -821,6 +828,10 @@ impl LateralShiftDetector {
                     let ego_norm_delta = ego.lateral_velocity / self.last_lane_width_px;
                     self.ego_estimated_offset += ego_norm_delta;
                     self.ego_cumulative_px += ego.lateral_velocity;
+                    // v4.13b: Track ego confidence during bridge frames.
+                    if ego.confidence > 0.3 {
+                        self.ego_shift_confident_frames += 1;
+                    }
 
                     let abs_est = self.ego_estimated_offset.abs();
                     if abs_est > self.shift_peak_offset {
@@ -947,7 +958,10 @@ impl LateralShiftDetector {
         self.shift_confidence_sum += lane_confidence;
         self.ego_cumulative_px += ego.lateral_velocity;
 
-        // v4.10: Track peak cumulative for direction validation at emit time
+        // v4.13b: Track ego confidence during shift for veto reliability.
+        if ego.confidence > 0.3 {
+            self.ego_shift_confident_frames += 1;
+        }
         if self.ego_cumulative_px.abs() > self.ego_cumulative_peak_px.abs() {
             self.ego_cumulative_peak_px = self.ego_cumulative_px;
         }
@@ -1107,6 +1121,8 @@ impl LateralShiftDetector {
             1
         };
         self.ego_cumulative_px = 0.0;
+        self.ego_cumulative_peak_px = 0.0;
+        self.ego_shift_confident_frames = 0;
         self.ego_bridge_frames = 0;
         self.ego_estimated_offset = 0.0;
         // v4.13b: Latch curve mode at shift start. Will also be latched
@@ -1213,6 +1229,11 @@ impl LateralShiftDetector {
         // ══════════════════════════════════════════════════════════
         const CURVE_EGO_MIN_FLOOR_PX: f32 = 10.0;
         const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 15.0;
+        // v4.13b: Minimum ratio of confident ego frames to trust the veto.
+        // If the ego flow estimator had poor confidence during most of the shift
+        // (low-texture terrain like desert), "ego says zero" is unreliable —
+        // it means the estimator failed, not that the vehicle didn't move.
+        const CURVE_EGO_MIN_CONFIDENCE_RATIO: f32 = 0.30;
 
         let duration_s = (duration_ms / 1000.0) as f32;
         let curve_ego_threshold =
@@ -1220,14 +1241,22 @@ impl LateralShiftDetector {
 
         let curve_tainted = self.in_curve_mode || self.shift_saw_curve_mode;
 
+        let ego_confidence_ratio = if self.shift_frames > 0 {
+            self.ego_shift_confident_frames as f32 / self.shift_frames as f32
+        } else {
+            0.0
+        };
+        let ego_trustworthy = ego_confidence_ratio >= CURVE_EGO_MIN_CONFIDENCE_RATIO;
+
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
+            && ego_trustworthy
             && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
                  peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}) | \
-                 dur={:.1}s | curve_now={} curve_saw={} → perspective distortion, not lane change",
+                 dur={:.1}s | curve_now={} curve_saw={} | ego_conf={}/{} ({:.0}%) → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),
@@ -1241,10 +1270,40 @@ impl LateralShiftDetector {
                 duration_ms / 1000.0,
                 self.in_curve_mode,
                 self.shift_saw_curve_mode,
+                self.ego_shift_confident_frames,
+                self.shift_frames,
+                ego_confidence_ratio * 100.0,
             );
             self.state = State::Stable;
             self.reset_shift();
             return None;
+        }
+
+        // v4.13b: Log when veto WOULD have fired but ego was untrustworthy.
+        // This helps diagnose whether bypassed vetoes were correct (real lane
+        // changes with bad ego) or false negatives (curve artifacts that slipped).
+        if curve_tainted
+            && self.shift_source == ShiftSource::LaneBased
+            && !ego_trustworthy
+            && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
+        {
+            warn!(
+                "⚠️ Curve veto BYPASSED (ego untrustworthy): shift {} | \
+                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
+                 ego_conf={}/{} ({:.0}%) < {:.0}% min → allowing despite curve, \
+                 ego estimator had insufficient confidence",
+                self.shift_direction
+                    .unwrap_or(ShiftDirection::Left)
+                    .as_str(),
+                self.shift_peak_offset * 100.0,
+                self.ego_cumulative_px,
+                self.ego_cumulative_peak_px,
+                curve_ego_threshold,
+                self.ego_shift_confident_frames,
+                self.shift_frames,
+                ego_confidence_ratio * 100.0,
+                CURVE_EGO_MIN_CONFIDENCE_RATIO * 100.0,
+            );
         }
 
         // ── FINAL DIRECTION VALIDATION (v4.4, v4.10b) ────────────
@@ -1304,7 +1363,7 @@ impl LateralShiftDetector {
 
         info!(
             "✅ Lateral shift completed: {} | peak={:.1}% | dur={:.1}s | conf={:.2} | \
-             source={:?} | ego_cum={:.1}px (peak={:.1}px) | lane_frames={}/{} | curve_mode={}",
+             source={:?} | ego_cum={:.1}px (peak={:.1}px) | lane_frames={}/{} | curve_mode={} | ego_conf={}/{} ({:.0}%)",
             evt.direction.as_str(),
             evt.peak_offset * 100.0,
             evt.duration_ms / 1000.0,
@@ -1315,6 +1374,13 @@ impl LateralShiftDetector {
             self.shift_lane_frames,
             self.shift_frames,
             self.in_curve_mode,
+            self.ego_shift_confident_frames,
+            self.shift_frames,
+            if self.shift_frames > 0 {
+                self.ego_shift_confident_frames as f32 / self.shift_frames as f32 * 100.0
+            } else {
+                0.0
+            },
         );
 
         self.state = State::Stable;
@@ -1575,6 +1641,7 @@ impl LateralShiftDetector {
         self.ego_estimated_offset = 0.0;
         self.ego_preempt_originated = false;
         self.shift_saw_curve_mode = false;
+        self.ego_shift_confident_frames = 0;
     }
 
     fn is_deviation_stable(&self) -> bool {
@@ -1933,7 +2000,7 @@ mod tests {
             let m = make_measurement(offset_px, lane_w, 0.85);
             let ego = EgoMotionInput {
                 lateral_velocity: -0.10,
-                confidence: 0.3,
+                confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
             let frame = 60 + i as u64;
             det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
@@ -1950,7 +2017,7 @@ mod tests {
             let m = make_measurement(offset_px, lane_w, 0.1); // curve mode off
             let ego = EgoMotionInput {
                 lateral_velocity: 0.05,
-                confidence: 0.3,
+                confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
             let frame = 65 + i as u64;
             if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
