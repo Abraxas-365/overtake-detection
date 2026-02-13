@@ -234,6 +234,11 @@ pub struct ManeuverClassifier {
     recent_events: Vec<ManeuverEvent>,
     total_maneuvers: u64,
     latest_markings: MarkingSnapshot,
+    // v4.13b: Curve mode awareness for zone-oscillation suppression.
+    // On curves, BESIDE→AHEAD zone flips are unreliable (perspective distortion).
+    // VehicleOvertookEgo events require additional validation when active.
+    curve_mode_active: bool,
+    frames_since_curve_mode: u32,
 }
 
 impl ManeuverClassifier {
@@ -247,6 +252,8 @@ impl ManeuverClassifier {
             recent_events: Vec::new(),
             total_maneuvers: 0,
             latest_markings: MarkingSnapshot::default(),
+            curve_mode_active: false,
+            frames_since_curve_mode: u32::MAX,
         }
     }
 
@@ -275,6 +282,26 @@ impl ManeuverClassifier {
 
     pub fn update_markings(&mut self, snapshot: MarkingSnapshot) {
         self.latest_markings = snapshot;
+    }
+
+    /// v4.13b: Update curve mode state from the lateral detector.
+    /// Called by the pipeline each frame BEFORE classify().
+    /// Uses a cooldown to handle curve mode chattering — if curve was
+    /// active anytime in the last ~1.5s, zone-based events are suspect.
+    pub fn set_curve_mode(&mut self, active: bool) {
+        self.curve_mode_active = active;
+        if active {
+            self.frames_since_curve_mode = 0;
+        } else {
+            self.frames_since_curve_mode = self.frames_since_curve_mode.saturating_add(1);
+        }
+    }
+
+    /// v4.13b: Whether curve conditions make zone-based VehicleOvertookEgo unreliable.
+    /// True when in curve mode OR within cooldown after it (curve mode chatters).
+    fn curve_suppresses_zone_events(&self) -> bool {
+        // 45 frames ≈ 1.5s at 30fps — generous cooldown for curve chatter
+        self.curve_mode_active || self.frames_since_curve_mode <= 45
     }
 
     pub fn classify(
@@ -561,6 +588,45 @@ impl ManeuverClassifier {
                     );
                     self.pass_buffer[pass_idx].correlated = true;
                     continue;
+                }
+
+                // v4.13b: Curve-induced zone oscillation gate.
+                //
+                // On curves, perspective distortion shifts bbox positions,
+                // causing BESIDE→AHEAD zone flips that aren't real overtakes.
+                // The truck goes BESIDE→AHEAD→BESIDE (zone oscillation).
+                //
+                // Single-source VehicleOvertookEgo (no lateral shift corroboration)
+                // is unreliable during curve mode because it relies entirely on
+                // zone position, which is the signal most distorted by curves.
+                //
+                // Gate: when curve conditions are active or recent, require that
+                // VehicleOvertookEgo has corroboration from a lateral shift in the
+                // shift_buffer (i.e., the ego was actually pushed aside). If no
+                // corroborating shift exists, suppress as zone oscillation artifact.
+                if self.curve_suppresses_zone_events() {
+                    let has_corroborating_shift = self.shift_buffer.iter().any(|s| {
+                        !s.correlated
+                            && temporal_gap(
+                                self.pass_buffer[pass_idx].event.beside_start_ms,
+                                self.pass_buffer[pass_idx].event.beside_end_ms,
+                                s.event.start_ms,
+                                s.event.end_ms,
+                            ) < self.config.correlation_window_ms
+                    });
+
+                    if !has_corroborating_shift {
+                        warn!(
+                            "  ❌ REJECTED VehicleOvertookEgo (track {}): curve-induced \
+                             zone oscillation (BESIDE→AHEAD flip on curve, no lateral \
+                             shift corroboration) | curve_active={} frames_since={}",
+                            self.pass_buffer[pass_idx].event.vehicle_track_id,
+                            self.curve_mode_active,
+                            self.frames_since_curve_mode,
+                        );
+                        self.pass_buffer[pass_idx].correlated = true;
+                        continue;
+                    }
                 }
 
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
@@ -925,6 +991,8 @@ impl ManeuverClassifier {
         self.recent_events.clear();
         self.total_maneuvers = 0;
         self.latest_markings = MarkingSnapshot::default();
+        self.curve_mode_active = false;
+        self.frames_since_curve_mode = u32::MAX;
     }
 }
 
