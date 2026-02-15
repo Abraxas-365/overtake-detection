@@ -342,6 +342,20 @@ impl LineCrossingDetector {
             }
         }
 
+        // v6.1c: Adaptive min_overlap for dashed vs solid markings.
+        // Dashed markings (class 9, 10) have short intermittent segments —
+        // ego zone overlaps 1-2 frames max. Use min_overlap=1 for dashed.
+        let adaptive_min_overlap = best_crossing
+            .as_ref()
+            .map(|(_, m, _)| {
+                if is_dashed_marking(m.class_id) {
+                    1u32
+                } else {
+                    self.config.min_overlap_frames
+                }
+            })
+            .unwrap_or(self.config.min_overlap_frames);
+
         // Update overlap state machines
         self.left_overlap_state = if left_overlap {
             match self.left_overlap_state {
@@ -351,7 +365,7 @@ impl LineCrossingDetector {
                 }
                 OverlapState::Overlapping => {
                     self.left_overlap_frames += 1;
-                    if self.left_overlap_frames >= self.config.min_overlap_frames {
+                    if self.left_overlap_frames >= adaptive_min_overlap {
                         OverlapState::Confirmed
                     } else {
                         OverlapState::Overlapping
@@ -375,7 +389,7 @@ impl LineCrossingDetector {
                 }
                 OverlapState::Overlapping => {
                     self.right_overlap_frames += 1;
-                    if self.right_overlap_frames >= self.config.min_overlap_frames {
+                    if self.right_overlap_frames >= adaptive_min_overlap {
                         OverlapState::Confirmed
                     } else {
                         OverlapState::Overlapping
@@ -399,7 +413,7 @@ impl LineCrossingDetector {
                 }
                 OverlapState::Overlapping => {
                     self.center_overlap_frames += 1;
-                    if self.center_overlap_frames >= self.config.min_overlap_frames {
+                    if self.center_overlap_frames >= adaptive_min_overlap {
                         OverlapState::Confirmed
                     } else {
                         OverlapState::Overlapping
@@ -446,18 +460,25 @@ impl LineCrossingDetector {
                 return None;
             }
 
+            // v6.1c: Adaptive overlap threshold — dashed markings confirm on first frame
+            let effective_min_overlap = if is_dashed_marking(marking.class_id) {
+                1u32
+            } else {
+                self.config.min_overlap_frames
+            };
+
             let is_newly_confirmed = match role {
                 LineRole::LeftBoundary => {
                     self.left_overlap_state == OverlapState::Confirmed
-                        && self.left_overlap_frames == self.config.min_overlap_frames
+                        && self.left_overlap_frames == effective_min_overlap
                 }
                 LineRole::RightBoundary => {
                     self.right_overlap_state == OverlapState::Confirmed
-                        && self.right_overlap_frames == self.config.min_overlap_frames
+                        && self.right_overlap_frames == effective_min_overlap
                 }
                 LineRole::CenterLine => {
                     self.center_overlap_state == OverlapState::Confirmed
-                        && self.center_overlap_frames == self.config.min_overlap_frames
+                        && self.center_overlap_frames == effective_min_overlap
                 }
                 _ => false,
             };
@@ -932,6 +953,12 @@ fn is_lane_line_class(class_id: usize) -> bool {
     matches!(class_id, 4 | 5 | 6 | 7 | 8 | 9 | 10 | 99)
 }
 
+/// v6.1c: Dashed markings have short, intermittent segments.
+/// Crossing detection needs lower overlap thresholds for these.
+fn is_dashed_marking(class_id: usize) -> bool {
+    matches!(class_id, 9 | 10) // 9=dashed_single_white, 10=dashed_single_yellow
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -1137,6 +1164,71 @@ mod tests {
             );
             assert!(r.is_none());
         }
+    }
+
+    #[test]
+    fn test_dashed_line_confirms_on_single_frame() {
+        // v6.1c: Dashed markings should confirm with just 1 frame of overlap
+        // because dashed segments are short and intermittent
+        let config = CrossingDetectorConfig {
+            ego_half_width_px: 40.0,
+            reference_y_ratio: 0.82,
+            min_overlap_frames: 3, // solid lines need 3, but dashed should use 1
+            cooldown_frames: 10,
+            min_marking_confidence: 0.20,
+            min_penetration_ratio: 0.0,
+            clear_frames_required: 0,
+        };
+        let mut detector = LineCrossingDetector::new(1280.0, 720.0, config);
+
+        // Dashed yellow line at ego center (class_id=10 = dashed_single_yellow)
+        let marking = make_marking(10, "dashed_single_yellow", 640.0, 620.0, 660.0);
+
+        // Frame 1: Should confirm immediately (dashed → min_overlap=1)
+        let r1 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 1, 33.0);
+        assert!(
+            r1.is_some(),
+            "Dashed marking should confirm on first overlap frame"
+        );
+        let event = r1.unwrap();
+        assert_eq!(event.passing_legality, PassingLegality::Allowed);
+        assert_eq!(event.marking_class_id, 10);
+    }
+
+    #[test]
+    fn test_solid_line_requires_multi_frame() {
+        // Solid lines should still require min_overlap_frames=3
+        let config = CrossingDetectorConfig {
+            ego_half_width_px: 40.0,
+            reference_y_ratio: 0.82,
+            min_overlap_frames: 3,
+            cooldown_frames: 10,
+            min_marking_confidence: 0.20,
+            min_penetration_ratio: 0.0,
+            clear_frames_required: 0,
+        };
+        let mut detector = LineCrossingDetector::new(1280.0, 720.0, config);
+
+        // Solid yellow line at ego center (class_id=5 = solid_single_yellow)
+        let marking = make_marking(5, "solid_single_yellow", 640.0, 620.0, 660.0);
+
+        // Frame 1: Not confirmed yet (solid needs 3 frames)
+        let r1 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 1, 33.0);
+        assert!(
+            r1.is_none(),
+            "Solid marking should NOT confirm on first frame"
+        );
+
+        // Frame 2: Still not confirmed
+        let r2 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 2, 66.0);
+        assert!(
+            r2.is_none(),
+            "Solid marking should NOT confirm on second frame"
+        );
+
+        // Frame 3: NOW confirmed
+        let r3 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 3, 99.0);
+        assert!(r3.is_some(), "Solid marking should confirm on third frame");
     }
 
     #[test]
