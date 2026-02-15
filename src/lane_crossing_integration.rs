@@ -183,16 +183,23 @@ pub fn update_lane_cache(
 /// Returns a crossing event if the ego vehicle is confirmed to be driving over a line.
 ///
 /// v6.1: Events are pushed to the pending buffer, NOT counted as confirmed yet.
+/// v6.1d: Added fallback_markings param — uses legality model markings when cache expired.
 pub fn run_crossing_detection(
     state: &mut LaneCrossingState,
     ego_left_x: Option<f32>,
     ego_right_x: Option<f32>,
     frame_id: u64,
     timestamp_ms: f64,
+    fallback_markings: &[MarkingInfo],
 ) -> Option<LineCrossingEvent> {
-    // Get markings from the cache (these might be cached markings from a recent frame)
+    // v6.1d: Get markings from cache first; fall back to legality model markings
+    // when cache is expired/empty. This prevents the crossing detector from being
+    // starved when YOLO fails to detect lane boundaries but the legality model
+    // still detects road markings (common at night with intermittent YOLO).
     let markings = if let Some(boundaries) = state.detection_cache.get_boundaries() {
         boundaries.markings
+    } else if !fallback_markings.is_empty() {
+        fallback_markings.to_vec()
     } else {
         Vec::new()
     };

@@ -636,6 +636,7 @@ fn run_maneuver_pipeline_v2(
         ego_right,
         frame_count,
         timestamp_ms,
+        &ps.latest_marking_infos,
     );
 
     if let Some(ref event) = crossing_event {

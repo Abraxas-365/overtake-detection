@@ -1177,26 +1177,35 @@ fn render_right_event_panel(
         )?;
         right_panel_y += line_height;
 
-        // v6.1: Legality badge — only show confirmed legality from actual crossing.
-        // When crossed_line_class is None, no line was physically crossed,
-        // so the buffer-derived legality is speculative (nearby markings != crossed).
-        let (leg_text, leg_color) = if maneuver.crossed_line_class.is_some() {
-            // Confirmed crossing — render actual legality from the crossed line
-            if maneuver.legality.contains("CriticalIllegal") {
+        // v6.1b: Tiered legality badge
+        //   Tier 1: crossed_line_class is Some → confirmed crossing, full-color badge
+        //   Tier 2: crossed_line_class is None but buffer has legality → dimmed "inferred" badge
+        //   Tier 3: no data at all → grey N/A
+        let has_confirmed_crossing = maneuver.crossed_line_class.is_some();
+
+        let (leg_text, leg_color) = if maneuver.legality.contains("CriticalIllegal") {
+            if has_confirmed_crossing {
                 ("CRITICAL ILLEGAL", core::Scalar::new(0.0, 0.0, 255.0, 0.0))
-            } else if maneuver.legality.contains("Illegal") {
+            } else {
+                ("~CRIT.ILLEGAL", core::Scalar::new(0.0, 0.0, 160.0, 0.0))
+            }
+        } else if maneuver.legality.contains("Illegal") {
+            if has_confirmed_crossing {
                 ("ILLEGAL", core::Scalar::new(0.0, 100.0, 255.0, 0.0))
-            } else if maneuver.legality.contains("Legal") {
+            } else {
+                ("~ILLEGAL", core::Scalar::new(0.0, 70.0, 160.0, 0.0))
+            }
+        } else if maneuver.legality.contains("Legal") {
+            if has_confirmed_crossing {
                 ("LEGAL", core::Scalar::new(0.0, 255.0, 0.0, 0.0))
             } else {
-                ("LEGAL (unmarked)", core::Scalar::new(0.0, 200.0, 0.0, 0.0))
+                ("~LEGAL", core::Scalar::new(0.0, 160.0, 0.0, 0.0))
             }
         } else {
-            // No confirmed crossing — grey neutral label
-            ("NO CROSSING", core::Scalar::new(180.0, 180.0, 180.0, 0.0))
+            ("N/A", core::Scalar::new(140.0, 140.0, 140.0, 0.0))
         };
 
-        // Show crossed line class if confirmed, otherwise just conf + duration
+        // Show crossed line class if confirmed, otherwise note it's inferred
         let leg_detail = if let Some(ref cls) = maneuver.crossed_line_class {
             format!(
                 "  {} [{}] | conf={:.0}% | {:.1}s",
