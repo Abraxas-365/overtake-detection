@@ -1,10 +1,12 @@
 // src/main.rs
 //
-// Production overtake detection pipeline v4.2 — Maneuver Detection v2
-// v4.11: Wires boundary_coherence into LaneMeasurement for curve-aware detection
-// v4.13: Wires polynomial curvature from YOLO-seg masks for direct geometric curve detection
+// Production overtake detection pipeline v6.0
 //
-// Minimal implementation focused on the new signal-fusion architecture
+// v4.11: boundary_coherence → LaneMeasurement for curve-aware detection
+// v4.13: polynomial curvature from YOLO-seg masks
+// v5.2:  DetectionCache + LineCrossingDetector (wired below)
+// v6.0:  RoadClassifier + CrossingFlash + zone-based visualization
+//        All previously dead-code modules are now active in the pipeline.
 
 mod analysis;
 mod color_analysis;
@@ -28,13 +30,17 @@ use analysis::maneuver_pipeline::{
 use analysis::vehicle_tracker::DetectionInput;
 
 use anyhow::{Context, Result};
+use lane_crossing::CacheState;
+use lane_crossing_integration::LaneCrossingState;
 use lane_legality::{FusedLegalityResult, LaneLegalityDetector, LegalityResult};
 use pipeline::legality_buffer::LegalityRingBuffer;
+use road_classification::{MixedLineSide, PassingLegality, RoadClassification, RoadClassifier};
+use road_overlay::CrossingFlashState;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use types::{DetectedLane, Frame, VehicleState};
 use vehicle_detection::YoloDetector;
 
@@ -66,10 +72,19 @@ struct PipelineState {
     maneuver_pipeline_v2: ManeuverPipeline,
     legality_buffer: LegalityRingBuffer,
 
+    // ── v5.2/v6.0: New subsystems ──
+    lane_crossing_state: LaneCrossingState,
+    road_classifier: RoadClassifier,
+    crossing_flash: Option<CrossingFlashState>,
+    last_road_classification: RoadClassification,
+
     // ── Transient state ──
     latest_vehicle_detections: Vec<vehicle_detection::Detection>,
     last_vehicle_state: Option<VehicleState>,
     last_maneuver: Option<LastManeuverInfo>,
+    /// Cached MarkingInfo vec from the most recent legality buffer entry.
+    /// Updated every time buffer_legality_result runs (every 3rd frame).
+    latest_marking_infos: Vec<road_classification::MarkingInfo>,
 
     // ── Counters ──
     frame_count: u64,
@@ -79,6 +94,8 @@ struct PipelineState {
     v2_lane_changes: u64,
     v2_being_overtaken: u64,
     v2_vehicles_overtaken: u64,
+    crossing_events_total: u64,
+    crossing_events_illegal: u64,
 }
 
 impl PipelineState {
@@ -114,8 +131,10 @@ impl PipelineState {
         );
 
         info!(
-            "✓ Maneuver Detection v2 initialized for video: {}",
-            video_path.display()
+            "✓ Pipeline v6.0 initialized for video: {} ({}×{})",
+            video_path.display(),
+            frame_width,
+            frame_height,
         );
 
         Ok(Self {
@@ -123,9 +142,18 @@ impl PipelineState {
             legality_detector,
             maneuver_pipeline_v2,
             legality_buffer: LegalityRingBuffer::with_capacity(300),
+
+            // v5.2/v6.0: New subsystems
+            lane_crossing_state: LaneCrossingState::new(frame_width, frame_height),
+            road_classifier: RoadClassifier::new(frame_width),
+            crossing_flash: None,
+            last_road_classification: RoadClassification::default(),
+
             latest_vehicle_detections: Vec::new(),
             last_vehicle_state: None,
             last_maneuver: None,
+            latest_marking_infos: Vec::new(),
+
             frame_count: 0,
             yolo_primary_count: 0,
             v2_maneuver_events: 0,
@@ -133,6 +161,8 @@ impl PipelineState {
             v2_lane_changes: 0,
             v2_being_overtaken: 0,
             v2_vehicles_overtaken: 0,
+            crossing_events_total: 0,
+            crossing_events_illegal: 0,
         })
     }
 }
@@ -149,6 +179,9 @@ struct ProcessingStats {
     v2_lane_changes: u64,
     v2_being_overtaken: u64,
     v2_vehicles_overtaken: u64,
+    crossing_events_total: u64,
+    crossing_events_illegal: u64,
+    cache_recoveries: u64,
     duration_secs: f64,
     avg_fps: f64,
 }
@@ -164,6 +197,9 @@ impl ProcessingStats {
             v2_lane_changes: ps.v2_lane_changes,
             v2_being_overtaken: ps.v2_being_overtaken,
             v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
+            crossing_events_total: ps.crossing_events_total,
+            crossing_events_illegal: ps.crossing_events_illegal,
+            cache_recoveries: ps.lane_crossing_state.detection_cache.cache_recoveries,
             duration_secs: duration.as_secs_f64(),
             avg_fps,
         }
@@ -185,93 +221,55 @@ async fn main() -> Result<()> {
         .with_thread_ids(true)
         .init();
 
-    info!("🚗 Maneuver Detection System v2 Starting");
+    info!("🚗 Maneuver Detection System v6.0 Starting");
 
     let config = types::Config::load("config.yaml").context("Failed to load config.yaml")?;
     validate_config(&config)?;
-    info!("✓ Configuration loaded and validated");
+    info!("✓ Config loaded: {}", serde_json::to_string(&config)?);
 
-    // ── Graceful shutdown ──
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => info!("Received SIGINT, shutting down gracefully..."),
-                _ = sigterm.recv() => info!("Received SIGTERM, shutting down gracefully..."),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = ctrl_c.await;
-            info!("Received SIGINT, shutting down gracefully...");
-        }
+    let _shutdown_handle = tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+        info!("\n🛑 Shutdown requested");
         let _ = shutdown_tx.send(true);
     });
 
     let video_processor = video_processor::VideoProcessor::new(config.clone());
     let video_files = video_processor.find_video_files()?;
 
-    if video_files.is_empty() {
-        error!("No video files found in {}", config.video.input_dir);
-        return Ok(());
-    }
-    info!("Found {} video file(s) to process", video_files.len());
-
-    // ── Process each video ──
-    for (idx, video_path) in video_files.iter().enumerate() {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-
-        info!("\n========================================");
-        info!(
-            "Processing video {}/{}: {}",
-            idx + 1,
-            video_files.len(),
-            video_path.display()
-        );
-        info!("========================================\n");
-
-        match process_video(video_path, &video_processor, &config, shutdown_rx.clone()).await {
-            Ok(stats) => print_final_stats(&stats),
-            Err(e) => error!("Failed to process video {}: {:#}", video_path.display(), e),
-        }
+    for video_path in &video_files {
+        let stats = process_video(&config, video_path, &shutdown_rx)?;
+        print_final_stats(&stats);
     }
 
-    info!("🏁 All videos processed. Exiting.");
+    info!("✓ All videos processed");
     Ok(())
 }
 
 fn validate_config(config: &types::Config) -> Result<()> {
-    if config.lane_legality.enabled && !Path::new(&config.lane_legality.model_path).exists() {
-        anyhow::bail!(
-            "Lane legality model not found: {}.",
-            config.lane_legality.model_path
-        );
+    if config.video.input_dir.is_empty() {
+        anyhow::bail!("video.input_dir is empty");
     }
     Ok(())
 }
 
 // ============================================================================
-// VIDEO PROCESSING
+// VIDEO PROCESSING LOOP
 // ============================================================================
 
-async fn process_video(
-    video_path: &Path,
-    video_processor: &video_processor::VideoProcessor,
+fn process_video(
     config: &types::Config,
-    shutdown_rx: watch::Receiver<bool>,
+    video_path: &Path,
+    shutdown_rx: &watch::Receiver<bool>,
 ) -> Result<ProcessingStats> {
     let start_time = Instant::now();
 
+    let video_processor = video_processor::VideoProcessor::new(config.clone());
     let mut reader = video_processor
         .open_video(video_path)
-        .with_context(|| format!("Failed to open video: {}", video_path.display()))?;
+        .context(format!("Failed to open video: {}", video_path.display()))?;
 
     let mut writer =
         video_processor.create_writer(video_path, reader.width, reader.height, reader.fps)?;
@@ -311,11 +309,11 @@ async fn process_video(
         // ── STAGE 1: Vehicle Detection ──
         run_vehicle_detection(&mut ps, &arc_frame)?;
 
-        // ── STAGE 2: Lane Detection ──
+        // ── STAGE 2: Lane Detection + Cache + Road Classification ──
         let (detected_lanes, lane_measurement) =
             run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms)?;
 
-        // ── STAGE 3: Maneuver Detection v2 ──
+        // ── STAGE 3: Maneuver Detection v2 + Crossing Detection ──
         let v2_output =
             run_maneuver_pipeline_v2(&mut ps, &arc_frame, lane_measurement, timestamp_ms);
 
@@ -324,7 +322,7 @@ async fn process_video(
             save_maneuver_event(event, &mut results_file)?;
         }
 
-        // ── STAGE 5: Video annotation ──
+        // ── STAGE 5: Video annotation (v6.0 — full AnnotationInput) ──
         if let Some(ref mut w) = writer {
             let tracked_vehicles = ps.maneuver_pipeline_v2.tracked_vehicles();
 
@@ -361,7 +359,7 @@ fn run_vehicle_detection(ps: &mut PipelineState, frame: &Arc<Frame>) -> Result<(
 }
 
 // ============================================================================
-// STAGE 2 — Lane Detection
+// STAGE 2 — Lane Detection + Cache + Road Classification
 // ============================================================================
 
 fn run_lane_detection(
@@ -375,71 +373,134 @@ fn run_lane_detection(
     let mut lane_measurement: Option<LaneMeasurement> = None;
     let center_x = frame.width as f32 / 2.0;
 
-    if let Some(ref mut detector) = ps.legality_detector {
-        if let Ok(Some((left_x, right_x, conf))) = detector.estimate_ego_lane_boundaries_stable(
+    // ── 2a: Run YOLO-seg boundary estimation ──
+    let yolo_result: Option<(f32, f32, f32)> = if let Some(ref mut detector) = ps.legality_detector
+    {
+        match detector.estimate_ego_lane_boundaries_stable(
             &frame.data,
             frame.width,
             frame.height,
             center_x,
         ) {
-            ps.yolo_primary_count += 1;
+            Ok(Some((left_x, right_x, conf))) => {
+                ps.yolo_primary_count += 1;
+                Some((left_x, right_x, conf))
+            }
+            Ok(None) => None,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
 
-            let y_bottom = frame.height as f32;
-            let y_top = frame.height as f32 * 0.45;
-            let y_mid = (y_bottom + y_top) / 2.0;
+    // ── 2b: Get ego lateral velocity for cache ego-compensation ──
+    let ego_lat_vel = ps.maneuver_pipeline_v2.last_ego_velocity().unwrap_or(0.0);
 
-            let left_dl = DetectedLane {
-                points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
-                confidence: conf,
-            };
-            let right_dl = DetectedLane {
-                points: vec![(right_x, y_bottom), (right_x, y_mid), (right_x, y_top)],
-                confidence: conf,
-            };
+    // ── 2c: Feed detection cache (fresh or miss) ──
+    // This is the key v5.2 integration: when YOLO misses, the cache
+    // provides ego-compensated boundaries from the last good detection.
+    let cache_result = lane_crossing_integration::update_lane_cache(
+        &mut ps.lane_crossing_state,
+        yolo_result,
+        &ps.latest_marking_infos, // from last legality buffer entry
+        ego_lat_vel,
+        frame_count,
+        timestamp_ms,
+    );
 
-            detected_lanes = vec![left_dl, right_dl];
+    // ── 2d: Use cache-aware boundaries (may be cached when YOLO missed) ──
+    let effective_boundaries: Option<(f32, f32, f32)> = cache_result.map(|(l, r, c, _)| (l, r, c));
+    let cache_state = cache_result
+        .map(|(_, _, _, s)| s)
+        .unwrap_or(CacheState::Empty);
 
-            // Calculate lane measurement
-            let lane_width_px = (right_x - left_x).abs();
-            let lateral_offset_px = center_x - (left_x + lane_width_px / 2.0);
+    if let Some((left_x, right_x, conf)) = effective_boundaries {
+        let y_bottom = frame.height as f32;
+        let y_top = frame.height as f32 * 0.45;
+        let y_mid = (y_bottom + y_top) / 2.0;
 
-            // v4.11: Wire boundary coherence from legality detector into LaneMeasurement.
-            // v4.13: Wire polynomial curvature from YOLO-seg mask geometry.
-            lane_measurement = Some(LaneMeasurement {
-                lateral_offset_px,
-                lane_width_px,
-                confidence: conf,
-                both_lanes: true,
-                boundary_coherence: detector.boundary_coherence(), // v4.11: curve awareness
-                curvature: detector.curvature_estimate().cloned(), // v4.13: geometric curve detection
-            });
+        let left_dl = DetectedLane {
+            points: vec![(left_x, y_bottom), (left_x, y_mid), (left_x, y_top)],
+            confidence: conf,
+        };
+        let right_dl = DetectedLane {
+            points: vec![(right_x, y_bottom), (right_x, y_mid), (right_x, y_top)],
+            confidence: conf,
+        };
+        detected_lanes = vec![left_dl, right_dl];
 
-            // Update last vehicle state
-            ps.last_vehicle_state = Some(VehicleState {
-                lateral_offset: lateral_offset_px,
-                lane_width: Some(lane_width_px),
-                heading_offset: 0.0,
-                frame_id: frame_count,
+        let lane_width_px = (right_x - left_x).abs();
+        let lateral_offset_px = center_x - (left_x + lane_width_px / 2.0);
+
+        // v4.11/v4.13: boundary coherence + curvature (only from fresh YOLO)
+        let (boundary_coherence, curvature) = if let Some(ref detector) = ps.legality_detector {
+            (
+                detector.boundary_coherence(),
+                detector.curvature_estimate().cloned(),
+            )
+        } else {
+            (-1.0, None)
+        };
+
+        lane_measurement = Some(LaneMeasurement {
+            lateral_offset_px,
+            lane_width_px,
+            confidence: conf,
+            both_lanes: true,
+            boundary_coherence,
+            curvature,
+        });
+
+        ps.last_vehicle_state = Some(VehicleState {
+            lateral_offset: lateral_offset_px,
+            lane_width: Some(lane_width_px),
+            heading_offset: 0.0,
+            frame_id: frame_count,
+            timestamp_ms,
+            raw_offset: lateral_offset_px,
+            detection_confidence: conf,
+            both_lanes_detected: true,
+        });
+
+        // ── 2e: Buffer legality (every 3 frames, only when YOLO is fresh) ──
+        if yolo_result.is_some() && frame_count % 3 == 0 {
+            buffer_legality_result(
+                ps.legality_detector.as_mut().unwrap(),
+                &mut ps.legality_buffer,
+                frame,
+                config,
+                left_x,
+                right_x,
+                frame_count,
                 timestamp_ms,
-                raw_offset: lateral_offset_px,
-                detection_confidence: conf,
-                both_lanes_detected: true,
-            });
+                lateral_offset_px,
+                Some(lane_width_px),
+            );
 
-            // Buffer legality result every 3 frames
-            if frame_count % 3 == 0 {
-                buffer_legality_result(
-                    detector,
-                    &mut ps.legality_buffer,
-                    frame,
-                    config,
-                    left_x,
-                    right_x,
-                    frame_count,
-                    timestamp_ms,
-                    lateral_offset_px,
-                    Some(lane_width_px),
+            // ── 2f: Convert fresh markings → MarkingInfo for RoadClassifier ──
+            if let Some(latest_fused) = ps.legality_buffer.latest() {
+                let marking_infos = lane_legality_patches::detections_to_marking_infos(
+                    &latest_fused.all_markings,
+                    &frame.data,
+                    frame.width,
+                    frame.height,
                 );
+
+                // ── 2g: Update RoadClassifier ──
+                let road_class = ps.road_classifier.update(&marking_infos);
+                if road_class.confidence > 0.3 {
+                    debug!(
+                        "🛣️  Road: {} | Passing: {} | Mixed: {:?} | Lanes: {}",
+                        road_class.road_type.as_display_str(),
+                        road_class.passing_legality.as_str(),
+                        road_class.mixed_line_side,
+                        road_class.estimated_lanes,
+                    );
+                    ps.last_road_classification = *road_class;
+                }
+
+                // Cache marking infos for use in non-legality frames
+                ps.latest_marking_infos = marking_infos;
             }
         }
     }
@@ -485,7 +546,7 @@ fn buffer_legality_result(
 }
 
 // ============================================================================
-// STAGE 3 — Maneuver Detection v2
+// STAGE 3 — Maneuver Detection v2 + Crossing Detection
 // ============================================================================
 
 fn run_maneuver_pipeline_v2(
@@ -558,6 +619,68 @@ fn run_maneuver_pipeline_v2(
         frame_id: frame_count,
     });
 
+    // ── v5.2: Run line crossing detection ──
+    let ego_left = ps.last_vehicle_state.as_ref().and_then(|vs| {
+        vs.lane_width
+            .map(|w| frame_center_x - w / 2.0 + vs.lateral_offset)
+    });
+    let ego_right = ps.last_vehicle_state.as_ref().and_then(|vs| {
+        vs.lane_width
+            .map(|w| frame_center_x + w / 2.0 + vs.lateral_offset)
+    });
+
+    let crossing_event = lane_crossing_integration::run_crossing_detection(
+        &mut ps.lane_crossing_state,
+        ego_left,
+        ego_right,
+        frame_count,
+        timestamp_ms,
+    );
+
+    if let Some(ref event) = crossing_event {
+        ps.crossing_events_total += 1;
+        if matches!(
+            event.passing_legality,
+            PassingLegality::Prohibited | PassingLegality::MixedProhibited
+        ) {
+            ps.crossing_events_illegal += 1;
+        }
+
+        info!(
+            "🚧 LINE CROSSING: {} {} | legality={} | pen={:.2} | frame={}",
+            event.line_role.as_str(),
+            event.crossing_direction.as_str(),
+            event.passing_legality.as_str(),
+            event.penetration_ratio,
+            frame_count,
+        );
+
+        // v6.0: Trigger crossing flash animation
+        // Find the marking bbox that was crossed
+        if let Some(fused) = ps.legality_buffer.latest() {
+            let marking_bbox = fused
+                .all_markings
+                .iter()
+                .find(|m| m.class_name == event.marking_class)
+                .map(|m| m.bbox);
+
+            if let Some(bbox) = marking_bbox {
+                let was_illegal = matches!(
+                    event.passing_legality,
+                    PassingLegality::Prohibited | PassingLegality::MixedProhibited
+                );
+                ps.crossing_flash = Some(CrossingFlashState::new(*event.line_role, bbox));
+            }
+        }
+    }
+
+    // Expire old crossing flash
+    if let Some(ref flash) = ps.crossing_flash {
+        if !flash.is_active(frame_count) {
+            ps.crossing_flash = None;
+        }
+    }
+
     // ── Update counters and last maneuver ──
     for event in &v2_result.maneuver_events {
         ps.v2_maneuver_events += 1;
@@ -581,7 +704,6 @@ fn run_maneuver_pipeline_v2(
             }
         }
 
-        // Update last maneuver for persistent display
         ps.last_maneuver = Some(LastManeuverInfo {
             maneuver_type: event.maneuver_type.as_str().to_string(),
             side: event.side.as_str().to_string(),
@@ -624,7 +746,7 @@ fn save_maneuver_event(
 }
 
 // ============================================================================
-// STAGE 5 — Video Annotation
+// STAGE 5 — Video Annotation (v6.0: full AnnotationInput)
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
@@ -639,30 +761,51 @@ fn run_video_annotation(
     height: i32,
     timestamp_ms: f64,
 ) -> Result<()> {
-    let frame_count = ps.frame_count;
-
     let legality_owned: Option<LegalityResult> = ps.legality_buffer.latest_as_legality_result();
     let legality_ref = legality_owned.as_ref();
 
-    if let Ok(annotated) = video_processor::draw_lanes_v2(
-        &frame.data,
+    // v6.0: Derive mixed-line side info from road classification
+    let mixed_dashed_is_right = match ps.last_road_classification.mixed_line_side {
+        Some(MixedLineSide::DashedRight) => Some(true),
+        Some(MixedLineSide::SolidRight) => Some(false),
+        _ => None,
+    };
+
+    let cache_state = ps.lane_crossing_state.detection_cache.state();
+    let cache_stale_frames = ps.lane_crossing_state.detection_cache.stale_frames();
+
+    // Build full AnnotationInput with ALL v6.0 data
+    let input = video_processor::AnnotationInput {
+        frame_rgb: &frame.data,
         width,
         height,
-        detected_lanes,
-        ps.last_vehicle_state.as_ref(),
-        &v2_output.maneuver_events,
-        tracked_vehicles,
-        v2_output.ego_lateral_velocity,
-        &v2_output.lateral_state,
-        frame_count,
+        frame_id: ps.frame_count,
         timestamp_ms,
-        legality_ref,
-        &ps.latest_vehicle_detections,
-        ps.v2_overtakes,
-        ps.v2_lane_changes,
-        ps.v2_vehicles_overtaken,
-        ps.last_maneuver.as_ref(),
-    ) {
+
+        lanes: detected_lanes,
+        vehicle_state: ps.last_vehicle_state.as_ref(),
+        legality_result: legality_ref,
+
+        // v6.0: Real data, not defaults
+        passing_legality: ps.last_road_classification.passing_legality,
+        cache_state,
+        cache_stale_frames,
+        crossing_flash: ps.crossing_flash.as_ref(),
+        mixed_dashed_is_right,
+
+        maneuver_events: &v2_output.maneuver_events,
+        ego_lateral_velocity: v2_output.ego_lateral_velocity,
+        lateral_state: &v2_output.lateral_state,
+        total_overtakes: ps.v2_overtakes,
+        total_lane_changes: ps.v2_lane_changes,
+        total_vehicles_overtaken: ps.v2_vehicles_overtaken,
+        last_maneuver: ps.last_maneuver.as_ref(),
+
+        tracked_vehicles,
+        vehicle_detections: &ps.latest_vehicle_detections,
+    };
+
+    if let Ok(annotated) = video_processor::draw_annotated_frame(&input) {
         use opencv::videoio::VideoWriterTrait;
         writer.write(&annotated)?;
     }
@@ -682,30 +825,41 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.yolo_primary_count,
         stats.yolo_primary_count as f64 / stats.total_frames.max(1) as f64 * 100.0
     );
+    if stats.cache_recoveries > 0 {
+        info!(
+            "  Cache recoveries (trocha→detection): {}",
+            stats.cache_recoveries
+        );
+    }
 
-    info!("╔════════════════════════════════════════════════════════╗");
-    info!("║       MANEUVER DETECTION v2 (A/B VALIDATION)         ║");
-    info!("╠════════════════════════════════════════════════════════╣");
+    info!("╔════════════════════════════════════════════════════════════╗");
+    info!("║       MANEUVER DETECTION v6.0 (FULL PIPELINE)            ║");
+    info!("╠════════════════════════════════════════════════════════════╣");
     info!(
-        "║ Total v2 maneuver events:   {:>5}                     ║",
+        "║ Total v2 maneuver events:   {:>5}                         ║",
         stats.v2_maneuver_events
     );
     info!(
-        "║   🚗 Overtakes:             {:>5} ({} vehicles)        ║",
+        "║   🚗 Overtakes:             {:>5} ({} vehicles)            ║",
         stats.v2_overtakes, stats.v2_vehicles_overtaken
     );
     info!(
-        "║   🔀 Lane changes:          {:>5}                     ║",
+        "║   🔀 Lane changes:          {:>5}                         ║",
         stats.v2_lane_changes
     );
     info!(
-        "║   ⚠️  Being overtaken:       {:>5}                     ║",
+        "║   ⚠️  Being overtaken:       {:>5}                         ║",
         stats.v2_being_overtaken
     );
-    info!("╚════════════════════════════════════════════════════════╝");
+    info!(
+        "║   🚧 Line crossings:        {:>5} ({} illegal)            ║",
+        stats.crossing_events_total, stats.crossing_events_illegal
+    );
+    info!("╚════════════════════════════════════════════════════════════╝");
 
     info!(
         "\n  Processing: {:.1} FPS ({:.1}s total)",
         stats.avg_fps, stats.duration_secs
     );
 }
+
