@@ -496,7 +496,7 @@ fn run_lane_detection(
                         road_class.mixed_line_side,
                         road_class.estimated_lanes,
                     );
-                    ps.last_road_classification = *road_class;
+                    ps.last_road_classification = road_class.clone();
                 }
 
                 // Cache marking infos for use in non-legality frames
