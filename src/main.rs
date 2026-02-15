@@ -59,6 +59,7 @@ pub struct LastManeuverInfo {
     pub frame_detected: u64,
     pub timestamp_detected: f64,
     pub vehicles_in_this_maneuver: usize,
+    pub crossed_line_class: Option<String>,
 }
 
 // ============================================================================
@@ -724,16 +725,23 @@ fn run_maneuver_pipeline_v2(
             }
         }
 
+        let confirmed_legality = if event.crossed_line_class.is_some() {
+            format!("{:?}", event.legality)
+        } else {
+            "Unknown".to_string()
+        };
+
         ps.last_maneuver = Some(LastManeuverInfo {
             maneuver_type: event.maneuver_type.as_str().to_string(),
             side: event.side.as_str().to_string(),
             confidence: event.confidence,
-            legality: format!("{:?}", event.legality),
+            legality: confirmed_legality,
             duration_ms: event.duration_ms,
             sources: event.sources.summary(),
             frame_detected: frame_count,
             timestamp_detected: timestamp_ms,
             vehicles_in_this_maneuver: vehicles_count,
+            crossed_line_class: event.crossed_line_class.clone(),
         });
 
         let crossed_line_str = event.crossed_line_class.as_deref().unwrap_or("none");

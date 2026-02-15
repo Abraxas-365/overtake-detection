@@ -27,10 +27,10 @@
 //   Layer 11: Bottom status bar
 //   Layer 12: Maneuver border pulse
 
-use crate::lane_legality::{DetectedRoadMarking, LegalityResult, LineLegality};
-use crate::road_overlay::{self, CrossingFlashState, RoadZoneInput};
 use crate::lane_crossing::CacheState;
+use crate::lane_legality::{DetectedRoadMarking, LegalityResult, LineLegality};
 use crate::road_classification::PassingLegality;
+use crate::road_overlay::{self, CrossingFlashState, RoadZoneInput};
 use crate::types::{Config, DetectedLane, VehicleState};
 use anyhow::Result;
 use opencv::{
@@ -85,8 +85,7 @@ impl VideoProcessor {
         }
 
         let fps = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FPS)?;
-        let total_frames =
-            VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
+        let total_frames = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_COUNT)? as i32;
         let width = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_WIDTH)? as i32;
         let height = VideoCaptureTraitConst::get(&cap, videoio::CAP_PROP_FRAME_HEIGHT)? as i32;
 
@@ -136,11 +135,7 @@ impl VideoProcessor {
         Ok(Some(writer))
     }
 
-    pub fn save_debug_frame(
-        &self,
-        frame: &crate::types::Frame,
-        label: &str,
-    ) -> Result<PathBuf> {
+    pub fn save_debug_frame(&self, frame: &crate::types::Frame, label: &str) -> Result<PathBuf> {
         let output_dir = PathBuf::from(&self.config.video.output_dir).join("debug");
         std::fs::create_dir_all(&output_dir)?;
         let filename = format!("{}_{}.png", label, chrono::Utc::now().format("%H%M%S"));
@@ -306,7 +301,13 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
     // ──────────────────────────────────────────────────────────────────
     // LAYER 1b: Ego lane polygon fill (between L/R boundary polylines)
     // ──────────────────────────────────────────────────────────────────
-    render_ego_lane_fill(&mut output, input.lanes, input.legality_result, width, height)?;
+    render_ego_lane_fill(
+        &mut output,
+        input.lanes,
+        input.legality_result,
+        width,
+        height,
+    )?;
 
     // ──────────────────────────────────────────────────────────────────
     // LAYER 4: Lane boundary polylines
@@ -327,7 +328,13 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
     // ──────────────────────────────────────────────────────────────────
     // LAYER 7: Ego position indicator + velocity arrow
     // ──────────────────────────────────────────────────────────────────
-    render_ego_indicator(&mut output, input.vehicle_state, input.ego_lateral_velocity, width, height)?;
+    render_ego_indicator(
+        &mut output,
+        input.vehicle_state,
+        input.ego_lateral_velocity,
+        width,
+        height,
+    )?;
 
     // ──────────────────────────────────────────────────────────────────
     // LAYER 5: Being-overtaken warning banner
@@ -875,7 +882,7 @@ fn render_maneuver_border_pulse(
     };
 
     let t = 6; // pulse thickness
-    // Top
+               // Top
     imgproc::rectangle(
         output,
         core::Rect::new(0, 0, width, t),
@@ -960,7 +967,15 @@ fn render_left_info_panel(
         )
     };
 
-    draw_text_with_shadow(output, &lane_status, panel_x + 18, panel_y, 0.48, lane_color, 1)?;
+    draw_text_with_shadow(
+        output,
+        &lane_status,
+        panel_x + 18,
+        panel_y,
+        0.48,
+        lane_color,
+        1,
+    )?;
     panel_y += line_height;
 
     // Lane confidence bar
@@ -1151,7 +1166,7 @@ fn render_right_event_panel(
         draw_text_with_shadow(
             output,
             &format!(
-                "{} {} — {:.1}s ago",
+                "{} {} {:.1}s ago",
                 maneuver.maneuver_type, maneuver.side, seconds_ago,
             ),
             right_panel_x + 8,
@@ -1162,25 +1177,46 @@ fn render_right_event_panel(
         )?;
         right_panel_y += line_height;
 
-        // Legality badge
-        let (leg_text, leg_color) = if maneuver.legality.contains("CriticalIllegal") {
-            ("CRITICAL ILLEGAL", core::Scalar::new(0.0, 0.0, 255.0, 0.0))
-        } else if maneuver.legality.contains("Illegal") {
-            ("ILLEGAL", core::Scalar::new(0.0, 100.0, 255.0, 0.0))
-        } else if maneuver.legality.contains("Legal") {
-            ("LEGAL", core::Scalar::new(0.0, 255.0, 0.0, 0.0))
+        // v6.1: Legality badge — only show confirmed legality from actual crossing.
+        // When crossed_line_class is None, no line was physically crossed,
+        // so the buffer-derived legality is speculative (nearby markings != crossed).
+        let (leg_text, leg_color) = if maneuver.crossed_line_class.is_some() {
+            // Confirmed crossing — render actual legality from the crossed line
+            if maneuver.legality.contains("CriticalIllegal") {
+                ("CRITICAL ILLEGAL", core::Scalar::new(0.0, 0.0, 255.0, 0.0))
+            } else if maneuver.legality.contains("Illegal") {
+                ("ILLEGAL", core::Scalar::new(0.0, 100.0, 255.0, 0.0))
+            } else if maneuver.legality.contains("Legal") {
+                ("LEGAL", core::Scalar::new(0.0, 255.0, 0.0, 0.0))
+            } else {
+                ("LEGAL (unmarked)", core::Scalar::new(0.0, 200.0, 0.0, 0.0))
+            }
         } else {
-            ("UNKNOWN", core::Scalar::new(200.0, 200.0, 200.0, 0.0))
+            // No confirmed crossing — grey neutral label
+            ("NO CROSSING", core::Scalar::new(180.0, 180.0, 180.0, 0.0))
         };
 
-        draw_text_with_shadow(
-            output,
-            &format!(
+        // Show crossed line class if confirmed, otherwise just conf + duration
+        let leg_detail = if let Some(ref cls) = maneuver.crossed_line_class {
+            format!(
+                "  {} [{}] | conf={:.0}% | {:.1}s",
+                leg_text,
+                cls,
+                maneuver.confidence * 100.0,
+                maneuver.duration_ms / 1000.0,
+            )
+        } else {
+            format!(
                 "  {} | conf={:.0}% | {:.1}s",
                 leg_text,
                 maneuver.confidence * 100.0,
                 maneuver.duration_ms / 1000.0,
-            ),
+            )
+        };
+
+        draw_text_with_shadow(
+            output,
+            &leg_detail,
             right_panel_x + 8,
             right_panel_y,
             0.38,
@@ -1424,14 +1460,15 @@ fn render_bottom_status_bar(
     )?;
 
     // Center: frame / time
-    let time_text = format!(
-        "F{} | {:.1}s",
-        frame_id,
-        timestamp_ms / 1000.0,
-    );
+    let time_text = format!("F{} | {:.1}s", frame_id, timestamp_ms / 1000.0,);
     let mut baseline = 0;
-    let text_size =
-        imgproc::get_text_size(&time_text, imgproc::FONT_HERSHEY_SIMPLEX, 0.42, 1, &mut baseline)?;
+    let text_size = imgproc::get_text_size(
+        &time_text,
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        0.42,
+        1,
+        &mut baseline,
+    )?;
     let center_x = (width - text_size.width) / 2;
     imgproc::put_text(
         output,
@@ -1447,8 +1484,13 @@ fn render_bottom_status_bar(
 
     // Right: stats
     let stats_text = format!("OVT:{} LC:{}", total_overtakes, total_lane_changes);
-    let stats_size =
-        imgproc::get_text_size(&stats_text, imgproc::FONT_HERSHEY_SIMPLEX, 0.42, 1, &mut baseline)?;
+    let stats_size = imgproc::get_text_size(
+        &stats_text,
+        imgproc::FONT_HERSHEY_SIMPLEX,
+        0.42,
+        1,
+        &mut baseline,
+    )?;
     imgproc::put_text(
         output,
         &stats_text,
@@ -1549,14 +1591,7 @@ fn draw_panel_background(img: &mut Mat, x: i32, y: i32, w: i32, h: i32) -> Resul
     Ok(())
 }
 
-fn draw_filled_rect_alpha(
-    img: &mut Mat,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    alpha: f64,
-) -> Result<()> {
+fn draw_filled_rect_alpha(img: &mut Mat, x: i32, y: i32, w: i32, h: i32, alpha: f64) -> Result<()> {
     let mut overlay = img.clone();
     imgproc::rectangle(
         &mut overlay,
@@ -1619,17 +1654,81 @@ fn draw_corner_accents(
     thickness: i32,
 ) -> Result<()> {
     // Top-left
-    imgproc::line(img, core::Point::new(x1, y1), core::Point::new(x1 + len, y1), color, thickness, imgproc::LINE_AA, 0)?;
-    imgproc::line(img, core::Point::new(x1, y1), core::Point::new(x1, y1 + len), color, thickness, imgproc::LINE_AA, 0)?;
+    imgproc::line(
+        img,
+        core::Point::new(x1, y1),
+        core::Point::new(x1 + len, y1),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    imgproc::line(
+        img,
+        core::Point::new(x1, y1),
+        core::Point::new(x1, y1 + len),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
     // Top-right
-    imgproc::line(img, core::Point::new(x2, y1), core::Point::new(x2 - len, y1), color, thickness, imgproc::LINE_AA, 0)?;
-    imgproc::line(img, core::Point::new(x2, y1), core::Point::new(x2, y1 + len), color, thickness, imgproc::LINE_AA, 0)?;
+    imgproc::line(
+        img,
+        core::Point::new(x2, y1),
+        core::Point::new(x2 - len, y1),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    imgproc::line(
+        img,
+        core::Point::new(x2, y1),
+        core::Point::new(x2, y1 + len),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
     // Bottom-left
-    imgproc::line(img, core::Point::new(x1, y2), core::Point::new(x1 + len, y2), color, thickness, imgproc::LINE_AA, 0)?;
-    imgproc::line(img, core::Point::new(x1, y2), core::Point::new(x1, y2 - len), color, thickness, imgproc::LINE_AA, 0)?;
+    imgproc::line(
+        img,
+        core::Point::new(x1, y2),
+        core::Point::new(x1 + len, y2),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    imgproc::line(
+        img,
+        core::Point::new(x1, y2),
+        core::Point::new(x1, y2 - len),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
     // Bottom-right
-    imgproc::line(img, core::Point::new(x2, y2), core::Point::new(x2 - len, y2), color, thickness, imgproc::LINE_AA, 0)?;
-    imgproc::line(img, core::Point::new(x2, y2), core::Point::new(x2, y2 - len), color, thickness, imgproc::LINE_AA, 0)?;
+    imgproc::line(
+        img,
+        core::Point::new(x2, y2),
+        core::Point::new(x2 - len, y2),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
+    imgproc::line(
+        img,
+        core::Point::new(x2, y2),
+        core::Point::new(x2, y2 - len),
+        color,
+        thickness,
+        imgproc::LINE_AA,
+        0,
+    )?;
     Ok(())
 }
 
@@ -1822,16 +1921,10 @@ fn passing_legality_from_markings(markings: &[DetectedRoadMarking]) -> PassingLe
     {
         return PassingLegality::Prohibited;
     }
-    if markings
-        .iter()
-        .any(|m| m.legality == LineLegality::Illegal)
-    {
+    if markings.iter().any(|m| m.legality == LineLegality::Illegal) {
         return PassingLegality::Prohibited;
     }
-    if markings
-        .iter()
-        .any(|m| m.legality == LineLegality::Legal)
-    {
+    if markings.iter().any(|m| m.legality == LineLegality::Legal) {
         return PassingLegality::Allowed;
     }
     PassingLegality::Unknown
