@@ -1255,4 +1255,3 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
-
