@@ -201,6 +201,12 @@ pub struct ManeuverEvent {
     #[serde(skip)]
     pub lateral_event: Option<LateralShiftEvent>,
     pub marking_context: Option<MarkingSnapshot>,
+
+    /// v6.1: The actual line marking class that was crossed during this maneuver.
+    /// Set by main.rs after correlating with LineCrossingDetector events.
+    pub crossed_line_class: Option<String>,
+    /// v6.1: The class_id of the crossed line marking (4=solid_white, 5=solid_yellow, etc.)
+    pub crossed_line_class_id: Option<usize>,
 }
 
 // ============================================================================
@@ -851,6 +857,8 @@ impl ManeuverClassifier {
             pass_event: Some(pass.clone()),
             lateral_event: shift.cloned(),
             marking_context: Some(self.latest_markings.clone()),
+            crossed_line_class: None,
+            crossed_line_class_id: None,
         }
     }
 
@@ -906,6 +914,8 @@ impl ManeuverClassifier {
             pass_event: None,
             lateral_event: Some(shift.clone()),
             marking_context: Some(self.latest_markings.clone()),
+            crossed_line_class: None,
+            crossed_line_class_id: None,
         }
     }
 
@@ -938,9 +948,10 @@ impl ManeuverClassifier {
             pass_event: Some(pass.clone()),
             lateral_event: None,
             marking_context: None,
+            crossed_line_class: None,
+            crossed_line_class_id: None,
         }
     }
-
     // ── HELPERS ──────────────────────────────────────────────────
 
     fn compute_frame_range(
@@ -1135,4 +1146,3 @@ fn directions_agree(pass: &PassEvent, shift: &LateralShiftEvent) -> bool {
 
     strict_match || (pass.confidence > 0.75 && shift.confirmed)
 }
-

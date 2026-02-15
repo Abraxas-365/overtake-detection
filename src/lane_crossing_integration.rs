@@ -3,11 +3,11 @@
 // v5.2: Wiring guide — how LineCrossingDetector + DetectionCache integrate
 //       with the existing pipeline stages in main.rs
 //
-// This module provides the glue functions that bridge the new lane_crossing
-// module with the existing pipeline architecture.
+// v6.1: Pending crossing buffer — crossings only confirmed when correlated
+//       with actual maneuver events. Crossed line determines maneuver legality.
 //
 // ════════════════════════════════════════════════════════════════════════════
-// ARCHITECTURE OVERVIEW
+// ARCHITECTURE OVERVIEW (v6.1)
 // ════════════════════════════════════════════════════════════════════════════
 //
 // Existing pipeline (main.rs):
@@ -25,9 +25,10 @@
 //   LineCrossingDetector runs in STAGE 3 alongside LateralShiftDetector:
 //     - Gets markings from the DetectionCache (fresh or cached)
 //     - Emits LineCrossingEvent when ego physically drives over a line
-//     - These events are fused with LateralShiftEvents for confirmation
+//     - v6.1: Events go to pending buffer, confirmed only when correlated
+//       with a maneuver event. Crossed line's legality feeds into ManeuverEvent.
 //
-// Data flow:
+// Data flow (v6.1):
 //   Frame → YOLO-seg → [boundaries + markings]
 //          ↓
 //   DetectionCache.update_fresh(boundaries + markings)
@@ -36,13 +37,22 @@
 //          ↓                              ↓
 //   LateralShiftDetector (offset)    LineCrossingDetector (overlap)
 //          ↓                              ↓
-//   ManeuverClassifier ←←←← crossing events as corroborating signal
+//   ManeuverClassifier            pending_crossings buffer
+//          ↓                              ↓
+//   ManeuverEvent ──── correlate_crossing_with_maneuver() ────→ confirmed
+//                              ↓
+//                   event.legality = crossed line's legality
+//                   event.crossed_line_class = marking class
 
+use std::collections::VecDeque;
+
+use crate::analysis::maneuver_classifier::{ManeuverEvent, ManeuverSide, ManeuverType};
 use crate::lane_crossing::{
     CacheState, CachedBoundaryResult, CachedLaneBoundaries, CrossingDetectorConfig, DetectionCache,
-    DetectionCacheConfig, LineCrossingDetector, LineCrossingEvent,
+    DetectionCacheConfig, LineCrossingDetector, LineCrossingEvent, LineRole,
 };
-use crate::road_classification::MarkingInfo;
+use crate::lane_legality::LineLegality;
+use crate::road_classification::{MarkingInfo, PassingLegality};
 use tracing::{debug, info};
 
 // ============================================================================
@@ -58,9 +68,17 @@ pub struct LaneCrossingState {
     pub crossing_detector: LineCrossingDetector,
     /// Last crossing event (for HUD display)
     pub last_crossing_event: Option<LineCrossingEvent>,
-    /// Running count of crossing events
+
+    // v6.1: Raw crossings go to pending buffer.
+    // Only promoted to confirmed when correlated with a maneuver.
+    pub pending_crossings: VecDeque<LineCrossingEvent>,
+
+    // v6.1: Confirmed counts (only crossings tied to actual lane changes/overtakes)
+    pub confirmed_crossing_count: u64,
+    pub confirmed_illegal_count: u64,
+
+    // Legacy counters (raw, for diagnostics only)
     pub crossing_event_count: u64,
-    /// Running count of illegal crossings
     pub illegal_crossing_count: u64,
 }
 
@@ -74,6 +92,9 @@ impl LaneCrossingState {
                 CrossingDetectorConfig::default(),
             ),
             last_crossing_event: None,
+            pending_crossings: VecDeque::with_capacity(10),
+            confirmed_crossing_count: 0,
+            confirmed_illegal_count: 0,
             crossing_event_count: 0,
             illegal_crossing_count: 0,
         }
@@ -93,6 +114,9 @@ impl LaneCrossingState {
                 crossing_config,
             ),
             last_crossing_event: None,
+            pending_crossings: VecDeque::with_capacity(10),
+            confirmed_crossing_count: 0,
+            confirmed_illegal_count: 0,
             crossing_event_count: 0,
             illegal_crossing_count: 0,
         }
@@ -110,25 +134,6 @@ impl LaneCrossingState {
 /// YOLO fails, the cache provides ego-compensated boundaries.
 ///
 /// Returns: (left_x, right_x, confidence, cache_state)
-///
-/// # Example usage in main.rs:
-/// ```rust,ignore
-/// // In run_lane_detection():
-/// let yolo_result = detector.estimate_ego_lane_boundaries_stable(...)?;
-///
-/// // Feed into cache
-/// let (left_x, right_x, conf, cache_state) = update_lane_cache(
-///     &mut ps.lane_crossing_state,
-///     yolo_result,
-///     &all_markings,     // from detector.last_lane_markings()
-///     ego_lateral_vel,   // from ego motion estimator
-///     frame_count,
-///     timestamp_ms,
-/// );
-///
-/// // Use (left_x, right_x, conf) for lane measurement construction
-/// // even when yolo_result was None, the cache may provide data
-/// ```
 pub fn update_lane_cache(
     state: &mut LaneCrossingState,
     yolo_boundaries: Option<(f32, f32, f32)>, // (left_x, right_x, confidence) from YOLO
@@ -177,23 +182,7 @@ pub fn update_lane_cache(
 /// Runs the line crossing detector on the current markings (fresh or cached).
 /// Returns a crossing event if the ego vehicle is confirmed to be driving over a line.
 ///
-/// # Example usage in main.rs:
-/// ```rust,ignore
-/// // In run_maneuver_detection():
-/// let crossing_event = run_crossing_detection(
-///     &mut ps.lane_crossing_state,
-///     ego_left_x,   // from cache or fresh detection
-///     ego_right_x,
-///     frame_count,
-///     timestamp_ms,
-/// );
-///
-/// if let Some(ref event) = crossing_event {
-///     // Inject as corroborating evidence into ManeuverPipeline
-///     // e.g., if event.line_role == LeftBoundary && event.crossing_direction == Leftward
-///     //       then this strongly confirms a leftward lane change
-/// }
-/// ```
+/// v6.1: Events are pushed to the pending buffer, NOT counted as confirmed yet.
 pub fn run_crossing_detection(
     state: &mut LaneCrossingState,
     ego_left_x: Option<f32>,
@@ -215,12 +204,19 @@ pub fn run_crossing_detection(
 
     if let Some(ref e) = event {
         state.last_crossing_event = Some(e.clone());
-        state.crossing_event_count += 1;
+        state.crossing_event_count += 1; // raw diagnostic counter
         if matches!(
             e.passing_legality,
-            crate::road_classification::PassingLegality::Prohibited
+            PassingLegality::Prohibited | PassingLegality::MixedProhibited
         ) {
-            state.illegal_crossing_count += 1;
+            state.illegal_crossing_count += 1; // raw diagnostic counter
+        }
+
+        // v6.1: Push to pending buffer — will be confirmed when correlated with maneuver
+        state.pending_crossings.push_back(e.clone());
+        // Cap pending buffer at 20
+        if state.pending_crossings.len() > 20 {
+            state.pending_crossings.pop_front();
         }
     }
 
@@ -250,6 +246,154 @@ pub fn crossing_alert_text(state: &LaneCrossingState) -> Option<String> {
         event.marking_class,
         event.passing_legality.as_str(),
     ))
+}
+
+// ============================================================================
+// v6.1: CROSSING-MANEUVER CORRELATION
+// ============================================================================
+
+/// v6.1: Correlate pending crossing events with a maneuver event.
+///
+/// When a maneuver (lane change or overtake) is detected, find the best
+/// matching pending crossing within ±`max_frame_gap` frames.
+///
+/// Returns the matched crossing (if any), promotes it to confirmed,
+/// and removes it from pending.
+///
+/// The returned crossing's `passing_legality` and `marking_class` should be
+/// used to set the maneuver's legality — this is the actual line that was crossed.
+pub fn correlate_crossing_with_maneuver(
+    state: &mut LaneCrossingState,
+    maneuver: &ManeuverEvent,
+    max_frame_gap: u64,
+) -> Option<LineCrossingEvent> {
+    if state.pending_crossings.is_empty() {
+        return None;
+    }
+
+    let maneuver_start = maneuver.start_frame;
+    let maneuver_end = maneuver.end_frame;
+
+    // Determine which side the maneuver crossed (left LC = cross left boundary, etc.)
+    let expected_role = match (maneuver.maneuver_type, maneuver.side) {
+        // Lane change LEFT → crosses left boundary or center line
+        (ManeuverType::LaneChange, ManeuverSide::Left) => {
+            Some((LineRole::LeftBoundary, LineRole::CenterLine))
+        }
+        // Lane change RIGHT → crosses right boundary or center line
+        (ManeuverType::LaneChange, ManeuverSide::Right) => {
+            Some((LineRole::RightBoundary, LineRole::CenterLine))
+        }
+        // Overtake LEFT → crosses left boundary or center line
+        (ManeuverType::Overtake, ManeuverSide::Left) => {
+            Some((LineRole::LeftBoundary, LineRole::CenterLine))
+        }
+        (ManeuverType::Overtake, ManeuverSide::Right) => {
+            Some((LineRole::RightBoundary, LineRole::CenterLine))
+        }
+        _ => None,
+    };
+
+    // Find best matching pending crossing:
+    // 1. Within frame window of the maneuver
+    // 2. Matching the expected line role
+    // 3. Highest penetration ratio wins ties
+    let mut best_idx: Option<usize> = None;
+    let mut best_score: f32 = 0.0;
+
+    for (i, crossing) in state.pending_crossings.iter().enumerate() {
+        let cf = crossing.frame_id;
+
+        // Check frame proximity: crossing must be within maneuver window ± gap
+        let in_window = cf >= maneuver_start.saturating_sub(max_frame_gap)
+            && cf <= maneuver_end.saturating_add(max_frame_gap);
+
+        if !in_window {
+            continue;
+        }
+
+        // Score based on role match + penetration
+        let role_score = if let Some((primary, secondary)) = expected_role {
+            if crossing.line_role == primary {
+                1.0
+            } else if crossing.line_role == secondary {
+                0.7
+            } else {
+                0.2 // wrong side but still in window — weak match
+            }
+        } else {
+            0.5 // no expectation — any role is OK
+        };
+
+        let score = role_score * crossing.confidence + crossing.penetration_ratio * 0.3;
+
+        if score > best_score {
+            best_score = score;
+            best_idx = Some(i);
+        }
+    }
+
+    if let Some(idx) = best_idx {
+        let crossing = state.pending_crossings.remove(idx).unwrap();
+
+        // Update confirmed counters
+        state.confirmed_crossing_count += 1;
+        if matches!(
+            crossing.passing_legality,
+            PassingLegality::Prohibited | PassingLegality::MixedProhibited
+        ) {
+            state.confirmed_illegal_count += 1;
+        }
+
+        info!(
+            "✅ CROSSING CONFIRMED: {} {} → {} (correlated with {} {} at frame {}–{})",
+            crossing.line_role.as_str(),
+            crossing.marking_class,
+            crossing.passing_legality.as_str(),
+            maneuver.maneuver_type.as_str(),
+            maneuver.side.as_str(),
+            maneuver.start_frame,
+            maneuver.end_frame,
+        );
+
+        Some(crossing)
+    } else {
+        None
+    }
+}
+
+/// v6.1: Convert a crossing's PassingLegality to the classifier's LineLegality.
+///
+/// Bridges the two legality enums so crossing legality can override
+/// the generic legality_buffer verdict on ManeuverEvent.
+pub fn crossing_legality_to_line_legality(
+    _passing: &PassingLegality,
+    marking_class_id: usize,
+) -> LineLegality {
+    // Use the detailed class-level mapping (same as lane_legality.rs)
+    match marking_class_id {
+        // solid yellow / double solid yellow → CriticalIllegal
+        5 | 8 => LineLegality::CriticalIllegal,
+        // solid white / solid red / double solid white → Illegal
+        4 | 6 | 7 => LineLegality::Illegal,
+        // dashed → Legal
+        9 | 10 => LineLegality::Legal,
+        // mixed → depends on PassingLegality
+        99 => match _passing {
+            PassingLegality::Prohibited | PassingLegality::MixedProhibited => LineLegality::Illegal,
+            PassingLegality::Allowed | PassingLegality::MixedAllowed => LineLegality::Legal,
+            _ => LineLegality::Caution,
+        },
+        _ => LineLegality::Unknown,
+    }
+}
+
+/// v6.1: Expire old pending crossings that are too far from current frame.
+/// Call this periodically to prevent unbounded growth.
+pub fn expire_pending_crossings(state: &mut LaneCrossingState, current_frame: u64, max_age: u64) {
+    state
+        .pending_crossings
+        .retain(|c| current_frame.saturating_sub(c.frame_id) <= max_age);
 }
 
 // ============================================================================
@@ -377,4 +521,21 @@ mod tests {
         let state = LaneCrossingState::new(1280.0, 720.0);
         assert_eq!(cache_status_text(&state), "LANE: NO DATA");
     }
+
+    #[test]
+    fn test_crossing_legality_mapping() {
+        assert_eq!(
+            crossing_legality_to_line_legality(&PassingLegality::Prohibited, 5),
+            LineLegality::CriticalIllegal
+        );
+        assert_eq!(
+            crossing_legality_to_line_legality(&PassingLegality::Prohibited, 4),
+            LineLegality::Illegal
+        );
+        assert_eq!(
+            crossing_legality_to_line_legality(&PassingLegality::Allowed, 10),
+            LineLegality::Legal
+        );
+    }
 }
+

@@ -243,7 +243,7 @@ pub fn fit_lane_polynomial(spine: &[(f32, f32)]) -> Option<LanePolynomial> {
 
     // Normalize y to [0, 1]
     let n = spine.len() as f64;
-    let mut s0: f64 = n;
+    let s0: f64 = n;
     let mut s1: f64 = 0.0;
     let mut s2: f64 = 0.0;
     let mut s3: f64 = 0.0;

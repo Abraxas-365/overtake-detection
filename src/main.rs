@@ -197,8 +197,8 @@ impl ProcessingStats {
             v2_lane_changes: ps.v2_lane_changes,
             v2_being_overtaken: ps.v2_being_overtaken,
             v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
-            crossing_events_total: ps.crossing_events_total,
-            crossing_events_illegal: ps.crossing_events_illegal,
+            crossing_events_total: ps.confirmed_crossing_count,
+            crossing_events_illegal: ps.confirmed_illegal_count,
             cache_recoveries: ps.lane_crossing_state.detection_cache.cache_recoveries,
             duration_secs: duration.as_secs_f64(),
             avg_fps,
@@ -638,42 +638,24 @@ fn run_maneuver_pipeline_v2(
     );
 
     if let Some(ref event) = crossing_event {
-        ps.crossing_events_total += 1;
-        if matches!(
-            event.passing_legality,
-            PassingLegality::Prohibited | PassingLegality::MixedProhibited
-        ) {
-            ps.crossing_events_illegal += 1;
-        }
-
-        info!(
-            "🚧 LINE CROSSING: {} {} | legality={} | pen={:.2} | frame={}",
+        // v6.1: Raw crossing detected — stored as pending in run_crossing_detection().
+        // Don't count it yet; confirmed only when correlated with a maneuver.
+        debug!(
+            "📋 PENDING CROSSING: {} {} | legality={} | pen={:.2} | frame={}",
             event.line_role.as_str(),
             event.crossing_direction.as_str(),
             event.passing_legality.as_str(),
             event.penetration_ratio,
             frame_count,
         );
-
-        // v6.0: Trigger crossing flash animation
-        // Find the marking bbox that was crossed
-        if let Some(fused) = ps.legality_buffer.latest() {
-            let marking_bbox = fused
-                .all_markings
-                .iter()
-                .find(|m| m.class_name == event.marking_class)
-                .map(|m| m.bbox);
-
-            if let Some(bbox) = marking_bbox {
-                let was_illegal = matches!(
-                    event.passing_legality,
-                    PassingLegality::Prohibited | PassingLegality::MixedProhibited
-                );
-
-                ps.crossing_flash = Some(CrossingFlashState::new(event, bbox));
-            }
-        }
     }
+
+    // v6.1: Expire stale pending crossings (older than 5s = 125 frames at 25fps)
+    lane_crossing_integration::expire_pending_crossings(
+        &mut ps.lane_crossing_state,
+        frame_count,
+        125,
+    );
 
     // Expire old crossing flash
     if let Some(ref flash) = ps.crossing_flash {
@@ -683,7 +665,8 @@ fn run_maneuver_pipeline_v2(
     }
 
     // ── Update counters and last maneuver ──
-    for event in &v2_result.maneuver_events {
+    let mut maneuver_events = v2_result.maneuver_events;
+    for event in &mut maneuver_events {
         ps.v2_maneuver_events += 1;
 
         let vehicles_count = if event.passed_vehicle_id.is_some() {
@@ -705,6 +688,42 @@ fn run_maneuver_pipeline_v2(
             }
         }
 
+        //         // v6.1: Correlate this maneuver with a pending crossing.
+        let correlated_crossing = lane_crossing_integration::correlate_crossing_with_maneuver(
+            &mut ps.lane_crossing_state,
+            event,
+            75, // ±75 frames (~3s at 25fps) correlation window
+        );
+
+        if let Some(ref crossing) = correlated_crossing {
+            // Override maneuver legality with the actual crossed line's legality
+            let line_legality = lane_crossing_integration::crossing_legality_to_line_legality(
+                &crossing.passing_legality,
+                crossing.marking_class_id,
+            );
+            event.legality = line_legality;
+            event.crossed_line_class = Some(crossing.marking_class.clone());
+            event.crossed_line_class_id = Some(crossing.marking_class_id);
+
+            info!(
+                "📌 Maneuver legality set from crossed line: {} ({}) → {:?}",
+                crossing.marking_class, crossing.marking_class_id, line_legality,
+            );
+
+            // v6.1: Trigger crossing flash ONLY for confirmed crossings
+            if let Some(fused) = ps.legality_buffer.latest() {
+                let marking_bbox = fused
+                    .all_markings
+                    .iter()
+                    .find(|m| m.class_name == crossing.marking_class)
+                    .map(|m| m.bbox);
+
+                if let Some(bbox) = marking_bbox {
+                    ps.crossing_flash = Some(CrossingFlashState::new(crossing, bbox));
+                }
+            }
+        }
+
         ps.last_maneuver = Some(LastManeuverInfo {
             maneuver_type: event.maneuver_type.as_str().to_string(),
             side: event.side.as_str().to_string(),
@@ -717,13 +736,16 @@ fn run_maneuver_pipeline_v2(
             vehicles_in_this_maneuver: vehicles_count,
         });
 
+        let crossed_line_str = event.crossed_line_class.as_deref().unwrap_or("none");
+
         info!(
-            "🆕 {} {} | conf={:.2} | sources={} | legality={:?} | frame={}",
+            "🆕 {} {} | conf={:.2} | sources={} | legality={:?} | crossed={} | frame={}",
             event.maneuver_type.as_str(),
             event.side.as_str(),
             event.confidence,
             event.sources.summary(),
             event.legality,
+            crossed_line_str,
             frame_count,
         );
     }

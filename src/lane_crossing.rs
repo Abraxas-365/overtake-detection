@@ -1,6 +1,8 @@
 // src/lane_crossing.rs
 //
 // v5.2: Direct YOLO-based lane crossing detection + detection frame cache.
+// v6.1: Min penetration filter, per-side debounce, increased cooldown.
+//       Crossings are now conservative — only meaningful overlap fires.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // PART 1: LINE CROSSING DETECTOR
@@ -18,6 +20,12 @@
 //
 // This is a much more direct signal than offset-based detection and can be
 // fused with the existing LateralShiftDetector as corroborating evidence.
+//
+// v6.1 additions:
+//   - min_penetration_ratio: ignore grazing contact (pen < 0.12)
+//   - clear_frames_required: per-side debounce to prevent re-fire spam
+//   - Increased cooldown from 30 → 50 frames
+//   - Per-side fire tracking to allow first fire freely
 //
 // ════════════════════════════════════════════════════════════════════════════
 // PART 2: YOLO DETECTION FRAME CACHE
@@ -139,13 +147,21 @@ pub struct CrossingDetectorConfig {
     /// Default: 0.82 (close to bottom, where the vehicle "touches" the road).
     pub reference_y_ratio: f32,
     /// Minimum frames of overlap before confirming a crossing event.
-    /// Prevents false positives from single-frame noise. Default: 2.
+    /// Prevents false positives from single-frame noise. Default: 3.
     pub min_overlap_frames: u32,
     /// Cooldown frames after a confirmed crossing before detecting another.
-    /// Prevents double-counting the same physical crossing. Default: 30 (~1s).
+    /// Prevents double-counting the same physical crossing. Default: 50 (~2s).
     pub cooldown_frames: u32,
     /// Minimum marking confidence to consider for crossing detection.
     pub min_marking_confidence: f32,
+    /// v6.1: Minimum penetration ratio to emit a crossing event.
+    /// Below this, the overlap is considered grazing contact / noise.
+    /// Default: 0.12 (12% of marking width).
+    pub min_penetration_ratio: f32,
+    /// v6.1: After a crossing fires on a given side (Left/Right/Center),
+    /// require this many frames of Clear state before the SAME side can fire again.
+    /// Prevents repeated crossings when driving near a line. Default: 20.
+    pub clear_frames_required: u32,
 }
 
 impl Default for CrossingDetectorConfig {
@@ -153,9 +169,11 @@ impl Default for CrossingDetectorConfig {
         Self {
             ego_half_width_px: 40.0,
             reference_y_ratio: 0.82,
-            min_overlap_frames: 2,
-            cooldown_frames: 30,
+            min_overlap_frames: 3,
+            cooldown_frames: 50,
             min_marking_confidence: 0.25,
+            min_penetration_ratio: 0.12,
+            clear_frames_required: 20,
         }
     }
 }
@@ -165,8 +183,7 @@ pub struct LineCrossingDetector {
     frame_width: f32,
     frame_height: f32,
 
-    // Per-line overlap tracking (keyed by approximate center_x buckets)
-    // We track overlap state for the left boundary, right boundary, and any center lines.
+    // Per-line overlap tracking
     left_overlap_state: OverlapState,
     left_overlap_frames: u32,
     right_overlap_state: OverlapState,
@@ -182,6 +199,16 @@ pub struct LineCrossingDetector {
 
     // History for external consumers
     recent_crossings: VecDeque<LineCrossingEvent>,
+
+    // v6.1: Per-side debounce — frames since each side was last Clear.
+    // A side can only re-fire after being Clear for >= clear_frames_required.
+    left_clear_counter: u32,
+    right_clear_counter: u32,
+    center_clear_counter: u32,
+    // v6.1: Track which sides have fired at least once (to allow the first fire freely)
+    left_has_fired: bool,
+    right_has_fired: bool,
+    center_has_fired: bool,
 }
 
 impl LineCrossingDetector {
@@ -199,6 +226,12 @@ impl LineCrossingDetector {
             cooldown_remaining: 0,
             prev_ego_x: None,
             recent_crossings: VecDeque::with_capacity(20),
+            left_clear_counter: u32::MAX, // allow first fire
+            right_clear_counter: u32::MAX,
+            center_clear_counter: u32::MAX,
+            left_has_fired: false,
+            right_has_fired: false,
+            center_has_fired: false,
         }
     }
 
@@ -310,11 +343,6 @@ impl LineCrossingDetector {
         }
 
         // Update overlap state machines
-        let left_event = self.update_overlap_state(
-            &mut self.left_overlap_state.clone(),
-            &mut self.left_overlap_frames.clone(),
-            left_overlap,
-        );
         self.left_overlap_state = if left_overlap {
             match self.left_overlap_state {
                 OverlapState::Clear => {
@@ -387,8 +415,37 @@ impl LineCrossingDetector {
             OverlapState::Clear
         };
 
-        // Emit event on first frame of Confirmed state
+        // v6.1: Update per-side clear counters for debounce
+        if self.left_overlap_state == OverlapState::Clear {
+            self.left_clear_counter = self.left_clear_counter.saturating_add(1);
+        } else {
+            self.left_clear_counter = 0;
+        }
+        if self.right_overlap_state == OverlapState::Clear {
+            self.right_clear_counter = self.right_clear_counter.saturating_add(1);
+        } else {
+            self.right_clear_counter = 0;
+        }
+        if self.center_overlap_state == OverlapState::Clear {
+            self.center_clear_counter = self.center_clear_counter.saturating_add(1);
+        } else {
+            self.center_clear_counter = 0;
+        }
+
+        // Emit event on first frame of Confirmed state (with v6.1 gates)
         if let Some((role, marking, penetration)) = best_crossing {
+            // v6.1 GATE 1: Minimum penetration — ignore grazing contact
+            if penetration < self.config.min_penetration_ratio {
+                debug!(
+                    "🚫 Crossing suppressed (pen={:.2} < {:.2}): {} {}",
+                    penetration,
+                    self.config.min_penetration_ratio,
+                    role.as_str(),
+                    marking.class_name,
+                );
+                return None;
+            }
+
             let is_newly_confirmed = match role {
                 LineRole::LeftBoundary => {
                     self.left_overlap_state == OverlapState::Confirmed
@@ -406,6 +463,27 @@ impl LineCrossingDetector {
             };
 
             if is_newly_confirmed {
+                // v6.1 GATE 2: Per-side debounce — require enough Clear frames before re-fire
+                let (has_fired, clear_count) = match role {
+                    LineRole::LeftBoundary => (self.left_has_fired, self.left_clear_counter),
+                    LineRole::RightBoundary => (self.right_has_fired, self.right_clear_counter),
+                    LineRole::CenterLine => (self.center_has_fired, self.center_clear_counter),
+                    _ => (false, u32::MAX),
+                };
+
+                // First fire on this side is always allowed; subsequent fires require debounce
+                if has_fired && clear_count < self.config.clear_frames_required {
+                    debug!(
+                        "🚫 Crossing debounced (side={} clear={}/{}): {} pen={:.2}",
+                        role.as_str(),
+                        clear_count,
+                        self.config.clear_frames_required,
+                        marking.class_name,
+                        penetration,
+                    );
+                    return None;
+                }
+
                 let legality = marking_to_passing_legality(marking);
 
                 let event = LineCrossingEvent {
@@ -429,6 +507,14 @@ impl LineCrossingDetector {
                     crossing_dir.as_str(),
                     penetration,
                 );
+
+                // v6.1: Mark this side as having fired (for debounce on next fire)
+                match role {
+                    LineRole::LeftBoundary => self.left_has_fired = true,
+                    LineRole::RightBoundary => self.right_has_fired = true,
+                    LineRole::CenterLine => self.center_has_fired = true,
+                    _ => {}
+                }
 
                 self.cooldown_remaining = self.config.cooldown_frames;
                 self.recent_crossings.push_back(event.clone());
@@ -475,6 +561,12 @@ impl LineCrossingDetector {
         self.cooldown_remaining = 0;
         self.prev_ego_x = None;
         self.recent_crossings.clear();
+        self.left_clear_counter = u32::MAX;
+        self.right_clear_counter = u32::MAX;
+        self.center_clear_counter = u32::MAX;
+        self.left_has_fired = false;
+        self.right_has_fired = false;
+        self.center_has_fired = false;
     }
 }
 
@@ -795,10 +887,10 @@ fn classify_line_role(
 ) -> LineRole {
     // If we know the ego lane boundaries, use them for precise classification
     if let (Some(left), Some(right)) = (ego_left_x, ego_right_x) {
-        let lane_center = (left + right) / 2.0;
+        let _lane_center = (left + right) / 2.0;
         let dist_to_left = (marking_center_x - left).abs();
         let dist_to_right = (marking_center_x - right).abs();
-        let dist_to_center = (marking_center_x - lane_center).abs();
+        let _dist_to_center = (marking_center_x - _lane_center).abs();
         let lane_width = (right - left).max(1.0);
 
         // If the marking is close to a known boundary
@@ -1008,6 +1100,8 @@ mod tests {
             min_overlap_frames: 2,
             cooldown_frames: 10,
             min_marking_confidence: 0.20,
+            min_penetration_ratio: 0.0, // test: no gate
+            clear_frames_required: 0,   // test: no debounce
         };
         let mut detector = LineCrossingDetector::new(1280.0, 720.0, config);
 
@@ -1045,6 +1139,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_grazing_contact_suppressed() {
+        // v6.1: Low-penetration crossings should be filtered
+        let config = CrossingDetectorConfig {
+            min_penetration_ratio: 0.12,
+            min_overlap_frames: 1,
+            cooldown_frames: 5,
+            clear_frames_required: 0,
+            ..CrossingDetectorConfig::default()
+        };
+        let mut detector = LineCrossingDetector::new(1280.0, 720.0, config);
+
+        // Place a marking barely touching the ego zone (narrow overlap)
+        // ego zone: 600..680, marking: 675..695 → overlap = 5px, width = 20px, pen = 0.25 → passes
+        let marking_pass = make_marking(5, "solid_single_yellow", 685.0, 675.0, 695.0);
+        let r = detector.update(&[marking_pass], Some(300.0), Some(900.0), 1, 33.0);
+        // pen = 5/20 = 0.25, above threshold → should eventually confirm
+
+        // Now test one that grazes: ego zone 600..680, marking 678..682 → overlap=2, width=4, pen=0.5
+        // But let's test the inverse: marking just barely overlapping
+        // ego zone 600..680, marking: 679..699 → overlap = 1px, width = 20, pen = 0.05 → suppressed
+        let mut detector2 = LineCrossingDetector::new(
+            1280.0,
+            720.0,
+            CrossingDetectorConfig {
+                min_penetration_ratio: 0.12,
+                min_overlap_frames: 1,
+                cooldown_frames: 5,
+                clear_frames_required: 0,
+                ..CrossingDetectorConfig::default()
+            },
+        );
+        let marking_graze = make_marking(5, "solid_single_yellow", 689.0, 679.0, 699.0);
+        // This marking is outside the ego zone (ego_zone_right = 640+40 = 680, marking starts at 679)
+        // overlap = min(680,699) - max(600,679) = 680 - 679 = 1px, pen = 1/20 = 0.05 → below 0.12
+        let r2 = detector2.update(&[marking_graze], Some(300.0), Some(900.0), 1, 33.0);
+        assert!(r2.is_none()); // pen < 0.12 → suppressed
+    }
+
+    #[test]
+    fn test_per_side_debounce() {
+        // v6.1: After firing on RIGHT, require clear_frames_required frames before re-fire
+        let config = CrossingDetectorConfig {
+            ego_half_width_px: 40.0,
+            reference_y_ratio: 0.82,
+            min_overlap_frames: 1,
+            cooldown_frames: 2, // short cooldown so debounce is the gate
+            min_marking_confidence: 0.20,
+            min_penetration_ratio: 0.0,
+            clear_frames_required: 5,
+        };
+        let mut detector = LineCrossingDetector::new(1280.0, 720.0, config);
+
+        let marking = make_marking(9, "dashed_single_white", 640.0, 620.0, 660.0);
+
+        // Frame 1: first fire (allowed — first time on this side)
+        let r1 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 1, 33.0);
+        assert!(r1.is_some(), "First fire should always succeed");
+
+        // Frames 2-3: cooldown
+        let r2 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 2, 66.0);
+        assert!(r2.is_none());
+        let r3 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 3, 99.0);
+        assert!(r3.is_none());
+
+        // Frames 4-6: overlap again but debounce should block (only 0 clear frames)
+        let r4 = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 4, 132.0);
+        assert!(r4.is_none(), "Debounce should block re-fire");
+
+        // Frames 7-12: clear (no marking)
+        for i in 7..12 {
+            detector.update(&[], Some(300.0), Some(900.0), i, i as f64 * 33.0);
+        }
+
+        // Frame 12+: overlap again — debounce clear (5+ clear frames)
+        let r_final = detector.update(&[marking.clone()], Some(300.0), Some(900.0), 12, 396.0);
+        assert!(
+            r_final.is_some(),
+            "After debounce clear period, should fire again"
+        );
+    }
+
     // ---- Line Role Classification ----
 
     #[test]
@@ -1065,3 +1241,4 @@ mod tests {
         assert_eq!(role, LineRole::CenterLine);
     }
 }
+
