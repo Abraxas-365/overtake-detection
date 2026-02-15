@@ -44,7 +44,7 @@ pub struct ManeuverFrameInput<'a> {
     pub frame_id: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManeuverFrameOutput {
     pub maneuver_events: Vec<ManeuverEvent>,
     pub tracked_vehicle_count: usize,

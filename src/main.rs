@@ -665,7 +665,7 @@ fn run_maneuver_pipeline_v2(
     }
 
     // ── Update counters and last maneuver ──
-    let mut maneuver_events = v2_result.maneuver_events;
+    let mut maneuver_events = v2_result.clone().maneuver_events;
     for event in &mut maneuver_events {
         ps.v2_maneuver_events += 1;
 
