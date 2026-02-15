@@ -7,8 +7,14 @@
 // Minimal implementation focused on the new signal-fusion architecture
 
 mod analysis;
+mod lane_crossing;
+mod lane_crossing_integration;
+mod lane_detection;
 mod lane_legality;
+mod lane_legality_patches;
 mod pipeline;
+mod road_classification;
+mod road_overlay;
 mod types;
 mod vehicle_detection;
 mod video_processor;
