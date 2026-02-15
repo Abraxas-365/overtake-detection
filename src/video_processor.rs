@@ -1139,7 +1139,7 @@ fn render_right_event_panel(
 
     // Last maneuver
     if let Some(maneuver) = last_maneuver {
-        let seconds_ago = (timestamp_ms - maneuver.end_ms) / 1000.0;
+        let seconds_ago = (timestamp_ms - maneuver.timestamp_detected) / 1000.0;
         let is_recent = seconds_ago < 5.0;
 
         let ago_color = if is_recent {
