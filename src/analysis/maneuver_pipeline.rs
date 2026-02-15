@@ -154,6 +154,15 @@ impl ManeuverPipeline {
         Self::with_config(ManeuverPipelineConfig::default(), frame_w, frame_h)
     }
 
+    /// Get the last ego lateral velocity estimate (px/frame), if available.
+    pub fn last_ego_velocity(&self) -> Option<f32> {
+        if self.last_ego_estimate.confidence > 0.0 {
+            Some(self.last_ego_estimate.lateral_velocity_px)
+        } else {
+            None
+        }
+    }
+
     pub fn with_config(config: ManeuverPipelineConfig, frame_w: f32, frame_h: f32) -> Self {
         Self {
             tracker: VehicleTracker::new(config.tracker, frame_w, frame_h),
@@ -371,4 +380,3 @@ impl ManeuverPipeline {
         self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
-

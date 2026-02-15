@@ -669,7 +669,8 @@ fn run_maneuver_pipeline_v2(
                     event.passing_legality,
                     PassingLegality::Prohibited | PassingLegality::MixedProhibited
                 );
-                ps.crossing_flash = Some(CrossingFlashState::new(*event.line_role, bbox));
+
+                ps.crossing_flash = Some(CrossingFlashState::new(event, bbox));
             }
         }
     }
@@ -862,4 +863,3 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.avg_fps, stats.duration_secs
     );
 }
-
