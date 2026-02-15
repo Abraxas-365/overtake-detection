@@ -7,6 +7,7 @@
 // Minimal implementation focused on the new signal-fusion architecture
 
 mod analysis;
+mod color_analysis;
 mod lane_crossing;
 mod lane_crossing_integration;
 mod lane_detection;
