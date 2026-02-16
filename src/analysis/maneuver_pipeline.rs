@@ -14,6 +14,11 @@
 // v4.4: Reordered steps so ego-motion is computed BEFORE lateral detection.
 //       This allows the lateral detector to use ego motion for bridging
 //       through lane detection dropout.
+//
+// v5.0: Added PolynomialBoundaryTracker between ego-motion and lateral
+//       detection. Tracks polynomial lane coefficients via Kalman filter
+//       for curve-aware prediction during dropout and geometric lane
+//       change signals that discriminate curves from lane changes.
 
 use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
 use super::lateral_detector::{
@@ -23,9 +28,12 @@ use super::maneuver_classifier::{
     ClassifierConfig, ManeuverClassifier, ManeuverEvent, MarkingSnapshot,
 };
 use super::pass_detector::{PassDetector, PassDetectorConfig};
+use super::polynomial_tracker::{
+    GeometricLaneChangeSignals, PolynomialBoundaryTracker, PolynomialTrackerConfig,
+};
 use super::vehicle_tracker::{DetectionInput, Track, TrackerConfig, VehicleTracker};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // INPUT / OUTPUT
@@ -52,6 +60,9 @@ pub struct ManeuverFrameOutput {
     pub shift_in_progress: bool,
     pub ego_lateral_velocity: f32,
     pub lateral_state: String,
+    /// v5.0: Geometric lane change signals from the polynomial tracker.
+    /// Available when both lane boundaries are being tracked.
+    pub geometric_signals: Option<GeometricLaneChangeSignals>,
 }
 
 // ============================================================================
@@ -66,6 +77,12 @@ pub struct ManeuverPipelineConfig {
     pub ego_motion: EgoMotionConfig,
     pub classifier: ClassifierConfig,
     pub enable_ego_motion: bool,
+    /// v5.0: Polynomial boundary tracker configuration.
+    pub poly_tracker: PolynomialTrackerConfig,
+    /// v5.0: Whether to use polynomial tracker to enhance lane measurements.
+    /// When false, the tracker still runs (for signals) but doesn't override
+    /// the lane measurement positions. Useful for A/B comparison.
+    pub poly_tracker_override_positions: bool,
 }
 
 impl Default for ManeuverPipelineConfig {
@@ -77,6 +94,8 @@ impl Default for ManeuverPipelineConfig {
             ego_motion: EgoMotionConfig::default(),
             classifier: ClassifierConfig::default(),
             enable_ego_motion: true,
+            poly_tracker: PolynomialTrackerConfig::default(),
+            poly_tracker_override_positions: true,
         }
     }
 }
@@ -129,6 +148,8 @@ impl ManeuverPipelineConfig {
                 ..ClassifierConfig::default()
             },
             enable_ego_motion: true,
+            poly_tracker: PolynomialTrackerConfig::default(),
+            poly_tracker_override_positions: true,
         }
     }
 }
@@ -146,7 +167,13 @@ pub struct ManeuverPipeline {
     enable_ego_motion: bool,
     frame_count: u64,
     last_ego_estimate: EgoMotionEstimate,
-    last_tracked_count: usize, // 🆕 Add this
+    last_tracked_count: usize,
+    /// v5.0: Polynomial boundary tracker for curve-aware lane geometry.
+    poly_tracker: PolynomialBoundaryTracker,
+    /// v5.0: Whether to override lane measurement positions with tracker output.
+    poly_tracker_override_positions: bool,
+    /// Stored frame width for ego_x computation.
+    frame_w: f32,
 }
 
 impl ManeuverPipeline {
@@ -165,16 +192,17 @@ impl ManeuverPipeline {
     pub fn with_config(config: ManeuverPipelineConfig, frame_w: f32, frame_h: f32) -> Self {
         Self {
             tracker: VehicleTracker::new(config.tracker, frame_w, frame_h),
-
             pass_detector: PassDetector::new(config.pass_detector, frame_h),
-
             lateral_detector: LateralShiftDetector::new(config.lateral_detector),
             ego_motion: EgoMotionEstimator::new(config.ego_motion),
             classifier: ManeuverClassifier::new(config.classifier),
             enable_ego_motion: config.enable_ego_motion,
             frame_count: 0,
             last_ego_estimate: EgoMotionEstimate::none(),
-            last_tracked_count: 0, // 🆕 Initialize to 0
+            last_tracked_count: 0,
+            poly_tracker: PolynomialBoundaryTracker::new(config.poly_tracker),
+            poly_tracker_override_positions: config.poly_tracker_override_positions,
+            frame_w,
         }
     }
 
@@ -183,12 +211,10 @@ impl ManeuverPipeline {
         self.frame_count += 1;
 
         // ══════════════════════════════════════════════════════════════════
-        // 🆕 DIAGNOSTIC: Count raw detections before filtering
+        // DIAGNOSTIC: Count raw detections before filtering
         // ══════════════════════════════════════════════════════════════════
         let raw_det_count = input.vehicle_detections.len();
 
-        // Count valid detections (would pass tracker's filters)
-        // This replicates the filtering logic from VehicleTracker::update()
         let valid_det_count = input
             .vehicle_detections
             .iter()
@@ -206,13 +232,11 @@ impl ManeuverPipeline {
         let tracked_count = self.tracker.confirmed_count();
         let tracks = self.tracker.confirmed_tracks();
 
-        // 🆕 DIAGNOSTIC: Track IDs and zones
         let track_info: Vec<String> = tracks
             .iter()
             .map(|t| format!("T{}:{}", t.id, t.zone.as_str()))
             .collect();
 
-        // 🆕 DIAGNOSTIC: Class ID distribution in raw detections
         let mut class_counts: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
         for det in input.vehicle_detections {
@@ -251,8 +275,154 @@ impl ManeuverPipeline {
         };
 
         // ══════════════════════════════════════════════════════════════════
+        // 3.5 POLYNOMIAL BOUNDARY TRACKER (v5.0)
+        //
+        //     Feeds polynomial fits from curvature_estimator (via LaneMeasurement.curvature)
+        //     into Kalman filters that track lane boundary geometry.
+        //
+        //     Outputs:
+        //       - Smoothed/predicted boundary positions (curve-aware)
+        //       - Geometric lane change signals (boundary divergence, width rate, etc.)
+        //       - Innovation magnitudes for dropout recovery detection
+        //
+        //     When poly_tracker_override_positions is true, replaces the
+        //     offset/width in the LaneMeasurement with tracker output before
+        //     feeding to the lateral detector. This gives:
+        //       - Curve-aware prediction during YOLO dropout (vs scalar+ego)
+        //       - Smoother boundaries (Kalman filtering vs raw YOLO noise)
+        //       - Principled confidence decay (covariance-based vs 0.85^n)
+        // ══════════════════════════════════════════════════════════════════
+        let ego_x = self.frame_w / 2.0;
+
+        // Extract polynomial fits from the curvature estimate (if present in measurement)
+        let left_poly = input
+            .lane_measurement
+            .as_ref()
+            .and_then(|m| m.curvature.as_ref())
+            .and_then(|c| c.left_poly);
+        let right_poly = input
+            .lane_measurement
+            .as_ref()
+            .and_then(|m| m.curvature.as_ref())
+            .and_then(|c| c.right_poly);
+
+        // Update the polynomial tracker
+        let geo_signals = self
+            .poly_tracker
+            .update(
+                left_poly.as_ref(),
+                right_poly.as_ref(),
+                self.last_ego_estimate.lateral_velocity_px,
+                ego_x,
+            )
+            .clone();
+
+        // Optionally override lane measurement positions with tracker output
+        let enhanced_measurement =
+            if self.poly_tracker_override_positions && self.poly_tracker.both_active() {
+                if let Some(meas) = input.lane_measurement {
+                    let ref_y = 0.82;
+                    let tracked_left = self.poly_tracker.left_x_at(ref_y);
+                    let tracked_right = self.poly_tracker.right_x_at(ref_y);
+                    let tracked_width = tracked_right - tracked_left;
+
+                    if tracked_width > 50.0 {
+                        // Use tracker's smoothed/predicted positions
+                        let tracked_offset = ego_x - (tracked_left + tracked_right) / 2.0;
+                        let tracker_conf = self.poly_tracker.confidence();
+
+                        // Blend confidence: tracker can boost low-confidence YOLO
+                        // or provide principled decay during prediction
+                        let is_predicting = !matches!(
+                            (
+                                self.poly_tracker.left_state(),
+                                self.poly_tracker.right_state()
+                            ),
+                            (
+                                super::polynomial_tracker::BoundaryState::Tracking,
+                                super::polynomial_tracker::BoundaryState::Tracking,
+                            )
+                        );
+
+                        let blended_conf = if is_predicting {
+                            // During prediction: use tracker's covariance-based confidence
+                            tracker_conf * meas.confidence.max(0.3)
+                        } else {
+                            // During tracking: blend (smoothed estimate is more stable)
+                            (meas.confidence * 0.7 + tracker_conf * 0.3).min(1.0)
+                        };
+
+                        if is_predicting {
+                            debug!(
+                                "📐 PolyTracker providing predicted boundaries: L={:.0} R={:.0} \
+                             W={:.0} conf={:.2} (stale L={}f R={}f)",
+                                tracked_left,
+                                tracked_right,
+                                tracked_width,
+                                blended_conf,
+                                self.poly_tracker.left_kf_stale(),
+                                self.poly_tracker.right_kf_stale(),
+                            );
+                        }
+
+                        Some(LaneMeasurement {
+                            lateral_offset_px: tracked_offset,
+                            lane_width_px: tracked_width,
+                            confidence: blended_conf,
+                            both_lanes: true, // tracker has both if both_active()
+                            boundary_coherence: meas.boundary_coherence,
+                            curvature: meas.curvature,
+                        })
+                    } else {
+                        // Tracked width too narrow — bad state, use original
+                        Some(meas)
+                    }
+                } else if self.poly_tracker.both_active() {
+                    // No YOLO measurement at all, but tracker is still predicting
+                    let ref_y = 0.82;
+                    let tracked_left = self.poly_tracker.left_x_at(ref_y);
+                    let tracked_right = self.poly_tracker.right_x_at(ref_y);
+                    let tracked_width = tracked_right - tracked_left;
+
+                    if tracked_width > 50.0 {
+                        let tracked_offset = ego_x - (tracked_left + tracked_right) / 2.0;
+                        let tracker_conf = self.poly_tracker.confidence();
+
+                        debug!(
+                            "📐 PolyTracker bridging dropout: L={:.0} R={:.0} \
+                         W={:.0} conf={:.2}",
+                            tracked_left, tracked_right, tracked_width, tracker_conf,
+                        );
+
+                        Some(LaneMeasurement {
+                            lateral_offset_px: tracked_offset,
+                            lane_width_px: tracked_width,
+                            confidence: tracker_conf,
+                            both_lanes: true,
+                            boundary_coherence: -1.0, // no fresh coherence data
+                            curvature: None,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    input.lane_measurement
+                }
+            } else {
+                input.lane_measurement
+            };
+
+        // Capture geometric signals for output
+        let output_geo = if self.poly_tracker.both_active() {
+            Some(geo_signals)
+        } else {
+            None
+        };
+
+        // ══════════════════════════════════════════════════════════════════
         // 4. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
         //    v4.4: Now receives ego-motion input for fusion/bridging.
+        //    v5.0: Receives enhanced measurement from polynomial tracker.
         // ══════════════════════════════════════════════════════════════════
         let ego_input = if self.enable_ego_motion {
             Some(EgoMotionInput {
@@ -264,7 +434,7 @@ impl ManeuverPipeline {
         };
 
         let shift_event = self.lateral_detector.update(
-            input.lane_measurement,
+            enhanced_measurement,
             ego_input,
             input.timestamp_ms,
             input.frame_id,
@@ -286,8 +456,6 @@ impl ManeuverPipeline {
         // 6. CLASSIFICATION / FUSION
         // ══════════════════════════════════════════════════════════════════
         // v4.13b: Pass curve mode to classifier for zone-oscillation suppression.
-        // On curves, BESIDE→AHEAD zone flips are unreliable — VehicleOvertookEgo
-        // events need lateral shift corroboration when this is active.
         self.classifier
             .set_curve_mode(self.lateral_detector.in_curve_mode());
 
@@ -299,7 +467,6 @@ impl ManeuverPipeline {
         // 7. PERIODIC DIAGNOSTICS (ENHANCED)
         // ══════════════════════════════════════════════════════════════════
 
-        // 🆕 Always log critical tracking failures
         if raw_det_count > 0 && tracked_count == 0 {
             warn!(
             "⚠️  F{}: TRACKING FAILURE | raw_dets={} | valid_dets={} | tracks={} | classes={:?}",
@@ -311,10 +478,26 @@ impl ManeuverPipeline {
         );
         }
 
-        // 🆕 Enhanced periodic diagnostics
         if self.frame_count % 150 == 0 {
+            // v5.0: Include polynomial tracker state in diagnostics
+            let poly_status = if self.poly_tracker.both_active() {
+                format!(
+                    "poly=L:{}/R:{} conf={:.2} div={:.2}",
+                    self.poly_tracker.left_state().as_str(),
+                    self.poly_tracker.right_state().as_str(),
+                    self.poly_tracker.confidence(),
+                    self.poly_tracker.signals().boundary_velocity_divergence,
+                )
+            } else {
+                format!(
+                    "poly=L:{}/R:{}",
+                    self.poly_tracker.left_state().as_str(),
+                    self.poly_tracker.right_state().as_str(),
+                )
+            };
+
             info!(
-            "📊 Pipeline v2 (F{}): raw_dets={} | valid_dets={} | tracks={} [{}] | passes={} | lateral={} | ego={:.2}px/f | maneuvers={}",
+            "📊 Pipeline v2 (F{}): raw_dets={} | valid_dets={} | tracks={} [{}] | passes={} | lateral={} | ego={:.2}px/f | maneuvers={} | {}",
             self.frame_count,
             raw_det_count,
             valid_det_count,
@@ -324,6 +507,7 @@ impl ManeuverPipeline {
             self.lateral_detector.state_str(),
             ego_velocity,
             self.classifier.total_maneuvers(),
+            poly_status,
         );
 
             if !class_counts.is_empty() {
@@ -331,7 +515,6 @@ impl ManeuverPipeline {
             }
         }
 
-        // 🆕 Log when tracks appear/disappear
         if tracked_count != self.last_tracked_count {
             if tracked_count > self.last_tracked_count {
                 info!(
@@ -354,6 +537,7 @@ impl ManeuverPipeline {
             shift_in_progress: self.lateral_detector.is_shifting(),
             ego_lateral_velocity: ego_velocity,
             lateral_state: self.lateral_detector.state_str().to_string(),
+            geometric_signals: output_geo,
         }
     }
 
@@ -369,13 +553,25 @@ impl ManeuverPipeline {
         self.classifier.total_maneuvers()
     }
 
+    /// v5.0: Access the polynomial boundary tracker (read-only).
+    pub fn poly_tracker(&self) -> &PolynomialBoundaryTracker {
+        &self.poly_tracker
+    }
+
+    /// v5.0: Get the latest geometric lane change signals.
+    pub fn geometric_signals(&self) -> &GeometricLaneChangeSignals {
+        self.poly_tracker.signals()
+    }
+
     pub fn reset(&mut self) {
         self.tracker.reset();
         self.pass_detector.reset();
         self.lateral_detector.reset();
         self.ego_motion.reset();
         self.classifier.reset();
+        self.poly_tracker.reset();
         self.frame_count = 0;
         self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
+
