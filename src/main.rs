@@ -528,7 +528,7 @@ fn run_lane_detection(
             let raw_markings = detector.last_lane_markings;
             if !raw_markings.is_empty() {
                 let fallback_infos = lane_legality_patches::detections_to_marking_infos(
-                    raw_markings,
+                    &raw_markings,
                     &frame.data,
                     frame.width,
                     frame.height,
