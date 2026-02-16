@@ -525,7 +525,7 @@ fn run_lane_detection(
     //
     if effective_boundaries.is_none() {
         if let Some(ref detector) = ps.legality_detector {
-            let raw_markings = detector.last_lane_markings();
+            let raw_markings = detector.last_lane_markings;
             if !raw_markings.is_empty() {
                 let fallback_infos = lane_legality_patches::detections_to_marking_infos(
                     raw_markings,
@@ -933,4 +933,3 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.avg_fps, stats.duration_secs
     );
 }
-

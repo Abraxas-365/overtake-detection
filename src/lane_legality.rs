@@ -668,7 +668,7 @@ pub struct LaneLegalityDetector {
 
     /// v4.13: Raw lane-line markings from the last boundary estimation call.
     /// Stored so the curvature estimator can access their masks without re-running inference.
-    last_lane_markings: Vec<DetectedRoadMarking>,
+    pub last_lane_markings: Vec<DetectedRoadMarking>,
     /// v4.13: Original image dimensions from the last call (for mask coordinate conversion).
     last_image_dims: (usize, usize),
     /// v4.13: Polynomial curvature estimate from mask geometry.
@@ -1480,4 +1480,3 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
-
