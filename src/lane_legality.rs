@@ -3,6 +3,9 @@
 // v4.13: Added polynomial curvature estimation from YOLO-seg masks.
 //        Stores raw lane markings per frame and computes per-boundary
 //        polynomial fits for direct geometric curve detection.
+// v6.1g: Mask-based mixed line detection — analyzes class 8 segmentation
+//        masks to distinguish true double-solid from mixed (solid+dashed)
+//        center lines. Reclassifies to class 99 when one stripe is dashed.
 
 use crate::analysis::curvature_estimator::{
     self, CurvatureEstimate, MaskInput, MaskTransformParams,
@@ -301,6 +304,219 @@ fn verify_line_color(
             marking.class_name = class_id_to_name(new_class).to_string();
             marking.legality = class_id_to_legality(new_class);
         }
+    }
+}
+
+// ===========================================================================
+// v6.1g: MASK-BASED MIXED LINE DETECTION
+// ===========================================================================
+//
+// The YOLO model detects both stripes of a mixed double yellow line as a
+// single solid_double_yellow (class 8) bounding box. This function splits
+// the 160×160 segmentation mask into left/right halves and measures
+// row-by-row coverage to distinguish solid from dashed stripes.
+//
+// Pipeline order in postprocess():
+//   1. verify_line_color()             — fix color misclassification
+//   2. analyze_double_line_for_mixed() — class 8 → 99 when mixed  ← THIS
+//   3. merge_composite_lines()         — merge separate solid+dashed pairs
+//   4. nms_markings()                  — suppress overlapping detections
+//
+// Two paths create class 99 mixed lines:
+//   Path A (this function): Single class 8 detection with one dashed stripe
+//   Path B (merge_composite_lines): Separate class 5 + class 10 detections
+
+/// v6.1g: Analyze a solid_double_yellow (class 8) segmentation mask to detect
+/// if one stripe is actually dashed (making it a mixed double yellow line).
+///
+/// Splits the mask into left/right halves at the column-sum valley between
+/// the two stripe peaks, then measures per-half coverage and gap transitions.
+///
+/// If mixed, reclassifies the detection:
+///   - dashed on right → class 99, mixed_double_yellow_dashed_right (Legal)
+///   - dashed on left  → class 99, mixed_double_yellow_solid_right (CriticalIllegal)
+fn analyze_double_line_for_mixed(
+    marking: &mut DetectedRoadMarking,
+    scale: f32,
+    pad_x: f32,
+    pad_y: f32,
+) {
+    // Only analyze solid_double_yellow (class 8)
+    if marking.class_id != 8 {
+        return;
+    }
+
+    let mask = &marking.mask;
+    let mw = marking.mask_width;
+    let mh = marking.mask_height;
+
+    if mask.is_empty() || mw == 0 || mh == 0 {
+        return;
+    }
+
+    // Map bbox from original image → 640-space → 160-space (mask coordinates)
+    let ratio = MASK_SIZE as f32 / SEG_INPUT_SIZE as f32; // 160/640 = 0.25
+
+    let mx1 = ((marking.bbox[0] * scale + pad_x) * ratio).floor().max(0.0) as usize;
+    let my1 = ((marking.bbox[1] * scale + pad_y) * ratio).floor().max(0.0) as usize;
+    let mx2 = ((marking.bbox[2] * scale + pad_x) * ratio)
+        .ceil()
+        .min(mw as f32 - 1.0) as usize;
+    let my2 = ((marking.bbox[3] * scale + pad_y) * ratio)
+        .ceil()
+        .min(mh as f32 - 1.0) as usize;
+
+    let col_width = mx2.saturating_sub(mx1) + 1;
+    let row_height = my2.saturating_sub(my1) + 1;
+
+    // Need enough resolution to distinguish two stripes
+    if col_width < 4 || row_height < 8 {
+        return;
+    }
+
+    // ── Step 1: Column sums to find the stripe split point ──────────
+    // A double line produces two vertical peaks with a valley between them.
+    let mut col_sums = vec![0u32; col_width];
+
+    for my in my1..=my2 {
+        for mx in mx1..=mx2 {
+            let idx = my * mw + mx;
+            if idx < mask.len() && mask[idx] == 255 {
+                col_sums[mx - mx1] += 1;
+            }
+        }
+    }
+
+    // Find the valley (minimum) in the central 50% of columns
+    let search_start = col_width / 4;
+    let search_end = (col_width * 3) / 4;
+
+    if search_end <= search_start {
+        return;
+    }
+
+    let split = (search_start..=search_end)
+        .min_by_key(|&c| col_sums[c])
+        .unwrap_or(col_width / 2);
+
+    // Verify there actually are two stripes (valley significantly lower than peaks)
+    let left_peak = col_sums[..split].iter().copied().max().unwrap_or(0);
+    let right_peak = col_sums[split..].iter().copied().max().unwrap_or(0);
+    let valley_val = col_sums[split];
+
+    let peak_min = left_peak.min(right_peak);
+    if peak_min == 0 || valley_val as f32 > peak_min as f32 * 0.6 {
+        return; // Not a clear two-stripe pattern — keep as solid_double_yellow
+    }
+
+    // ── Step 2: Row-by-row coverage for each half ───────────────────
+    let mut left_present_rows = 0u32;
+    let mut right_present_rows = 0u32;
+    let mut left_gap_transitions = 0u32;
+    let mut right_gap_transitions = 0u32;
+    let mut prev_left = false;
+    let mut prev_right = false;
+    let mut total_rows = 0u32;
+
+    for my in my1..=my2 {
+        let mut left_has_pixel = false;
+        let mut right_has_pixel = false;
+
+        for mx in mx1..=mx2 {
+            let idx = my * mw + mx;
+            if idx < mask.len() && mask[idx] == 255 {
+                if mx - mx1 < split {
+                    left_has_pixel = true;
+                } else {
+                    right_has_pixel = true;
+                }
+            }
+        }
+
+        total_rows += 1;
+        if left_has_pixel {
+            left_present_rows += 1;
+        }
+        if right_has_pixel {
+            right_present_rows += 1;
+        }
+
+        // Count transitions (present→absent or absent→present) = gap pattern
+        if total_rows > 1 {
+            if left_has_pixel != prev_left {
+                left_gap_transitions += 1;
+            }
+            if right_has_pixel != prev_right {
+                right_gap_transitions += 1;
+            }
+        }
+        prev_left = left_has_pixel;
+        prev_right = right_has_pixel;
+    }
+
+    if total_rows < 8 {
+        return;
+    }
+
+    let left_coverage = left_present_rows as f32 / total_rows as f32;
+    let right_coverage = right_present_rows as f32 / total_rows as f32;
+
+    // ── Step 3: Classify each half ──────────────────────────────────
+    // Solid: high coverage + few transitions
+    // Dashed: lower coverage OR many transitions (periodic gaps)
+    const SOLID_MIN_COVERAGE: f32 = 0.65;
+    const DASHED_MAX_COVERAGE: f32 = 0.55;
+    const DASHED_MIN_TRANSITIONS: u32 = 4;
+
+    let left_is_solid =
+        left_coverage >= SOLID_MIN_COVERAGE && left_gap_transitions < DASHED_MIN_TRANSITIONS;
+    let right_is_solid =
+        right_coverage >= SOLID_MIN_COVERAGE && right_gap_transitions < DASHED_MIN_TRANSITIONS;
+    let left_is_dashed =
+        left_coverage < DASHED_MAX_COVERAGE || left_gap_transitions >= DASHED_MIN_TRANSITIONS;
+    let right_is_dashed =
+        right_coverage < DASHED_MAX_COVERAGE || right_gap_transitions >= DASHED_MIN_TRANSITIONS;
+
+    // ── Step 4: Reclassify if mixed ─────────────────────────────────
+    if left_is_solid && right_is_dashed && !right_is_solid {
+        // Solid on left (opposing), dashed on right (ego side) → ego CAN pass
+        marking.class_id = 99;
+        marking.class_name = "mixed_double_yellow_dashed_right".to_string();
+        marking.legality = LineLegality::Legal;
+        info!(
+            "🔍 v6.1g mask→mixed: solid_double_yellow → dashed_right (Legal) \
+             | L: {:.0}% cov, {} trans | R: {:.0}% cov, {} trans | {} rows",
+            left_coverage * 100.0,
+            left_gap_transitions,
+            right_coverage * 100.0,
+            right_gap_transitions,
+            total_rows,
+        );
+    } else if right_is_solid && left_is_dashed && !left_is_solid {
+        // Dashed on left (opposing), solid on right (ego side) → ego CANNOT pass
+        marking.class_id = 99;
+        marking.class_name = "mixed_double_yellow_solid_right".to_string();
+        marking.legality = LineLegality::CriticalIllegal;
+        info!(
+            "🔍 v6.1g mask→mixed: solid_double_yellow → solid_right (CriticalIllegal) \
+             | L: {:.0}% cov, {} trans | R: {:.0}% cov, {} trans | {} rows",
+            left_coverage * 100.0,
+            left_gap_transitions,
+            right_coverage * 100.0,
+            right_gap_transitions,
+            total_rows,
+        );
+    } else {
+        // Both solid or ambiguous → keep as solid_double_yellow (class 8, no change)
+        debug!(
+            "🔍 v6.1g mask: solid_double_yellow confirmed double-solid \
+             | L: {:.0}% cov, {} trans | R: {:.0}% cov, {} trans | {} rows",
+            left_coverage * 100.0,
+            left_gap_transitions,
+            right_coverage * 100.0,
+            right_gap_transitions,
+            total_rows,
+        );
     }
 }
 
@@ -1134,11 +1350,23 @@ impl LaneLegalityDetector {
             });
         }
 
+        // Step 1: Color verification (existing)
         for marking in &mut detections {
             verify_line_color(frame_rgb, orig_w, orig_h, marking);
         }
 
+        // Step 2: v6.1g — Mask-based mixed line detection
+        // Check if any solid_double_yellow (class 8) is actually a mixed line
+        // by analyzing the segmentation mask for dashed stripe patterns.
+        // Must run BEFORE merge_composite_lines so that reclassified mixed
+        // lines (now class 99) don't get suppressed by double-solid guards.
+        for marking in &mut detections {
+            analyze_double_line_for_mixed(marking, scale, pad_x, pad_y);
+        }
+
+        // Step 3: Merge separate solid+dashed detection pairs into mixed (existing)
         let detections = merge_composite_lines(detections);
+        // Step 4: NMS (existing)
         let detections = nms_markings(detections, 0.45);
         Ok(detections)
     }
@@ -1252,3 +1480,4 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
+
