@@ -877,10 +877,7 @@ impl PolynomialBoundaryTracker {
                 Some(innov)
             } else {
                 self.left_kf.predict_with_ego(ego_lateral_velocity_px);
-                self.update_boundary_state_predict(
-                    &mut self.left_state,
-                    self.left_kf.frames_stale(),
-                );
+                self.update_boundary_state_predict_left();
                 self.total_left_predictions += 1;
                 None
             }
@@ -955,15 +952,6 @@ impl PolynomialBoundaryTracker {
         self.right_state = if !self.right_kf.is_initialized() {
             BoundaryState::Uninitialized
         } else if stale > self.config.kf.max_predict_frames {
-            BoundaryState::Expired
-        } else {
-            BoundaryState::Predicting
-        };
-    }
-
-    fn update_boundary_state_predict(state: &mut BoundaryState, stale_frames: u32) {
-        // Static helper — not used for left/right since we need &mut self for kf access
-        *state = if stale_frames > 20 {
             BoundaryState::Expired
         } else {
             BoundaryState::Predicting
