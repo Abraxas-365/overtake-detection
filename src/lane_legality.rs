@@ -463,19 +463,39 @@ fn analyze_double_line_for_mixed(
 
     // ── Step 3: Classify each half ──────────────────────────────────
     // Solid: high coverage + few transitions
-    // Dashed: lower coverage OR many transitions (periodic gaps)
+    // Dashed: low coverage AND many transitions (both conditions required)
+    //
+    // v6.1g-fix: The original OR logic caused false positives on true double
+    // solid lines — mask quantization noise at certain perspectives produces
+    // ≥4 gap transitions even on solid stripes. Requiring BOTH low coverage
+    // AND frequent gaps eliminates these false reclassifications.
     const SOLID_MIN_COVERAGE: f32 = 0.65;
     const DASHED_MAX_COVERAGE: f32 = 0.55;
-    const DASHED_MIN_TRANSITIONS: u32 = 4;
+    const DASHED_MIN_TRANSITIONS: u32 = 6;
 
     let left_is_solid =
         left_coverage >= SOLID_MIN_COVERAGE && left_gap_transitions < DASHED_MIN_TRANSITIONS;
     let right_is_solid =
         right_coverage >= SOLID_MIN_COVERAGE && right_gap_transitions < DASHED_MIN_TRANSITIONS;
+    // v6.1g-fix: AND instead of OR — a stripe is only dashed when it has
+    // BOTH low coverage AND frequent gaps. This prevents mask noise
+    // (high transitions on a solid stripe) from triggering false mixed.
     let left_is_dashed =
-        left_coverage < DASHED_MAX_COVERAGE || left_gap_transitions >= DASHED_MIN_TRANSITIONS;
+        left_coverage < DASHED_MAX_COVERAGE && left_gap_transitions >= DASHED_MIN_TRANSITIONS;
     let right_is_dashed =
-        right_coverage < DASHED_MAX_COVERAGE || right_gap_transitions >= DASHED_MIN_TRANSITIONS;
+        right_coverage < DASHED_MAX_COVERAGE && right_gap_transitions >= DASHED_MIN_TRANSITIONS;
+
+    // v6.1g-fix: Safety guard — if both halves have high coverage (>= 60%),
+    // this is almost certainly a true double solid. Don't reclassify even
+    // if one half has noisy transitions.
+    if left_coverage >= 0.60 && right_coverage >= 0.60 {
+        debug!(
+            "🔍 v6.1g: both halves high coverage ({:.0}%/{:.0}%) — keeping as solid_double_yellow",
+            left_coverage * 100.0,
+            right_coverage * 100.0,
+        );
+        return;
+    }
 
     // ── Step 4: Reclassify if mixed ─────────────────────────────────
     if left_is_solid && right_is_dashed && !right_is_solid {
@@ -668,7 +688,7 @@ pub struct LaneLegalityDetector {
 
     /// v4.13: Raw lane-line markings from the last boundary estimation call.
     /// Stored so the curvature estimator can access their masks without re-running inference.
-    pub last_lane_markings: Vec<DetectedRoadMarking>,
+    last_lane_markings: Vec<DetectedRoadMarking>,
     /// v4.13: Original image dimensions from the last call (for mask coordinate conversion).
     last_image_dims: (usize, usize),
     /// v4.13: Polynomial curvature estimate from mask geometry.
@@ -832,6 +852,16 @@ impl LaneLegalityDetector {
     /// mask points, poor fit quality, or no lane markings detected).
     pub fn curvature_estimate(&self) -> Option<&CurvatureEstimate> {
         self.last_curvature.as_ref()
+    }
+
+    /// v6.1d: Access the raw lane-line markings from the last inference run.
+    ///
+    /// These are available even when `estimate_ego_lane_boundaries` returns None,
+    /// because the YOLO-seg model detected individual markings that just didn't
+    /// form a valid boundary pair. Use as fallback for crossing detection when
+    /// the detection cache has expired.
+    pub fn last_lane_markings(&self) -> &[DetectedRoadMarking] {
+        &self.last_lane_markings
     }
 
     /// v4.13: Compute polynomial curvature from stored mask data.
@@ -1480,3 +1510,4 @@ fn calculate_iou_arr(a: &[f32; 4], b: &[f32; 4]) -> f32 {
         0.0
     }
 }
+
