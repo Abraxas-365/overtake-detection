@@ -258,7 +258,15 @@ impl LineCrossingDetector {
             return None;
         }
 
-        let ego_center_x = self.frame_width / 2.0;
+        // v6.1f: Use ego lane midpoint instead of frame center.
+        // On curves, markings shift far from frame center — using a fixed
+        // center makes the ego zone miss all markings entirely.
+        let ego_center_x = match (ego_left_x, ego_right_x) {
+            (Some(l), Some(r)) => (l + r) / 2.0,
+            (Some(l), None) => l + self.config.ego_half_width_px * 2.0,
+            (None, Some(r)) => r - self.config.ego_half_width_px * 2.0,
+            (None, None) => self.frame_width / 2.0,
+        };
         let reference_y = self.frame_height * self.config.reference_y_ratio;
         let ego_zone_left = ego_center_x - self.config.ego_half_width_px;
         let ego_zone_right = ego_center_x + self.config.ego_half_width_px;
