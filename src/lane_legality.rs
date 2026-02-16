@@ -329,7 +329,7 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
                 && matches!(b.class_id, 9 | 10))
                 || (matches!(a.class_id, 9 | 10) && matches!(b.class_id, 4 | 5));
 
-            if is_pair_double_dashed || is_pair_solid_dashed {
+            if is_pair_solid_dashed {
                 let iou = calculate_iou_arr(&a.bbox, &b.bbox);
                 let cx_a = (a.bbox[0] + a.bbox[2]) / 2.0;
                 let cx_b = (b.bbox[0] + b.bbox[2]) / 2.0;
