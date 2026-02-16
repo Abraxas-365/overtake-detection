@@ -3,6 +3,10 @@
 // v5.2: Direct YOLO-based lane crossing detection + detection frame cache.
 // v6.1: Min penetration filter, per-side debounce, increased cooldown.
 //       Crossings are now conservative — only meaningful overlap fires.
+// v6.1g: Class 99 mixed line legality resolution from class name.
+// v6.1h: Mask-based crossing detection — uses YOLO-seg pixel masks instead
+//        of bounding boxes for more precise overlap/penetration computation.
+//        Handles dashed gaps, curves, and mixed lines correctly.
 //
 // ════════════════════════════════════════════════════════════════════════════
 // PART 1: LINE CROSSING DETECTOR
@@ -51,6 +55,115 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 use crate::road_classification::{MarkingInfo, PassingLegality};
+
+// ============================================================================
+// v6.1h: MASK-BASED OVERLAP HELPERS
+// ============================================================================
+// The YOLO-seg model outputs a 160×160 binary mask per detection.
+// Instead of checking bbox rectangles (coarse, ignores gaps in dashed lines),
+// we check actual mask pixels at the reference Y line for precise overlap.
+
+/// YOLO-seg model input/output sizes (must match lane_legality.rs)
+const MASK_DIM: usize = 160;
+const SEG_INPUT: usize = 640;
+
+/// Compute letterbox transform parameters from frame dimensions.
+/// Returns (scale, pad_x, pad_y) to convert original → 640-space.
+fn compute_letterbox_params(frame_width: f32, frame_height: f32) -> (f32, f32, f32) {
+    let scale = (SEG_INPUT as f32 / frame_width).min(SEG_INPUT as f32 / frame_height);
+    let scaled_w = frame_width * scale;
+    let scaled_h = frame_height * scale;
+    let pad_x = (SEG_INPUT as f32 - scaled_w) / 2.0;
+    let pad_y = (SEG_INPUT as f32 - scaled_h) / 2.0;
+    (scale, pad_x, pad_y)
+}
+
+/// Convert an original-image X coordinate to mask space (0–159).
+#[inline]
+fn orig_x_to_mask(x: f32, scale: f32, pad_x: f32) -> f32 {
+    (x * scale + pad_x) * (MASK_DIM as f32 / SEG_INPUT as f32)
+}
+
+/// Convert an original-image Y coordinate to mask space (0–159).
+#[inline]
+fn orig_y_to_mask(y: f32, scale: f32, pad_y: f32) -> f32 {
+    (y * scale + pad_y) * (MASK_DIM as f32 / SEG_INPUT as f32)
+}
+
+/// v6.1h: Check mask-pixel overlap between the ego zone and a marking's
+/// segmentation mask at the reference Y line.
+///
+/// Returns `Some(penetration_ratio)` if mask pixels exist in the ego zone,
+/// or `None` if the marking has no mask data (fallback to bbox overlap).
+///
+/// The penetration ratio is computed as:
+///   (mask pixels in ego zone) / (total mask pixels at reference Y)
+/// This is more precise than bbox overlap because:
+///   - Dashed lines have gaps → no mask pixels in gaps → no false overlap
+///   - Curved lines → mask follows curve shape, not a rectangle
+///   - Mixed lines → can check which stripe has pixels in ego zone
+fn check_mask_overlap(
+    marking: &MarkingInfo,
+    reference_y: f32,
+    ego_zone_left: f32,
+    ego_zone_right: f32,
+    frame_width: f32,
+    frame_height: f32,
+) -> Option<f32> {
+    // Need mask data
+    if marking.mask.is_empty() || marking.mask_width == 0 || marking.mask_height == 0 {
+        return None;
+    }
+
+    let mw = marking.mask_width; // 160
+    let mh = marking.mask_height; // 160
+
+    let (scale, pad_x, pad_y) = compute_letterbox_params(frame_width, frame_height);
+
+    // Convert reference Y and ego zone to mask coordinates
+    let mask_ref_y = orig_y_to_mask(reference_y, scale, pad_y);
+    let mask_ego_left = orig_x_to_mask(ego_zone_left, scale, pad_x);
+    let mask_ego_right = orig_x_to_mask(ego_zone_right, scale, pad_x);
+
+    // Sample 3 rows around reference_y for robustness (mask resolution is coarse)
+    let y_center = mask_ref_y.round() as usize;
+    let y_start = y_center.saturating_sub(1);
+    let y_end = (y_center + 1).min(mh - 1);
+
+    let mx_left = (mask_ego_left.floor() as usize).max(0).min(mw - 1);
+    let mx_right = (mask_ego_right.ceil() as usize).max(0).min(mw - 1);
+
+    if mx_right <= mx_left {
+        return None;
+    }
+
+    // Count mask pixels in ego zone and total across the reference rows
+    let mut pixels_in_ego = 0u32;
+    let mut pixels_total = 0u32;
+
+    for my in y_start..=y_end {
+        // Count all active pixels in this row (for total width measurement)
+        for mx in 0..mw {
+            let idx = my * mw + mx;
+            if idx < marking.mask.len() && marking.mask[idx] == 255 {
+                pixels_total += 1;
+                // Is this pixel in the ego zone?
+                if mx >= mx_left && mx <= mx_right {
+                    pixels_in_ego += 1;
+                }
+            }
+        }
+    }
+
+    if pixels_total == 0 {
+        // No mask pixels at reference Y — marking doesn't exist at this row.
+        // This is the key improvement over bbox: dashed line gaps return None here.
+        return Some(0.0);
+    }
+
+    let penetration = pixels_in_ego as f32 / pixels_total as f32;
+    Some(penetration)
+}
 
 // ============================================================================
 // TYPES
@@ -311,18 +424,43 @@ impl LineCrossingDetector {
                 continue;
             }
 
-            // Check horizontal overlap with ego zone
-            let overlap_left = ego_zone_left.max(m_left);
-            let overlap_right = ego_zone_right.min(m_right);
-            let horizontal_overlap = overlap_right - overlap_left;
-
-            if horizontal_overlap <= 0.0 {
-                continue;
-            }
-
-            // Compute penetration ratio (how centered is ego on the marking)
-            let marking_width = (m_right - m_left).max(1.0);
-            let penetration = horizontal_overlap / marking_width;
+            // v6.1h: Try mask-based overlap first (pixel-precise).
+            // Falls back to bbox overlap if no mask data available.
+            let penetration = if !marking.mask.is_empty() {
+                // Mask-based: check actual segmentation pixels at reference Y
+                match check_mask_overlap(
+                    marking,
+                    reference_y,
+                    ego_zone_left,
+                    ego_zone_right,
+                    self.frame_width,
+                    self.frame_height,
+                ) {
+                    Some(mask_pen) if mask_pen > 0.0 => mask_pen,
+                    Some(_) => continue, // mask pixels exist but none in ego zone (or gap in dashed line)
+                    None => {
+                        // Mask check inconclusive — fall back to bbox
+                        let overlap_left = ego_zone_left.max(m_left);
+                        let overlap_right = ego_zone_right.min(m_right);
+                        let horizontal_overlap = overlap_right - overlap_left;
+                        if horizontal_overlap <= 0.0 {
+                            continue;
+                        }
+                        let marking_width = (m_right - m_left).max(1.0);
+                        horizontal_overlap / marking_width
+                    }
+                }
+            } else {
+                // No mask data — use bbox overlap (original behavior)
+                let overlap_left = ego_zone_left.max(m_left);
+                let overlap_right = ego_zone_right.min(m_right);
+                let horizontal_overlap = overlap_right - overlap_left;
+                if horizontal_overlap <= 0.0 {
+                    continue;
+                }
+                let marking_width = (m_right - m_left).max(1.0);
+                horizontal_overlap / marking_width
+            };
 
             // Determine the marking's role
             let role = classify_line_role(
