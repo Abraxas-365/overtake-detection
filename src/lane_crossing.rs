@@ -951,8 +951,18 @@ fn marking_to_passing_legality(marking: &MarkingInfo) -> PassingLegality {
         7 | 8 => PassingLegality::Prohibited,
         // Dashed → allowed
         9 | 10 => PassingLegality::Allowed,
-        // Mixed → need more context (from road classifier)
-        99 => PassingLegality::Unknown,
+        // v6.1g: Mixed → resolve from class name (set by mask analysis or merge logic)
+        99 => {
+            if marking.class_name.contains("dashed_right") {
+                // Dashed stripe on ego side (right in Peru) → allowed to pass
+                PassingLegality::Allowed
+            } else if marking.class_name.contains("solid_right") {
+                // Solid stripe on ego side → prohibited
+                PassingLegality::Prohibited
+            } else {
+                PassingLegality::Unknown
+            }
+        }
         _ => PassingLegality::Unknown,
     }
 }
