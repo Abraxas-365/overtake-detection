@@ -32,6 +32,7 @@ use super::polynomial_tracker::{
     GeometricLaneChangeSignals, PolynomialBoundaryTracker, PolynomialTrackerConfig,
 };
 use super::vehicle_tracker::{DetectionInput, Track, TrackerConfig, VehicleTracker};
+use crate::analysis::curvature_estimator::LanePolynomial;
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use tracing::{debug, info, warn};
 
@@ -294,7 +295,12 @@ impl ManeuverPipeline {
         // ══════════════════════════════════════════════════════════════════
         let ego_x = self.frame_w / 2.0;
 
-        // Extract polynomial fits from the curvature estimate (if present in measurement)
+        // Extract polynomial fits from the curvature estimate (if present in measurement).
+        // When the curvature estimator can't produce a polynomial (e.g., dashed line
+        // with too few spine points), synthesize a straight-line polynomial from the
+        // known boundary positions. This gives the Kalman tracker a position anchor
+        // while the adaptive R scaling (12× noise for synthetic) ensures the filter
+        // trusts its shape prediction over the synthetic measurement.
         let left_poly = input
             .lane_measurement
             .as_ref()
@@ -306,12 +312,49 @@ impl ManeuverPipeline {
             .and_then(|m| m.curvature.as_ref())
             .and_then(|c| c.right_poly);
 
+        // Derive boundary positions for synthetic fallback
+        let (left_boundary_x, right_boundary_x) = if let Some(ref meas) = input.lane_measurement {
+            if meas.both_lanes && meas.lane_width_px > 50.0 && meas.confidence > 0.3 {
+                let center_x = ego_x - meas.lateral_offset_px;
+                let half_w = meas.lane_width_px / 2.0;
+                (Some(center_x - half_w), Some(center_x + half_w))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        // Synthesize straight-line polys for boundaries missing polynomial fits.
+        // a=0, b=0, c=boundary_x | high RMSE + low points → KF adaptive R will
+        // scale measurement noise 12× so the filter trusts prediction for shape.
+        let effective_left = left_poly.or_else(|| {
+            left_boundary_x.map(|x| LanePolynomial {
+                a: 0.0,
+                b: 0.0,
+                c: x,
+                rmse_px: 15.0, // synthetic — triggers high measurement noise
+                num_points: 5, // synthetic — above min_fit_points threshold
+                vertical_span_px: 200.0,
+            })
+        });
+        let effective_right = right_poly.or_else(|| {
+            right_boundary_x.map(|x| LanePolynomial {
+                a: 0.0,
+                b: 0.0,
+                c: x,
+                rmse_px: 15.0,
+                num_points: 5,
+                vertical_span_px: 200.0,
+            })
+        });
+
         // Update the polynomial tracker
         let geo_signals = self
             .poly_tracker
             .update(
-                left_poly.as_ref(),
-                right_poly.as_ref(),
+                effective_left.as_ref(),
+                effective_right.as_ref(),
                 self.last_ego_estimate.lateral_velocity_px,
                 ego_x,
             )

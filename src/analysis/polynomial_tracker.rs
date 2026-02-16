@@ -385,7 +385,7 @@ impl Default for PolyKFConfig {
             r_base_a: 1.0,
             r_base_b: 0.1,
             r_base_c: 0.05,
-            max_predict_frames: 20,
+            max_predict_frames: 50, // 2s at 25fps — bridges dashed-line dropout on curves
             initial_p_coeff: 100.0,
             initial_p_rate: 10.0,
         }
@@ -429,7 +429,7 @@ impl Default for PolynomialTrackerConfig {
             kf: PolyKFConfig::default(),
             min_fit_rmse: 0.0,
             max_fit_rmse: 25.0,
-            min_fit_points: 8,
+            min_fit_points: 5, // dashed markings on curves produce shorter spines
             boundary_divergence_threshold: 3.0,
             lane_width_rate_threshold: 2.0,
             offset_divergence_threshold: 0.08,
