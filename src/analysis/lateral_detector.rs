@@ -144,8 +144,8 @@ impl Default for LateralDetectorConfig {
             curve_coherence_threshold: 0.65,
             curve_shift_threshold_multiplier: 1.8,
             curve_min_sustained_frames: 5,
-            curve_ego_velocity_multiplier: 2.0,  // v4.12: double ego thresholds on curves
-            curve_ego_cooldown_frames: 15,        // v4.12: ~500ms at 30fps
+            curve_ego_velocity_multiplier: 2.0, // v4.12: double ego thresholds on curves
+            curve_ego_cooldown_frames: 15,      // v4.12: ~500ms at 30fps
 
             // v4.11 adaptive baseline defaults
             adaptive_baseline_alpha_max: 0.04,
@@ -323,7 +323,7 @@ pub struct LateralShiftDetector {
     curve_sustained_frames: u32,      // consecutive frames above coherence threshold
     in_curve_mode: bool,              // whether thresholds are currently raised
     // v4.12: Curve ego suppression
-    frames_since_curve_mode: u32,     // frames since curve mode was last active
+    frames_since_curve_mode: u32, // frames since curve mode was last active
     // v4.13b: Whether curve mode was active at ANY point during the current shift.
     // Catches false positives that start/complete during brief curve-mode gaps.
     shift_saw_curve_mode: bool,
@@ -462,8 +462,9 @@ impl LateralShiftDetector {
         // the multi-frame lag that let early-curve false positives through.
         if curvature_says_curve && curvature.unwrap().confidence > 0.5 {
             self.in_curve_mode = true;
-            self.curve_sustained_frames =
-                self.curve_sustained_frames.max(self.config.curve_min_sustained_frames);
+            self.curve_sustained_frames = self
+                .curve_sustained_frames
+                .max(self.config.curve_min_sustained_frames);
         } else {
             // Standard sustained-frame gate for coherence-only path
             self.in_curve_mode =
@@ -478,12 +479,20 @@ impl LateralShiftDetector {
         }
 
         if self.in_curve_mode && !was_curve {
-            let source = if curvature_says_curve { "poly_curvature" } else { "coherence" };
+            let source = if curvature_says_curve {
+                "poly_curvature"
+            } else {
+                "coherence"
+            };
             let curv_info = curvature
-                .map(|c| format!(
-                    "agree={:.2} mean_a={:.6} dir={}",
-                    c.curvature_agreement, c.mean_curvature, c.curve_direction.as_str()
-                ))
+                .map(|c| {
+                    format!(
+                        "agree={:.2} mean_a={:.6} dir={}",
+                        c.curvature_agreement,
+                        c.mean_curvature,
+                        c.curve_direction.as_str()
+                    )
+                })
                 .unwrap_or_else(|| "N/A".to_string());
             info!(
                 "🔄 Curve mode ACTIVATED [{}]: coherence={:.2} sustained={}f | curv=[{}] | thresholds ×{:.1} | ego ×{:.1}",
@@ -584,12 +593,9 @@ impl LateralShiftDetector {
         }
 
         // v4.13b: Expire pending return expectation
-        if self.pending_return_direction.is_some()
-            && timestamp_ms > self.pending_return_deadline_ms
+        if self.pending_return_direction.is_some() && timestamp_ms > self.pending_return_deadline_ms
         {
-            debug!(
-                "🔄 Return expectation expired (no return detected within window)"
-            );
+            debug!("🔄 Return expectation expired (no return detected within window)");
             self.pending_return_direction = None;
         }
 
@@ -614,7 +620,7 @@ impl LateralShiftDetector {
             self.frames_without_lanes = 0;
             self.last_lane_width_px = m.lane_width_px;
             self.ego_bridge_frames = 0; // lanes back, bridge ends
-            // v4.10: Update cache with fresh measurement
+                                        // v4.10: Update cache with fresh measurement
             self.cached_measurement = Some(m.clone());
             self.cached_measurement_age = 0;
         } else {
@@ -1078,10 +1084,7 @@ impl LateralShiftDetector {
         let eff_confirm = self.effective_shift_confirm_threshold();
 
         if let Some(current_dir) = self.shift_direction {
-            if self.shift_frames <= 30
-                && lane_direction != current_dir
-                && abs_dev > eff_confirm
-            {
+            if self.shift_frames <= 30 && lane_direction != current_dir && abs_dev > eff_confirm {
                 // Lane says opposite direction. Check ego.
                 let ego_direction = if self.ego_cumulative_px < 0.0 {
                     ShiftDirection::Left
@@ -1341,6 +1344,22 @@ impl LateralShiftDetector {
         };
         let ego_trustworthy = ego_confidence_ratio >= CURVE_EGO_MIN_CONFIDENCE_RATIO;
 
+        // v6.1: Use DIRECTIONAL ego displacement for curve veto.
+        //
+        // On curves, rotational flow accumulates in one direction. A shift
+        // RIGHT with ego moving LEFT means ego OPPOSES the shift — this is
+        // stronger evidence of perspective distortion, not weaker.
+        //
+        // directional_ego > 0: ego confirms shift direction
+        // directional_ego <= 0: ego opposes → always veto
+        // directional_ego < threshold: insufficient confirming motion → veto
+        let shift_sign = match self.shift_direction {
+            Some(ShiftDirection::Right) => 1.0f32,
+            Some(ShiftDirection::Left) => -1.0f32,
+            None => 1.0f32,
+        };
+        let directional_ego = self.ego_cumulative_peak_px * shift_sign;
+
         // v4.13b: Check if this shift matches the expected return direction.
         // After a confirmed LC, the return is overwhelmingly likely to be real,
         // not a curve artifact. Bypass the veto for expected returns.
@@ -1364,12 +1383,12 @@ impl LateralShiftDetector {
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
             && ego_trustworthy
-            && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
+            && directional_ego < curve_ego_threshold
             && !is_expected_return
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
-                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}) | \
+                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}) | \
                  dur={:.1}s | curve_now={} curve_saw={} | ego_conf={}/{} ({:.0}%) → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
@@ -1377,6 +1396,7 @@ impl LateralShiftDetector {
                 self.shift_peak_offset * 100.0,
                 self.ego_cumulative_px,
                 self.ego_cumulative_peak_px,
+                directional_ego,
                 curve_ego_threshold,
                 CURVE_EGO_MIN_FLOOR_PX,
                 duration_s,
@@ -1396,12 +1416,12 @@ impl LateralShiftDetector {
         // v4.13b: Diagnostic logs for when veto WOULD have fired but was bypassed.
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
-            && self.ego_cumulative_peak_px.abs() < curve_ego_threshold
+            && directional_ego < curve_ego_threshold
         {
             if is_expected_return {
                 warn!(
                     "⚠️ Curve veto BYPASSED (expected return): shift {} | \
-                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
+                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px threshold | \
                      return expected after prior LC → allowing (one-shot, consumed)",
                     self.shift_direction
                         .unwrap_or(ShiftDirection::Left)
@@ -1409,12 +1429,13 @@ impl LateralShiftDetector {
                     self.shift_peak_offset * 100.0,
                     self.ego_cumulative_px,
                     self.ego_cumulative_peak_px,
+                    directional_ego,
                     curve_ego_threshold,
                 );
             } else if !ego_trustworthy {
                 warn!(
                     "⚠️ Curve veto BYPASSED (ego untrustworthy): shift {} | \
-                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px) < {:.0}px threshold | \
+                     peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px threshold | \
                      ego_conf={}/{} ({:.0}%) < {:.0}% min → allowing despite curve",
                     self.shift_direction
                         .unwrap_or(ShiftDirection::Left)
@@ -1422,6 +1443,7 @@ impl LateralShiftDetector {
                     self.shift_peak_offset * 100.0,
                     self.ego_cumulative_px,
                     self.ego_cumulative_peak_px,
+                    directional_ego,
                     curve_ego_threshold,
                     self.ego_shift_confident_frames,
                     self.shift_frames,
@@ -1445,6 +1467,39 @@ impl LateralShiftDetector {
                 return None;
             }
         };
+
+        // v6.1: Direction-correction veto for curve-tainted shifts.
+        //
+        // When lane says direction A but ego says direction B during a curve,
+        // the lane-detected shift in direction A is perspective distortion.
+        // The ego motion in direction B may be real, but it should be detected
+        // as its OWN shift starting natively in direction B — not as a
+        // direction-corrected version of the A-direction shift.
+        //
+        // Evidence from production:
+        //   F574: RIGHT→LEFT corrected, peak=266.8% (RIGHT measurement, meaningless for LEFT)
+        //   F609: RIGHT→LEFT corrected, peak=635.1% (same issue)
+        //   F701: Native LEFT, peak=152.4%, ego=-114.4px → real lane change
+        //
+        // Without this veto, each corrected shift triggers overtake classification
+        // and creates duplicate LC events. The real motion always gets detected
+        // natively (F701), so the corrected shifts are pure duplicates.
+        let initial_dir = self.shift_direction.unwrap_or(ShiftDirection::Left);
+        if curve_tainted && validated_direction != initial_dir {
+            warn!(
+                "❌ Curve direction-correction VETO: shift {} corrected to {} during curve | \
+                 peak={:.1}% | ego_cum={:.1}px | dur={:.1}s → perspective distortion + real motion \
+                 in opposite direction; will be detected natively",
+                initial_dir.as_str(),
+                validated_direction.as_str(),
+                self.shift_peak_offset * 100.0,
+                self.ego_cumulative_px,
+                duration_ms / 1000.0,
+            );
+            self.state = State::Stable;
+            self.reset_shift();
+            return None;
+        }
 
         let avg_confidence = if self.shift_frames > 0 {
             self.shift_confidence_sum / self.shift_frames as f32
@@ -1734,8 +1789,8 @@ impl LateralShiftDetector {
             let signed_deltas: Vec<f32> = recent.windows(2).map(|w| w[0] - w[1]).collect();
             let positive_count = signed_deltas.iter().filter(|d| **d > 0.0).count();
             let negative_count = signed_deltas.iter().filter(|d| **d < 0.0).count();
-            let direction_consistency = positive_count.max(negative_count) as f32
-                / signed_deltas.len().max(1) as f32;
+            let direction_consistency =
+                positive_count.max(negative_count) as f32 / signed_deltas.len().max(1) as f32;
 
             if variance < self.config.adaptive_baseline_max_variance
                 && avg_drift > self.config.adaptive_baseline_min_drift
@@ -1745,11 +1800,9 @@ impl LateralShiftDetector {
                 let drift_factor = ((avg_drift - self.config.adaptive_baseline_min_drift)
                     / (self.config.adaptive_baseline_min_drift * 5.0))
                     .min(1.0);
-                let variance_factor = (1.0
-                    - variance / self.config.adaptive_baseline_max_variance)
-                    .max(0.0);
-                let consistency_factor =
-                    ((direction_consistency - 0.6) / 0.4).min(1.0);
+                let variance_factor =
+                    (1.0 - variance / self.config.adaptive_baseline_max_variance).max(0.0);
+                let consistency_factor = ((direction_consistency - 0.6) / 0.4).min(1.0);
 
                 let boost = drift_factor * variance_factor * consistency_factor;
                 let adaptive_alpha =
@@ -2188,3 +2241,4 @@ mod tests {
         );
     }
 }
+
