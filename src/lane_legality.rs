@@ -325,9 +325,6 @@ fn merge_composite_lines(dets: Vec<DetectedRoadMarking>) -> Vec<DetectedRoadMark
             }
             let b = &dets[j];
 
-            let is_pair_double_dashed = (matches!(a.class_id, 7 | 8)
-                && matches!(b.class_id, 9 | 10))
-                || (matches!(a.class_id, 9 | 10) && matches!(b.class_id, 7 | 8));
             let is_pair_solid_dashed = (matches!(a.class_id, 4 | 5)
                 && matches!(b.class_id, 9 | 10))
                 || (matches!(a.class_id, 9 | 10) && matches!(b.class_id, 4 | 5));

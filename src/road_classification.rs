@@ -95,10 +95,16 @@ impl PassingLegality {
         }
     }
     pub fn is_legal(&self) -> bool {
-        matches!(self, PassingLegality::Allowed | PassingLegality::MixedAllowed)
+        matches!(
+            self,
+            PassingLegality::Allowed | PassingLegality::MixedAllowed
+        )
     }
     pub fn is_illegal(&self) -> bool {
-        matches!(self, PassingLegality::Prohibited | PassingLegality::MixedProhibited)
+        matches!(
+            self,
+            PassingLegality::Prohibited | PassingLegality::MixedProhibited
+        )
     }
 }
 
@@ -183,7 +189,11 @@ impl RoadClassifier {
 
     pub fn update(&mut self, markings: &[MarkingInfo]) -> &RoadClassification {
         let instant = self.classify_single_frame(markings);
-        self.push_history(instant.road_type, instant.passing_legality, instant.mixed_line_side);
+        self.push_history(
+            instant.road_type,
+            instant.passing_legality,
+            instant.mixed_line_side,
+        );
 
         self.last_stable = RoadClassification {
             road_type: self.majority_road_type(),
@@ -196,7 +206,9 @@ impl RoadClassifier {
         &self.last_stable
     }
 
-    pub fn current(&self) -> &RoadClassification { &self.last_stable }
+    pub fn current(&self) -> &RoadClassification {
+        &self.last_stable
+    }
 
     pub fn reset(&mut self) {
         self.road_type_history.clear();
@@ -207,36 +219,51 @@ impl RoadClassifier {
 
     fn push_history(&mut self, rt: RoadType, pl: PassingLegality, ms: Option<MixedLineSide>) {
         self.road_type_history.push_back(rt);
-        if self.road_type_history.len() > TEMPORAL_WINDOW { self.road_type_history.pop_front(); }
+        if self.road_type_history.len() > TEMPORAL_WINDOW {
+            self.road_type_history.pop_front();
+        }
         self.passing_history.push_back(pl);
-        if self.passing_history.len() > TEMPORAL_WINDOW { self.passing_history.pop_front(); }
+        if self.passing_history.len() > TEMPORAL_WINDOW {
+            self.passing_history.pop_front();
+        }
         self.mixed_side_history.push_back(ms);
-        if self.mixed_side_history.len() > TEMPORAL_WINDOW { self.mixed_side_history.pop_front(); }
+        if self.mixed_side_history.len() > TEMPORAL_WINDOW {
+            self.mixed_side_history.pop_front();
+        }
     }
 
     // ── Single-frame classification ──
 
     fn classify_single_frame(&self, markings: &[MarkingInfo]) -> RoadClassification {
-        if markings.is_empty() { return RoadClassification::default(); }
+        if markings.is_empty() {
+            return RoadClassification::default();
+        }
 
         let cl = self.frame_width * CENTER_ZONE_LEFT_RATIO;
         let cr = self.frame_width * CENTER_ZONE_RIGHT_RATIO;
 
-        let center: Vec<&MarkingInfo> = markings.iter()
+        let center: Vec<&MarkingInfo> = markings
+            .iter()
             .filter(|m| m.center_x >= cl && m.center_x <= cr && is_lane_line_class(m.class_id))
             .collect();
 
-        let right_lines = markings.iter()
+        let right_lines = markings
+            .iter()
             .filter(|m| m.center_x > cr && is_lane_line_class(m.class_id))
             .count();
 
-        let mixed = center.iter().find(|m| m.class_id == 99 || m.class_name.contains("mixed"));
+        let mixed = center
+            .iter()
+            .find(|m| m.class_id == 99 || m.class_name.contains("mixed"));
         let has_yellow = center.iter().any(|m| is_yellow_class(m));
         let has_white = center.iter().any(|m| is_white_class(m));
 
         let names: Vec<String> = center.iter().map(|m| m.class_name.clone()).collect();
-        let max_conf = center.iter().map(|m| m.confidence)
-            .max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(0.0);
+        let max_conf = center
+            .iter()
+            .map(|m| m.confidence)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(0.0);
 
         if let Some(m) = mixed {
             // ── MIXED LINE (línea mixta) ──
@@ -292,7 +319,10 @@ impl RoadClassifier {
             debug!("🚦 Línea mixta: continua DERECHA → ego NO puede adelantar");
             (PassingLegality::MixedProhibited, MixedLineSide::SolidRight)
         } else {
-            debug!("🚦 Línea mixta detectada, lado desconocido: '{}'. Conservador → PROHIBIDO.", m.class_name);
+            debug!(
+                "🚦 Línea mixta detectada, lado desconocido: '{}'. Conservador → PROHIBIDO.",
+                m.class_name
+            );
             (PassingLegality::MixedProhibited, MixedLineSide::Unknown)
         }
     }
@@ -317,25 +347,43 @@ impl RoadClassifier {
         let has_solid = center.iter().any(|m| matches!(m.class_id, 4 | 7));
         let has_dashed = center.iter().any(|m| m.class_id == 9);
 
-        if has_solid && !has_dashed { PassingLegality::Prohibited }
-        else if has_dashed && !has_solid { PassingLegality::Allowed }
-        else { PassingLegality::Unknown }
+        if has_solid && !has_dashed {
+            PassingLegality::Prohibited
+        } else if has_dashed && !has_solid {
+            PassingLegality::Allowed
+        } else {
+            PassingLegality::Unknown
+        }
     }
 
     // ── Temporal smoothing ──
 
     fn majority_road_type(&self) -> RoadType {
-        if self.road_type_history.len() < MIN_CONSENSUS_FRAMES { return RoadType::Unknown; }
+        if self.road_type_history.len() < MIN_CONSENSUS_FRAMES {
+            return RoadType::Unknown;
+        }
         let (mut tw, mut ow) = (0u32, 0u32);
         for rt in &self.road_type_history {
-            match rt { RoadType::TwoWay => tw += 1, RoadType::OneWay => ow += 1, _ => {} }
+            match rt {
+                RoadType::TwoWay => tw += 1,
+                RoadType::OneWay => ow += 1,
+                _ => {}
+            }
         }
         let th = self.road_type_history.len() as u32 / 2;
-        if tw > th { RoadType::TwoWay } else if ow > th { RoadType::OneWay } else { RoadType::Unknown }
+        if tw > th {
+            RoadType::TwoWay
+        } else if ow > th {
+            RoadType::OneWay
+        } else {
+            RoadType::Unknown
+        }
     }
 
     fn majority_passing(&self) -> PassingLegality {
-        if self.passing_history.len() < MIN_CONSENSUS_FRAMES { return PassingLegality::Unknown; }
+        if self.passing_history.len() < MIN_CONSENSUS_FRAMES {
+            return PassingLegality::Unknown;
+        }
         let (mut a, mut p, mut ma, mut mp) = (0u32, 0u32, 0u32, 0u32);
         for pl in &self.passing_history {
             match pl {
@@ -347,10 +395,18 @@ impl RoadClassifier {
             }
         }
         let th = self.passing_history.len() as u32 / 3;
-        let counts = [(PassingLegality::Allowed, a), (PassingLegality::Prohibited, p),
-                       (PassingLegality::MixedAllowed, ma), (PassingLegality::MixedProhibited, mp)];
+        let counts = [
+            (PassingLegality::Allowed, a),
+            (PassingLegality::Prohibited, p),
+            (PassingLegality::MixedAllowed, ma),
+            (PassingLegality::MixedProhibited, mp),
+        ];
         let best = counts.iter().max_by_key(|(_, c)| *c).unwrap();
-        if best.1 > th { best.0 } else { PassingLegality::Unknown }
+        if best.1 > th {
+            best.0
+        } else {
+            PassingLegality::Unknown
+        }
     }
 
     fn majority_mixed_side(&self) -> Option<MixedLineSide> {
@@ -362,15 +418,25 @@ impl RoadClassifier {
                 _ => {}
             }
         }
-        if dr == 0 && sr == 0 { None }
-        else if dr > sr { Some(MixedLineSide::DashedRight) }
-        else { Some(MixedLineSide::SolidRight) }
+        if dr == 0 && sr == 0 {
+            None
+        } else if dr > sr {
+            Some(MixedLineSide::DashedRight)
+        } else {
+            Some(MixedLineSide::SolidRight)
+        }
     }
 
     fn compute_confidence(&self) -> f32 {
-        if self.road_type_history.is_empty() { return 0.0; }
+        if self.road_type_history.is_empty() {
+            return 0.0;
+        }
         let cur = self.last_stable.road_type;
-        let agree = self.road_type_history.iter().filter(|&&rt| rt == cur).count();
+        let agree = self
+            .road_type_history
+            .iter()
+            .filter(|&&rt| rt == cur)
+            .count();
         agree as f32 / self.road_type_history.len() as f32
     }
 }
@@ -404,12 +470,16 @@ pub fn merge_composite_lines_v2(
     let mut used = HashSet::new();
 
     for i in 0..dets.len() {
-        if used.contains(&i) { continue; }
+        if used.contains(&i) {
+            continue;
+        }
         let a = &dets[i];
         let mut found = false;
 
-        for j in (i+1)..dets.len() {
-            if used.contains(&j) { continue; }
+        for j in (i + 1)..dets.len() {
+            if used.contains(&j) {
+                continue;
+            }
             let b = &dets[j];
 
             let yellow_pair = (is_solid_yellow(a.class_id) && is_dashed_yellow(b.class_id))
@@ -417,7 +487,9 @@ pub fn merge_composite_lines_v2(
             let white_pair = (is_solid_white(a.class_id) && is_dashed_white(b.class_id))
                 || (is_dashed_white(a.class_id) && is_solid_white(b.class_id));
 
-            if !yellow_pair && !white_pair { continue; }
+            if !yellow_pair && !white_pair {
+                continue;
+            }
 
             let cx_a = (a.bbox[0] + a.bbox[2]) / 2.0;
             let cx_b = (b.bbox[0] + b.bbox[2]) / 2.0;
@@ -425,9 +497,12 @@ pub fn merge_composite_lines_v2(
             let v_overlap = vertical_overlap_ratio(&a.bbox, &b.bbox);
 
             if dist_x < merge_dist && v_overlap > 0.3 {
-                let (solid, dashed) = if is_dashed_yellow(a.class_id) || is_dashed_white(a.class_id) {
+                let (solid, dashed) = if is_dashed_yellow(a.class_id) || is_dashed_white(a.class_id)
+                {
                     (b, a)
-                } else { (a, b) };
+                } else {
+                    (a, b)
+                };
 
                 let solid_cx = (solid.bbox[0] + solid.bbox[2]) / 2.0;
                 let dashed_cx = (dashed.bbox[0] + dashed.bbox[2]) / 2.0;
@@ -437,8 +512,10 @@ pub fn merge_composite_lines_v2(
                 m.class_id = 99;
                 m.confidence = (a.confidence + b.confidence) / 2.0;
                 m.bbox = [
-                    a.bbox[0].min(b.bbox[0]), a.bbox[1].min(b.bbox[1]),
-                    a.bbox[2].max(b.bbox[2]), a.bbox[3].max(b.bbox[3]),
+                    a.bbox[0].min(b.bbox[0]),
+                    a.bbox[1].min(b.bbox[1]),
+                    a.bbox[2].max(b.bbox[2]),
+                    a.bbox[3].max(b.bbox[3]),
                 ];
 
                 let prefix = if yellow_pair { "yellow" } else { "white" };
@@ -448,7 +525,10 @@ pub fn merge_composite_lines_v2(
                     format!("mixed_double_{}_solid_right", prefix)
                 };
 
-                debug!("🧩 Merged línea mixta: {} (dashed_right={})", m.class_name, dashed_is_right);
+                debug!(
+                    "🧩 Merged línea mixta: {} (dashed_right={})",
+                    m.class_name, dashed_is_right
+                );
                 merged.push(m);
                 used.insert(i);
                 used.insert(j);
@@ -456,26 +536,87 @@ pub fn merge_composite_lines_v2(
                 break;
             }
         }
-        if !found { merged.push(a.clone()); }
+        if !found {
+            merged.push(a.clone());
+        }
     }
-    merged
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // v6.1e: Suppress dashed detections that overlap with double-solid
+    // detections. When the model sees one line of a double-solid as
+    // "dashed" (common with worn paint at night), we keep the double-solid
+    // and drop the false dashed detection.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    let mut deduped = Vec::new();
+    let mut suppressed = HashSet::new();
+
+    for i in 0..merged.len() {
+        let a = &merged[i];
+        // Check if this is a dashed detection overlapping a double-solid
+        if matches!(a.class_id, 9 | 10) {
+            let cx_a = (a.bbox[0] + a.bbox[2]) / 2.0;
+            for j in 0..merged.len() {
+                if i == j {
+                    continue;
+                }
+                let b = &merged[j];
+                if matches!(b.class_id, 7 | 8) {
+                    let cx_b = (b.bbox[0] + b.bbox[2]) / 2.0;
+                    let dist = (cx_a - cx_b).abs();
+                    let v_overlap = vertical_overlap_ratio(&a.bbox, &b.bbox);
+                    if dist < merge_dist && v_overlap > 0.3 {
+                        // Suppress dashed — double-solid takes priority
+                        suppressed.insert(i);
+                        debug!(
+                            "🧹 Suppressed false {} near {} (dist={:.0}px)",
+                            a.class_name, b.class_name, dist
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (i, m) in merged.into_iter().enumerate() {
+        if !suppressed.contains(&i) {
+            deduped.push(m);
+        }
+    }
+
+    deduped
 }
 
 // ============================================================================
 // HELPERS
 // ============================================================================
 
-fn is_lane_line_class(id: usize) -> bool { matches!(id, 4|5|6|7|8|9|10|99) }
-fn is_solid_yellow(id: usize) -> bool { matches!(id, 5|8) }
-fn is_dashed_yellow(id: usize) -> bool { id == 10 }
-fn is_solid_white(id: usize) -> bool { matches!(id, 4|7) }
-fn is_dashed_white(id: usize) -> bool { id == 9 }
+fn is_lane_line_class(id: usize) -> bool {
+    matches!(id, 4 | 5 | 6 | 7 | 8 | 9 | 10 | 99)
+}
+
+fn is_solid_yellow(id: usize) -> bool {
+    id == 5
+}
+
+fn is_dashed_yellow(id: usize) -> bool {
+    id == 10
+}
+
+fn is_solid_white(id: usize) -> bool {
+    id == 4
+}
+
+fn is_dashed_white(id: usize) -> bool {
+    id == 9
+}
 
 fn is_yellow_class(m: &MarkingInfo) -> bool {
-    matches!(m.class_id, 5|8|10|99) || matches!(m.detected_color, Some(MarkingColor::Yellow))
+    matches!(m.class_id, 5 | 8 | 10 | 99) || matches!(m.detected_color, Some(MarkingColor::Yellow))
 }
 fn is_white_class(m: &MarkingInfo) -> bool {
-    matches!(m.class_id, 4|7|9) || matches!(m.detected_color, Some(MarkingColor::White))
+    matches!(m.class_id, 4 | 7 | 9) || matches!(m.detected_color, Some(MarkingColor::White))
 }
 
 fn vertical_overlap_ratio(a: &[f32; 4], b: &[f32; 4]) -> f32 {
@@ -494,7 +635,13 @@ mod tests {
     use super::*;
 
     fn mk(id: usize, name: &str, cx: f32, conf: f32) -> MarkingInfo {
-        MarkingInfo { class_id: id, class_name: name.into(), center_x: cx, confidence: conf, detected_color: None }
+        MarkingInfo {
+            class_id: id,
+            class_name: name.into(),
+            center_x: cx,
+            confidence: conf,
+            detected_color: None,
+        }
     }
 
     #[test]
@@ -539,10 +686,24 @@ mod tests {
     #[test]
     fn test_merge_creates_dashed_right() {
         let dets = vec![
-            DetectedRoadMarkingCompat { class_id: 5, class_name: "solid_single_yellow".into(),
-                confidence: 0.8, bbox: [600.0, 200.0, 630.0, 600.0], mask: vec![], mask_width: 0, mask_height: 0 },
-            DetectedRoadMarkingCompat { class_id: 10, class_name: "dashed_single_yellow".into(),
-                confidence: 0.75, bbox: [640.0, 200.0, 670.0, 600.0], mask: vec![], mask_width: 0, mask_height: 0 },
+            DetectedRoadMarkingCompat {
+                class_id: 5,
+                class_name: "solid_single_yellow".into(),
+                confidence: 0.8,
+                bbox: [600.0, 200.0, 630.0, 600.0],
+                mask: vec![],
+                mask_width: 0,
+                mask_height: 0,
+            },
+            DetectedRoadMarkingCompat {
+                class_id: 10,
+                class_name: "dashed_single_yellow".into(),
+                confidence: 0.75,
+                bbox: [640.0, 200.0, 670.0, 600.0],
+                mask: vec![],
+                mask_width: 0,
+                mask_height: 0,
+            },
         ];
         let m = merge_composite_lines_v2(dets, 1280.0);
         assert_eq!(m.len(), 1);
@@ -552,10 +713,24 @@ mod tests {
     #[test]
     fn test_merge_creates_solid_right() {
         let dets = vec![
-            DetectedRoadMarkingCompat { class_id: 10, class_name: "dashed_single_yellow".into(),
-                confidence: 0.75, bbox: [600.0, 200.0, 630.0, 600.0], mask: vec![], mask_width: 0, mask_height: 0 },
-            DetectedRoadMarkingCompat { class_id: 5, class_name: "solid_single_yellow".into(),
-                confidence: 0.8, bbox: [640.0, 200.0, 670.0, 600.0], mask: vec![], mask_width: 0, mask_height: 0 },
+            DetectedRoadMarkingCompat {
+                class_id: 10,
+                class_name: "dashed_single_yellow".into(),
+                confidence: 0.75,
+                bbox: [600.0, 200.0, 630.0, 600.0],
+                mask: vec![],
+                mask_width: 0,
+                mask_height: 0,
+            },
+            DetectedRoadMarkingCompat {
+                class_id: 5,
+                class_name: "solid_single_yellow".into(),
+                confidence: 0.8,
+                bbox: [640.0, 200.0, 670.0, 600.0],
+                mask: vec![],
+                mask_width: 0,
+                mask_height: 0,
+            },
         ];
         let m = merge_composite_lines_v2(dets, 1280.0);
         assert_eq!(m.len(), 1);
@@ -566,7 +741,9 @@ mod tests {
     fn test_temporal_smoothing() {
         let mut c = RoadClassifier::new(1280.0);
         let mixed = [mk(99, "mixed_double_yellow_dashed_right", 640.0, 0.85)];
-        for _ in 0..10 { c.update(&mixed); }
+        for _ in 0..10 {
+            c.update(&mixed);
+        }
         assert_eq!(c.current().passing_legality, PassingLegality::MixedAllowed);
         assert!(c.current().confidence > 0.8);
     }
