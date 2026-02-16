@@ -426,6 +426,11 @@ impl LineCrossingDetector {
 
             // v6.1h: Try mask-based overlap first (pixel-precise).
             // Falls back to bbox overlap if no mask data available.
+            //
+            // Special case for dashed markings (class 9, 10): mask gaps are normal
+            // (the line has periodic breaks). When mask shows zero pixels at the
+            // reference Y row, fall back to bbox overlap so v6.1c's adaptive
+            // threshold (min_overlap=1) can still catch the crossing.
             let penetration = if !marking.mask.is_empty() {
                 // Mask-based: check actual segmentation pixels at reference Y
                 match check_mask_overlap(
@@ -437,7 +442,20 @@ impl LineCrossingDetector {
                     self.frame_height,
                 ) {
                     Some(mask_pen) if mask_pen > 0.0 => mask_pen,
-                    Some(_) => continue, // mask pixels exist but none in ego zone (or gap in dashed line)
+                    Some(_) if is_dashed_marking(marking.class_id) => {
+                        // v6.1h+c: Dashed line gap at reference Y — mask has no
+                        // pixels here but the line exists (periodic gaps are normal).
+                        // Fall back to bbox overlap so the crossing isn't missed.
+                        let overlap_left = ego_zone_left.max(m_left);
+                        let overlap_right = ego_zone_right.min(m_right);
+                        let horizontal_overlap = overlap_right - overlap_left;
+                        if horizontal_overlap <= 0.0 {
+                            continue;
+                        }
+                        let marking_width = (m_right - m_left).max(1.0);
+                        horizontal_overlap / marking_width
+                    }
+                    Some(_) => continue, // solid line: no mask pixels in ego zone → no crossing
                     None => {
                         // Mask check inconclusive — fall back to bbox
                         let overlap_left = ego_zone_left.max(m_left);

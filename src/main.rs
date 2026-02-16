@@ -7,6 +7,8 @@
 // v5.2:  DetectionCache + LineCrossingDetector (wired below)
 // v6.0:  RoadClassifier + CrossingFlash + zone-based visualization
 //        All previously dead-code modules are now active in the pipeline.
+// v6.1d: Fallback markings from legality model when YOLO boundary estimation
+//        fails — keeps crossing detector fed during intermittent detection.
 
 mod analysis;
 mod color_analysis;
@@ -506,6 +508,43 @@ fn run_lane_detection(
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // v6.1d: Fallback marking refresh when YOLO boundary estimation fails
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // When YOLO-seg boundary estimation returns None (common at night, low
+    // contrast, worn paint), the legality model may still have detected
+    // individual lane markings that didn't form a valid boundary pair.
+    //
+    // These markings are stored internally by the detector (last_lane_markings)
+    // and are accessible without re-running inference. We pull them here to
+    // keep `latest_marking_infos` fresh for the crossing detector fallback.
+    //
+    // Without this, `latest_marking_infos` goes stale during YOLO failures
+    // and the crossing detector sees no markings even when the HUD shows lines.
+    //
+    if effective_boundaries.is_none() {
+        if let Some(ref detector) = ps.legality_detector {
+            let raw_markings = detector.last_lane_markings();
+            if !raw_markings.is_empty() {
+                let fallback_infos = lane_legality_patches::detections_to_marking_infos(
+                    raw_markings,
+                    &frame.data,
+                    frame.width,
+                    frame.height,
+                );
+                if !fallback_infos.is_empty() {
+                    debug!(
+                        "📡 v6.1d: {} fallback markings from legality model (cache={})",
+                        fallback_infos.len(),
+                        cache_state.as_str(),
+                    );
+                    ps.latest_marking_infos = fallback_infos;
+                }
+            }
+        }
+    }
+
     Ok((detected_lanes, lane_measurement))
 }
 
@@ -894,3 +933,4 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.avg_fps, stats.duration_secs
     );
 }
+
