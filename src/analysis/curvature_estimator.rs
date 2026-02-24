@@ -60,7 +60,7 @@ const CURVE_AGREEMENT_THRESHOLD: f32 = 0.50;
 
 /// Minimum |a| coefficient (in image-pixel units) to count as curved at all.
 /// Below this, the boundary is effectively straight.
-const MIN_CURVATURE_MAGNITUDE: f32 = 1e-5;
+const MIN_CURVATURE_MAGNITUDE: f32 = 5e-4;
 
 // ============================================================================
 // TYPES
@@ -511,7 +511,7 @@ fn compute_curvature(
             let side = if left_poly.is_some() { "left" } else { "right" };
             let conf = fit_confidence(&poly) * 0.5; // halved for single-boundary
 
-            let is_curve = poly.a.abs() > MIN_CURVATURE_MAGNITUDE * 5.0 && conf > 0.2;
+            let is_curve = poly.a.abs() > MIN_CURVATURE_MAGNITUDE * 10.0 && conf > 0.3;
             let direction = if !is_curve {
                 CurveDirection::Straight
             } else if poly.a > 0.0 {
@@ -557,8 +557,9 @@ fn curvature_agreement(a_left: f32, a_right: f32) -> f32 {
     let max_abs = abs_left.max(abs_right);
 
     if max_abs < MIN_CURVATURE_MAGNITUDE {
-        // Both essentially straight — perfect agreement (no curvature to disagree on)
-        return 1.0;
+        // Both essentially straight — no curvature to agree on.
+        // Return 0.0 so this doesn't trigger is_curve for straight roads.
+        return 0.0;
     }
 
     // Sign agreement: same sign → positive contribution, opposite → negative
