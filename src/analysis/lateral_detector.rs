@@ -532,7 +532,8 @@ impl LateralShiftDetector {
             self.in_curve_mode = self.curve_sustained_frames >= CURVE_DEACTIVATION_THRESHOLD;
         } else {
             // Activate at the normal threshold
-            self.in_curve_mode = self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
+            self.in_curve_mode =
+                self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
         }
 
         // v4.12: Track how recently curve mode was active
@@ -1695,7 +1696,17 @@ impl LateralShiftDetector {
         // independent confirmation signal. When boundaries are diverging
         // strongly enough (geo_override=true), the ego estimator's silence
         // is explained by curve rotation, not by vehicle stillness.
-        let (geo_override, geo_score) = self.geometric_signals_confirm_lane_change();
+        //
+        // v7.3c: When ego OPPOSES the shift (directional_ego < 0), the geo
+        // override alone is not sufficient for short shifts. On severe curves,
+        // perspective distortion can produce brief (~1-2s) high-magnitude
+        // normalized offsets with small opposing ego and boundary divergence.
+        // Require a minimum duration of 2.5s to distinguish real lane changes
+        // (which take longer) from transient curve artifacts.
+        const GEO_OVERRIDE_OPPOSING_MIN_DURATION_S: f32 = 2.5;
+        let (geo_override_raw, geo_score) = self.geometric_signals_confirm_lane_change();
+        let geo_override = geo_override_raw
+            && (directional_ego >= 0.0 || duration_s >= GEO_OVERRIDE_OPPOSING_MIN_DURATION_S);
 
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
@@ -1708,7 +1719,7 @@ impl LateralShiftDetector {
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
                  peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}, cap={:.0}) | \
                  dur={:.1}s | curve_now={} curve_saw={} curve_ratio={:.0}% ({}/{}) | ego_conf={}/{} ({:.0}%) | \
-                 geo_score={:.2} → perspective distortion, not lane change",
+                 geo_raw={} geo_score={:.2}{} → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),
@@ -1730,7 +1741,13 @@ impl LateralShiftDetector {
                 self.ego_shift_confident_frames,
                 self.shift_frames,
                 ego_confidence_ratio * 100.0,
+                geo_override_raw,
                 geo_score,
+                if geo_override_raw && !geo_override {
+                    " (geo blocked: opposing ego + short duration)"
+                } else {
+                    ""
+                },
             );
             self.state = State::Stable;
             self.reset_shift();
@@ -2593,7 +2610,10 @@ mod tests {
             let frame = 36 + i as u64;
             det.update(Some(m), None, frame as f64 * 33.3, frame);
         }
-        assert!(!det.in_curve_mode, "Curve mode should have deactivated after hysteresis cooldown");
+        assert!(
+            !det.in_curve_mode,
+            "Curve mode should have deactivated after hysteresis cooldown"
+        );
 
         // Phase 2: Shift starts while curve_mode=false (the gap).
         // Offset ramps to 60% — above base 35% threshold but below raised 70%.
