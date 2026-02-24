@@ -1320,6 +1320,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "image",
+ "lazy_static",
  "ndarray 0.15.6",
  "opencv",
  "ort",
