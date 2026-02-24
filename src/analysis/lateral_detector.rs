@@ -374,6 +374,13 @@ pub struct LateralShiftDetector {
     /// v7.0: Whether early "shift confirmed" notification has fired for this shift.
     shift_confirmed_notified: bool,
 
+    // v7.3: Latest geometric signals from polynomial tracker.
+    // Fed by the pipeline each frame BEFORE lateral update runs.
+    // Used to bypass the curve ego veto when boundary divergence confirms
+    // a real lane change — the ego estimator can fail on curves where
+    // rotational flow cancels real lateral motion.
+    latest_geometric_signals: Option<GeometricLaneChangeSignals>,
+
     // v4.13b: Post-lane-change return expectation.
     //
     // After a confirmed lane change (e.g. LEFT), the return in the opposite
@@ -432,6 +439,7 @@ impl LateralShiftDetector {
             shift_curve_frames: 0,
             shift_used_return_bypass: false,
             shift_confirmed_notified: false,
+            latest_geometric_signals: None,
             pending_return_direction: None,
             pending_return_deadline_ms: 0.0,
         }
@@ -617,6 +625,49 @@ impl LateralShiftDetector {
     /// Whether the detector is currently in curve suppression mode.
     pub fn in_curve_mode(&self) -> bool {
         self.in_curve_mode
+    }
+
+    /// v7.3: Evaluate whether geometric signals from the polynomial tracker
+    /// indicate a real lane change, allowing curve veto bypass.
+    ///
+    /// On curves, both boundaries move together → divergence ≈ 0.
+    /// On lane changes (even on curves), boundaries diverge.
+    /// When divergence is strong enough, the curve veto should be bypassed
+    /// because the ego estimator's failure (near-zero displacement due to
+    /// rotational flow canceling real lateral motion) is not evidence against
+    /// a lane change — the geometric signal IS independent evidence FOR it.
+    ///
+    /// Uses the same scoring as ManeuverClassifier::evaluate_geometric_override.
+    fn geometric_signals_confirm_lane_change(&self) -> (bool, f32) {
+        let signals = match &self.latest_geometric_signals {
+            Some(s) => s,
+            None => return (false, 0.0),
+        };
+
+        // Need minimum signal confidence (both boundaries actively tracked)
+        const GEO_MIN_CONFIDENCE: f32 = 0.4;
+        if signals.confidence < GEO_MIN_CONFIDENCE {
+            return (false, 0.0);
+        }
+
+        // The polynomial tracker already computes suggests_lane_change using
+        // a 2-of-3 vote on boundary_velocity_divergence, lane_width_rate,
+        // and near_far_offset_divergence.
+        if !signals.suggests_lane_change {
+            return (false, 0.0);
+        }
+
+        // Compute graded confidence based on signal strengths.
+        // Thresholds from polynomial_tracker: div>3.0, width_rate>2.0, nf_div>0.08
+        let div_strength = (signals.boundary_velocity_divergence.abs() / 3.0).min(1.0);
+        let width_strength = (signals.lane_width_rate.abs() / 2.0).min(1.0);
+        let nf_strength = (signals.near_far_offset_divergence / 0.08).min(1.0);
+
+        let geo_score = div_strength * 0.5 + width_strength * 0.3 + nf_strength * 0.2;
+        let boosted_score = geo_score * signals.confidence;
+
+        const GEO_OVERRIDE_MIN_SCORE: f32 = 0.50;
+        (boosted_score >= GEO_OVERRIDE_MIN_SCORE, boosted_score)
     }
 
     /// Average boundary coherence over recent history (for diagnostics).
@@ -1338,9 +1389,15 @@ impl LateralShiftDetector {
             };
             let directional_ego = self.ego_cumulative_peak_px * shift_sign;
 
+            // v7.3: Check geometric override before suppressing.
+            // Boundary divergence can confirm a lane change even when ego
+            // estimator fails on curves (rotational flow cancels lateral motion).
+            let (geo_override, _geo_score) = self.geometric_signals_confirm_lane_change();
+
             // Gate A: Ego trustworthy + insufficient confirming motion → suppress
-            if ego_trustworthy && directional_ego < ego_threshold {
-                return None; // Curve artifact — ego doesn't confirm
+            //         UNLESS geometric signals independently confirm lane change.
+            if ego_trustworthy && directional_ego < ego_threshold && !geo_override {
+                return None; // Curve artifact — ego doesn't confirm, geometry doesn't confirm
             }
 
             // Gate B: Direction disagreement — even with low ego confidence,
@@ -1348,8 +1405,9 @@ impl LateralShiftDetector {
             // direction, the lane-based direction is likely a perspective artifact.
             // This mirrors the direction-correction veto in emit_shift_event().
             // Threshold: 5px is well above noise, but catches clear opposing motion.
+            // v7.3: Also bypassed by geometric override.
             let ego_opposing = self.ego_cumulative_px * shift_sign;
-            if ego_opposing < -5.0 {
+            if ego_opposing < -5.0 && !geo_override {
                 debug!(
                     "🔔❌ Early LC suppressed: ego opposes shift on curve | ego_cum={:.1}px vs shift={} | ego_conf={:.0}%",
                     self.ego_cumulative_px,
@@ -1616,16 +1674,28 @@ impl LateralShiftDetector {
             self.shift_used_return_bypass = true;
         }
 
+        // v7.3: Before applying the curve veto, check if geometric signals
+        // from the polynomial tracker independently confirm a lane change.
+        //
+        // On curves where the ego estimator fails (rotational flow cancels
+        // or opposes real lateral motion), boundary divergence provides an
+        // independent confirmation signal. When boundaries are diverging
+        // strongly enough (geo_override=true), the ego estimator's silence
+        // is explained by curve rotation, not by vehicle stillness.
+        let (geo_override, geo_score) = self.geometric_signals_confirm_lane_change();
+
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
             && ego_trustworthy
             && directional_ego < curve_ego_threshold
             && !is_expected_return
+            && !geo_override
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
                  peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}, cap={:.0}) | \
-                 dur={:.1}s | curve_now={} curve_saw={} curve_ratio={:.0}% ({}/{}) | ego_conf={}/{} ({:.0}%) → perspective distortion, not lane change",
+                 dur={:.1}s | curve_now={} curve_saw={} curve_ratio={:.0}% ({}/{}) | ego_conf={}/{} ({:.0}%) | \
+                 geo_score={:.2} → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),
@@ -1647,10 +1717,34 @@ impl LateralShiftDetector {
                 self.ego_shift_confident_frames,
                 self.shift_frames,
                 ego_confidence_ratio * 100.0,
+                geo_score,
             );
             self.state = State::Stable;
             self.reset_shift();
             return None;
+        }
+
+        // v7.3: Diagnostic when curve veto is bypassed by geometric override.
+        if curve_tainted
+            && self.shift_source == ShiftSource::LaneBased
+            && ego_trustworthy
+            && directional_ego < curve_ego_threshold
+            && !is_expected_return
+            && geo_override
+        {
+            warn!(
+                "⚠️ Curve veto BYPASSED (geometric override): shift {} | \
+                 peak={:.1}% | ego_cum={:.1}px (dir={:.1}px) < {:.0}px threshold | \
+                 geo_score={:.2} → boundary divergence confirms lane change",
+                self.shift_direction
+                    .unwrap_or(ShiftDirection::Left)
+                    .as_str(),
+                self.shift_peak_offset * 100.0,
+                self.ego_cumulative_px,
+                directional_ego,
+                curve_ego_threshold,
+                geo_score,
+            );
         }
 
         // v7.1: Diagnostic for when curve veto is bypassed due to low curve-frame ratio.
@@ -1987,6 +2081,13 @@ impl LateralShiftDetector {
 
     pub fn baseline(&self) -> f32 {
         self.baseline
+    }
+
+    /// v7.3: Feed the latest geometric signals from the polynomial tracker.
+    /// Must be called each frame BEFORE `update()` so that the curve veto
+    /// can consult boundary divergence as an independent lane-change signal.
+    pub fn set_geometric_signals(&mut self, signals: Option<GeometricLaneChangeSignals>) {
+        self.latest_geometric_signals = signals;
     }
 
     /// v7.1: Allow external code (e.g., the maneuver pipeline) to set the

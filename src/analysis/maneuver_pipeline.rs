@@ -467,7 +467,17 @@ impl ManeuverPipeline {
         // 4. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
         //    v4.4: Now receives ego-motion input for fusion/bridging.
         //    v5.0: Receives enhanced measurement from polynomial tracker.
+        //    v7.3: Receives geometric signals for curve veto bypass.
         // ══════════════════════════════════════════════════════════════════
+        // v7.3: Feed geometric signals BEFORE lateral update so the curve
+        // veto can consult boundary divergence as independent lane-change evidence.
+        if self.poly_tracker.both_active() {
+            self.lateral_detector
+                .set_geometric_signals(Some(*self.poly_tracker.signals()));
+        } else {
+            self.lateral_detector.set_geometric_signals(None);
+        }
+
         let ego_input = if self.enable_ego_motion {
             Some(EgoMotionInput {
                 lateral_velocity: self.last_ego_estimate.lateral_velocity_px,
