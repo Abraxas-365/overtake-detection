@@ -1294,8 +1294,25 @@ impl LateralShiftDetector {
             };
             let directional_ego = self.ego_cumulative_peak_px * shift_sign;
 
+            // Gate A: Ego trustworthy + insufficient confirming motion → suppress
             if ego_trustworthy && directional_ego < ego_threshold {
                 return None; // Curve artifact — ego doesn't confirm
+            }
+
+            // Gate B: Direction disagreement — even with low ego confidence,
+            // if ego has accumulated meaningful displacement OPPOSING the shift
+            // direction, the lane-based direction is likely a perspective artifact.
+            // This mirrors the direction-correction veto in emit_shift_event().
+            // Threshold: 5px is well above noise, but catches clear opposing motion.
+            let ego_opposing = self.ego_cumulative_px * shift_sign;
+            if ego_opposing < -5.0 {
+                debug!(
+                    "🔔❌ Early LC suppressed: ego opposes shift on curve | ego_cum={:.1}px vs shift={} | ego_conf={:.0}%",
+                    self.ego_cumulative_px,
+                    self.shift_direction.unwrap_or(ShiftDirection::Left).as_str(),
+                    ego_confidence_ratio * 100.0,
+                );
+                return None;
             }
         }
 
