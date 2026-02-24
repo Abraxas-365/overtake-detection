@@ -739,18 +739,57 @@ fn run_maneuver_pipeline_v2(
         );
 
         if let Some(ref crossing) = correlated_crossing {
+            // v7.1: Use RoadClassifier temporal consensus to correct stale class IDs.
+            //
+            // Problem: During overtakes the camera perspective changes, causing
+            // analyze_double_line_for_mixed() to miss the dashed stripe. The crossing
+            // fires with class 8 (solid_double_yellow → CriticalIllegal) even though
+            // the line is actually mixed with dashed on our side (Legal).
+            //
+            // Fix: The RoadClassifier keeps a 30-frame temporal vote. If it says the
+            // center line is mixed_dashed_right, override class 8 → class 99 legality.
+            let (effective_class_id, effective_passing, effective_class_name) =
+                if crossing.marking_class_id == 8 {
+                    let rc = ps.road_classifier.current();
+                    match rc.mixed_line_side {
+                        Some(MixedLineSide::DashedRight) => {
+                            info!(
+                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed dashed_right, \
+                                 temporal consensus: {:?}, conf={:.2})",
+                                rc.passing_legality, rc.confidence,
+                            );
+                            (99_usize, PassingLegality::MixedAllowed,
+                             "mixed_double_yellow_dashed_right".to_string())
+                        }
+                        Some(MixedLineSide::SolidRight) => {
+                            info!(
+                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed solid_right, \
+                                 temporal consensus: {:?}, conf={:.2})",
+                                rc.passing_legality, rc.confidence,
+                            );
+                            (99_usize, PassingLegality::MixedProhibited,
+                             "mixed_double_yellow_solid_right".to_string())
+                        }
+                        _ => (crossing.marking_class_id, crossing.passing_legality,
+                              crossing.marking_class.clone()),
+                    }
+                } else {
+                    (crossing.marking_class_id, crossing.passing_legality,
+                     crossing.marking_class.clone())
+                };
+
             // Override maneuver legality with the actual crossed line's legality
             let line_legality = lane_crossing_integration::crossing_legality_to_line_legality(
-                &crossing.passing_legality,
-                crossing.marking_class_id,
+                &effective_passing,
+                effective_class_id,
             );
             event.legality = line_legality;
-            event.crossed_line_class = Some(crossing.marking_class.clone());
-            event.crossed_line_class_id = Some(crossing.marking_class_id);
+            event.crossed_line_class = Some(effective_class_name.clone());
+            event.crossed_line_class_id = Some(effective_class_id);
 
             info!(
                 "📌 Maneuver legality set from crossed line: {} ({}) → {:?}",
-                crossing.marking_class, crossing.marking_class_id, line_legality,
+                effective_class_name, effective_class_id, line_legality,
             );
 
             // v6.1: Trigger crossing flash ONLY for confirmed crossings
