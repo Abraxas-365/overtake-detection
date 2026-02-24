@@ -672,9 +672,7 @@ impl ManeuverClassifier {
                     self.total_maneuvers += 1;
 
                     self.pass_buffer[pass_idx].correlated = true;
-                    // NOTE: Intentionally NOT marking shift as correlated.
-                    // An overtake inherently includes a lane change — the
-                    // shift should still emit as a LANE_CHANGE event below.
+                    self.shift_buffer[si].correlated = true;
                 }
             }
         }
