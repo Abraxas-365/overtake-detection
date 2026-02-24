@@ -1392,12 +1392,23 @@ impl LateralShiftDetector {
             // v7.3: Check geometric override before suppressing.
             // Boundary divergence can confirm a lane change even when ego
             // estimator fails on curves (rotational flow cancels lateral motion).
-            let (geo_override, _geo_score) = self.geometric_signals_confirm_lane_change();
+            //
+            // v7.3b: Only allow geometric override for EARLY notifications when
+            // ego is NOT opposing the shift direction (directional_ego >= 0).
+            // On severe curves, the polynomial tracker can report high boundary
+            // divergence even for pure perspective artifacts. Without direction
+            // validation (which only runs in emit_shift_event), the early LC
+            // path must be conservative. When ego opposes, we can't distinguish
+            // "ego canceled by curve rotation" from "no real lateral motion."
+            // The completed shift will still go through emit_shift_event where
+            // the direction-correction veto provides a safety net.
+            let (geo_override_raw, _geo_score) = self.geometric_signals_confirm_lane_change();
+            let geo_override = geo_override_raw && directional_ego >= 0.0;
 
             // Gate A: Ego trustworthy + insufficient confirming motion → suppress
-            //         UNLESS geometric signals independently confirm lane change.
+            //         UNLESS geometric signals confirm AND ego is not opposing.
             if ego_trustworthy && directional_ego < ego_threshold && !geo_override {
-                return None; // Curve artifact — ego doesn't confirm, geometry doesn't confirm
+                return None; // Curve artifact — ego doesn't confirm, geometry insufficient
             }
 
             // Gate B: Direction disagreement — even with low ego confidence,
@@ -1405,9 +1416,11 @@ impl LateralShiftDetector {
             // direction, the lane-based direction is likely a perspective artifact.
             // This mirrors the direction-correction veto in emit_shift_event().
             // Threshold: 5px is well above noise, but catches clear opposing motion.
-            // v7.3: Also bypassed by geometric override.
+            // NOTE: Geometric override does NOT bypass Gate B for early LCs.
+            // Strong ego opposition is definitive — the early path has no
+            // direction validation safety net.
             let ego_opposing = self.ego_cumulative_px * shift_sign;
-            if ego_opposing < -5.0 && !geo_override {
+            if ego_opposing < -5.0 {
                 debug!(
                     "🔔❌ Early LC suppressed: ego opposes shift on curve | ego_cum={:.1}px vs shift={} | ego_conf={:.0}%",
                     self.ego_cumulative_px,
