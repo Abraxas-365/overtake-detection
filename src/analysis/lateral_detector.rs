@@ -1403,8 +1403,13 @@ impl LateralShiftDetector {
             // "ego canceled by curve rotation" from "no real lateral motion."
             // The completed shift will still go through emit_shift_event where
             // the direction-correction veto provides a safety net.
+            //
+            // v7.5: Tightened from >= 0.0 to >= 0.5 — consistent with the
+            // completion path. On curves, near-zero ego (-0.0) with high
+            // geo_score is perspective distortion. Require at least 0.5px
+            // of positive confirming ego motion.
             let (geo_override_raw, _geo_score) = self.geometric_signals_confirm_lane_change();
-            let geo_override = geo_override_raw && directional_ego >= 0.0;
+            let geo_override = geo_override_raw && directional_ego >= 0.5;
 
             // Gate A: Ego trustworthy + insufficient confirming motion → suppress
             //         UNLESS geometric signals confirm AND ego is not opposing.
@@ -1714,12 +1719,29 @@ impl LateralShiftDetector {
         // mean "can't measure" rather than "didn't move". In this case, allow
         // geometric override without the duration requirement.
         const CURVE_EGO_INCONCLUSIVE_PX: f32 = 3.0;
+        // v7.5: On curves, geometric signals (boundary divergence, lane width
+        // rate) are NOT independent of perspective effects — road curvature
+        // naturally produces diverging boundaries in the camera frame, yielding
+        // high geo_scores even without real lateral motion. Require minimum
+        // positive directional ego to use geometric override on curve-tainted
+        // shifts. Zero or opposing ego + high geo_score on a curve is
+        // perspective distortion, not a lane change. Expected returns are
+        // handled separately via is_expected_return.
+        const CURVE_GEO_MIN_CONFIRM_PX: f32 = 0.5;
         let (geo_override_raw, geo_score) = self.geometric_signals_confirm_lane_change();
         let ego_is_inconclusive = directional_ego.abs() < CURVE_EGO_INCONCLUSIVE_PX;
-        let geo_override = geo_override_raw
-            && (directional_ego >= 0.0
-                || ego_is_inconclusive
-                || duration_s >= GEO_OVERRIDE_OPPOSING_MIN_DURATION_S);
+        let geo_override = if curve_tainted {
+            // On curves: boundary divergence can't independently confirm a
+            // lane change because perspective geometry creates the same signal.
+            // Require at least 0.5px of confirming directional ego.
+            geo_override_raw && directional_ego >= CURVE_GEO_MIN_CONFIRM_PX
+        } else {
+            // Off curves: geometric signals are reliable independent confirmation.
+            geo_override_raw
+                && (directional_ego >= 0.0
+                    || ego_is_inconclusive
+                    || duration_s >= GEO_OVERRIDE_OPPOSING_MIN_DURATION_S)
+        };
 
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
@@ -1757,7 +1779,9 @@ impl LateralShiftDetector {
                 geo_override_raw,
                 geo_score,
                 if geo_override_raw && !geo_override {
-                    if ego_is_inconclusive {
+                    if curve_tainted {
+                        " (geo blocked: curve requires confirming ego >= 0.5px)"
+                    } else if ego_is_inconclusive {
                         " (geo blocked: opposing ego + short duration + not inconclusive)"
                     } else {
                         " (geo blocked: opposing ego + short duration)"
