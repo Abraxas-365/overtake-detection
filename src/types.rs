@@ -38,6 +38,11 @@ pub struct ProcessingConfig {
     pub vehicle_detection_interval: u64,
     /// Run YOLO-seg lane boundary estimation every N frames (1 = every frame)
     pub lane_detection_interval: u64,
+    /// Write annotated video every N frames (1 = every frame, 2 = half, 0 = disable)
+    /// Skipped frames are still written (last annotated frame is repeated) to keep video in sync.
+    pub annotation_interval: u64,
+    /// Print per-stage timing every N frames (0 = disabled)
+    pub timing_log_interval: u64,
 }
 
 impl Default for ProcessingConfig {
@@ -45,6 +50,8 @@ impl Default for ProcessingConfig {
         Self {
             vehicle_detection_interval: 2,
             lane_detection_interval: 2,
+            annotation_interval: 1,
+            timing_log_interval: 0,
         }
     }
 }
