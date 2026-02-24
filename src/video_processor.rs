@@ -596,21 +596,43 @@ fn render_ego_lane_fill(
         core::Scalar::new(160.0, 110.0, 0.0, 0.0)
     };
 
-    let mut overlay = output.try_clone()?;
-    let mut pts_vec = Vector::<Vector<core::Point>>::new();
-    pts_vec.push(Vector::from_iter(poly_pts.into_iter()));
-    imgproc::fill_poly(
-        &mut overlay,
-        &pts_vec,
-        fill_color,
-        imgproc::LINE_AA,
-        0,
-        core::Point::new(0, 0),
-    )?;
+    // Compute bounding rect of the polygon to use ROI-based blending
+    let min_x = poly_pts.iter().map(|p| p.x).min().unwrap_or(0).max(0);
+    let min_y = poly_pts.iter().map(|p| p.y).min().unwrap_or(0).max(0);
+    let max_x = poly_pts.iter().map(|p| p.x).max().unwrap_or(0).min(output.cols() - 1);
+    let max_y = poly_pts.iter().map(|p| p.y).max().unwrap_or(0).min(output.rows() - 1);
+    let roi_w = max_x - min_x + 1;
+    let roi_h = max_y - min_y + 1;
 
-    let mut blended = Mat::default();
-    core::add_weighted(&overlay, 0.14, output, 0.86, 0.0, &mut blended, -1)?;
-    blended.copy_to(output)?;
+    if roi_w > 0 && roi_h > 0 {
+        let roi_rect = core::Rect::new(min_x, min_y, roi_w, roi_h);
+        {
+            let roi = Mat::roi(output, roi_rect)?;
+            let mut roi_overlay = roi.try_clone()?;
+
+            // Offset polygon points to ROI coordinates
+            let offset_pts: Vec<core::Point> = poly_pts
+                .iter()
+                .map(|p| core::Point::new(p.x - min_x, p.y - min_y))
+                .collect();
+            let mut pts_vec = Vector::<Vector<core::Point>>::new();
+            pts_vec.push(Vector::from_iter(offset_pts.into_iter()));
+            imgproc::fill_poly(
+                &mut roi_overlay,
+                &pts_vec,
+                fill_color,
+                imgproc::LINE_AA,
+                0,
+                core::Point::new(0, 0),
+            )?;
+
+            let mut blended = Mat::default();
+            core::add_weighted(&roi_overlay, 0.14, &roi, 0.86, 0.0, &mut blended, -1)?;
+            drop(roi);
+            let mut dst_roi = Mat::roi_mut(output, roi_rect)?;
+            blended.copy_to(&mut dst_roi)?;
+        }
+    }
 
     Ok(())
 }
@@ -827,18 +849,25 @@ fn render_ego_indicator(
 
 fn render_shadow_overtake_banner(output: &mut Mat, width: i32) -> Result<()> {
     let banner_h = 40;
-    let mut overlay = output.try_clone()?;
-    imgproc::rectangle(
-        &mut overlay,
-        core::Rect::new(0, 0, width, banner_h),
-        core::Scalar::new(0.0, 0.0, 200.0, 0.0),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-    let mut blended = Mat::default();
-    core::add_weighted(&overlay, 0.8, output, 0.2, 0.0, &mut blended, -1)?;
-    blended.copy_to(output)?;
+    // ROI-based alpha blend (avoid full-frame clone)
+    let roi_rect = core::Rect::new(0, 0, width, banner_h);
+    {
+        let roi = Mat::roi(output, roi_rect)?;
+        let mut roi_overlay = roi.try_clone()?;
+        imgproc::rectangle(
+            &mut roi_overlay,
+            core::Rect::new(0, 0, width, banner_h),
+            core::Scalar::new(0.0, 0.0, 200.0, 0.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+        let mut blended = Mat::default();
+        core::add_weighted(&roi_overlay, 0.8, &roi, 0.2, 0.0, &mut blended, -1)?;
+        drop(roi);
+        let mut dst_roi = Mat::roi_mut(output, roi_rect)?;
+        blended.copy_to(&mut dst_roi)?;
+    }
 
     let text = "!! SHADOW OVERTAKE !!";
     let mut baseline = 0;
@@ -1438,18 +1467,25 @@ fn render_bottom_status_bar(
     let bar_h = 36;
     let bar_y = height - bar_h;
 
-    let mut overlay = output.try_clone()?;
-    imgproc::rectangle(
-        &mut overlay,
-        core::Rect::new(0, bar_y, width, bar_h),
-        core::Scalar::new(20.0, 20.0, 20.0, 0.0),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-    let mut blended = Mat::default();
-    core::add_weighted(&overlay, 0.85, output, 0.15, 0.0, &mut blended, -1)?;
-    blended.copy_to(output)?;
+    // ROI-based alpha blend for status bar (avoid full-frame clone)
+    let roi_rect = core::Rect::new(0, bar_y, width, bar_h);
+    {
+        let roi = Mat::roi(output, roi_rect)?;
+        let mut roi_overlay = roi.try_clone()?;
+        imgproc::rectangle(
+            &mut roi_overlay,
+            core::Rect::new(0, 0, width, bar_h),
+            core::Scalar::new(20.0, 20.0, 20.0, 0.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+        let mut blended = Mat::default();
+        core::add_weighted(&roi_overlay, 0.85, &roi, 0.15, 0.0, &mut blended, -1)?;
+        drop(roi);
+        let mut dst_roi = Mat::roi_mut(output, roi_rect)?;
+        blended.copy_to(&mut dst_roi)?;
+    }
 
     // Accent line
     imgproc::line(
@@ -1582,18 +1618,36 @@ fn render_legend(output: &mut Mat, _width: i32, height: i32) -> Result<()> {
 // ════════════════════════════════════════════════════════════════════════════
 
 fn draw_panel_background(img: &mut Mat, x: i32, y: i32, w: i32, h: i32) -> Result<()> {
-    let mut overlay = img.clone();
-    imgproc::rectangle(
-        &mut overlay,
-        core::Rect::new(x, y, w, h),
-        core::Scalar::new(0.0, 0.0, 0.0, 0.0),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-    let mut result = Mat::default();
-    core::add_weighted(&overlay, 0.7, img, 0.3, 0.0, &mut result, -1)?;
-    result.copy_to(img)?;
+    // Clamp ROI to image bounds
+    let img_rows = img.rows();
+    let img_cols = img.cols();
+    let rx = x.max(0);
+    let ry = y.max(0);
+    let rw = w.min(img_cols - rx);
+    let rh = h.min(img_rows - ry);
+    if rw <= 0 || rh <= 0 {
+        return Ok(());
+    }
+
+    // ROI-based alpha blend (only clone the small region, not the whole frame)
+    let roi_rect = core::Rect::new(rx, ry, rw, rh);
+    {
+        let roi = Mat::roi(img, roi_rect)?;
+        let mut roi_overlay = roi.try_clone()?;
+        imgproc::rectangle(
+            &mut roi_overlay,
+            core::Rect::new(0, 0, rw, rh),
+            core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+        let mut blended = Mat::default();
+        core::add_weighted(&roi_overlay, 0.7, &roi, 0.3, 0.0, &mut blended, -1)?;
+        drop(roi);
+        let mut dst_roi = Mat::roi_mut(img, roi_rect)?;
+        blended.copy_to(&mut dst_roi)?;
+    }
 
     imgproc::rectangle(
         img,
@@ -1608,18 +1662,34 @@ fn draw_panel_background(img: &mut Mat, x: i32, y: i32, w: i32, h: i32) -> Resul
 }
 
 fn draw_filled_rect_alpha(img: &mut Mat, x: i32, y: i32, w: i32, h: i32, alpha: f64) -> Result<()> {
-    let mut overlay = img.clone();
-    imgproc::rectangle(
-        &mut overlay,
-        core::Rect::new(x, y, w, h),
-        core::Scalar::new(0.0, 0.0, 0.0, 0.0),
-        -1,
-        imgproc::LINE_8,
-        0,
-    )?;
-    let mut result = Mat::default();
-    core::add_weighted(&overlay, alpha, img, 1.0 - alpha, 0.0, &mut result, -1)?;
-    result.copy_to(img)?;
+    let img_rows = img.rows();
+    let img_cols = img.cols();
+    let rx = x.max(0);
+    let ry = y.max(0);
+    let rw = w.min(img_cols - rx);
+    let rh = h.min(img_rows - ry);
+    if rw <= 0 || rh <= 0 {
+        return Ok(());
+    }
+
+    let roi_rect = core::Rect::new(rx, ry, rw, rh);
+    {
+        let roi = Mat::roi(img, roi_rect)?;
+        let mut roi_overlay = roi.try_clone()?;
+        imgproc::rectangle(
+            &mut roi_overlay,
+            core::Rect::new(0, 0, rw, rh),
+            core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
+        let mut blended = Mat::default();
+        core::add_weighted(&roi_overlay, alpha, &roi, 1.0 - alpha, 0.0, &mut blended, -1)?;
+        drop(roi);
+        let mut dst_roi = Mat::roi_mut(img, roi_rect)?;
+        blended.copy_to(&mut dst_roi)?;
+    }
     Ok(())
 }
 

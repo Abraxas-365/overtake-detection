@@ -47,6 +47,10 @@ video:
   save_annotated: true
   save_events_only: false
 
+processing:
+  vehicle_detection_interval: 2    # Run YOLO vehicle detection every N frames (2 = 50% less inference)
+  lane_detection_interval: 2       # Run YOLO-seg boundary estimation every N frames (cache fills gaps)
+
 logging:
   level: "info"
 

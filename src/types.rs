@@ -17,6 +17,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub lane_legality: LaneLegalityConfig,
+    #[serde(default)]
+    pub processing: ProcessingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,23 @@ pub struct LaneLegalityConfig {
     pub inference_interval: u64,
     /// Ego vehicle bounding box ratios [x1, y1, x2, y2]
     pub ego_bbox_ratio: [f32; 4],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessingConfig {
+    /// Run YOLO vehicle detection every N frames (1 = every frame, 2 = every other)
+    pub vehicle_detection_interval: u64,
+    /// Run YOLO-seg lane boundary estimation every N frames (1 = every frame)
+    pub lane_detection_interval: u64,
+}
+
+impl Default for ProcessingConfig {
+    fn default() -> Self {
+        Self {
+            vehicle_detection_interval: 2,
+            lane_detection_interval: 2,
+        }
+    }
 }
 
 impl Default for LaneLegalityConfig {

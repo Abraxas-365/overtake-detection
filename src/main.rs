@@ -309,12 +309,17 @@ fn process_video(
 
         let arc_frame = Arc::new(frame);
 
-        // ── STAGE 1: Vehicle Detection ──
-        run_vehicle_detection(&mut ps, &arc_frame)?;
+        // ── STAGE 1: Vehicle Detection (skip frames for speed) ──
+        let vd_interval = config.processing.vehicle_detection_interval.max(1);
+        if ps.frame_count % vd_interval == 1 || vd_interval == 1 {
+            run_vehicle_detection(&mut ps, &arc_frame)?;
+        }
 
         // ── STAGE 2: Lane Detection + Cache + Road Classification ──
+        let ld_interval = config.processing.lane_detection_interval.max(1);
+        let run_lane_inference = ps.frame_count % ld_interval == 1 || ld_interval == 1;
         let (detected_lanes, lane_measurement) =
-            run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms)?;
+            run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms, run_lane_inference)?;
 
         // ── STAGE 3: Maneuver Detection v2 + Crossing Detection ──
         let v2_output =
@@ -370,30 +375,34 @@ fn run_lane_detection(
     frame: &Arc<Frame>,
     config: &types::Config,
     timestamp_ms: f64,
+    run_inference: bool,
 ) -> Result<(Vec<DetectedLane>, Option<LaneMeasurement>)> {
     let frame_count = ps.frame_count;
     let mut detected_lanes: Vec<DetectedLane> = Vec::new();
     let mut lane_measurement: Option<LaneMeasurement> = None;
     let center_x = frame.width as f32 / 2.0;
 
-    // ── 2a: Run YOLO-seg boundary estimation ──
-    let yolo_result: Option<(f32, f32, f32)> = if let Some(ref mut detector) = ps.legality_detector
-    {
-        match detector.estimate_ego_lane_boundaries_stable(
-            &frame.data,
-            frame.width,
-            frame.height,
-            center_x,
-        ) {
-            Ok(Some((left_x, right_x, conf))) => {
-                ps.yolo_primary_count += 1;
-                Some((left_x, right_x, conf))
+    // ── 2a: Run YOLO-seg boundary estimation (skipped on non-inference frames) ──
+    let yolo_result: Option<(f32, f32, f32)> = if run_inference {
+        if let Some(ref mut detector) = ps.legality_detector {
+            match detector.estimate_ego_lane_boundaries_stable(
+                &frame.data,
+                frame.width,
+                frame.height,
+                center_x,
+            ) {
+                Ok(Some((left_x, right_x, conf))) => {
+                    ps.yolo_primary_count += 1;
+                    Some((left_x, right_x, conf))
+                }
+                Ok(None) => None,
+                Err(_) => None,
             }
-            Ok(None) => None,
-            Err(_) => None,
+        } else {
+            None
         }
     } else {
-        None
+        None // Skipped — cache will provide ego-compensated boundaries
     };
 
     // ── 2b: Get ego lateral velocity for cache ego-compensation ──
