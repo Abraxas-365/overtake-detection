@@ -342,9 +342,10 @@ impl ManeuverClassifier {
         // v7.0: Check if an early LC was already emitted for this shift.
         // Match by start_frame and direction — a completed shift with the same
         // start as a confirmed notification is the same shift.
-        let early_lc = self.early_lc_records.iter().position(|(frame, dir)| {
-            *frame == event.start_frame && *dir == event.direction
-        });
+        let early_lc = self
+            .early_lc_records
+            .iter()
+            .position(|(frame, dir)| *frame == event.start_frame && *dir == event.direction);
         let early_lc_emitted = if let Some(idx) = early_lc {
             self.early_lc_records.swap_remove(idx);
             true
@@ -419,7 +420,8 @@ impl ManeuverClassifier {
         // v7.0: Cap early_lc_records to prevent unbounded growth.
         // Records older than 60s are no longer relevant.
         if self.early_lc_records.len() > 50 {
-            self.early_lc_records.drain(..self.early_lc_records.len() - 20);
+            self.early_lc_records
+                .drain(..self.early_lc_records.len() - 20);
         }
 
         debug!(
@@ -931,7 +933,8 @@ impl ManeuverClassifier {
             self.total_maneuvers += 1;
 
             // Record so the completed shift won't produce a duplicate LC
-            self.early_lc_records.push((confirmed.start_frame, confirmed.direction));
+            self.early_lc_records
+                .push((confirmed.start_frame, confirmed.direction));
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -1157,10 +1160,7 @@ impl ManeuverClassifier {
     /// On curves, both boundaries move together → divergence ≈ 0.
     /// On lane changes (even on curves), boundaries diverge.
     /// When divergence is strong enough, we allow the lane change through.
-    fn evaluate_geometric_override(
-        &self,
-        shift: &LateralShiftEvent,
-    ) -> (bool, f32) {
+    fn evaluate_geometric_override(&self, shift: &LateralShiftEvent) -> (bool, f32) {
         let signals = match &shift.geometric_signals {
             Some(s) => s,
             None => return (false, 0.0),

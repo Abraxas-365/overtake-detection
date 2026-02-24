@@ -1513,7 +1513,10 @@ fn render_bottom_status_bar(
     )?;
 
     // Right: stats
-    let stats_text = format!("OVT:{} LC:{} SHDW:{}", total_overtakes, total_lane_changes, total_shadow_overtakes);
+    let stats_text = format!(
+        "OVT:{} LC:{} SHDW:{}",
+        total_overtakes, total_lane_changes, total_shadow_overtakes
+    );
     let stats_size = imgproc::get_text_size(
         &stats_text,
         imgproc::FONT_HERSHEY_SIMPLEX,

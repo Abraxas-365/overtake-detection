@@ -390,4 +390,3 @@ mod tests {
         assert!((x.unwrap() - 150.0).abs() < 1.0);
     }
 }
-

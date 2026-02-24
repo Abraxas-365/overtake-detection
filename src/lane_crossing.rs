@@ -1507,4 +1507,3 @@ mod tests {
         assert_eq!(role, LineRole::CenterLine);
     }
 }
-

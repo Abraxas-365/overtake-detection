@@ -640,4 +640,3 @@ impl ManeuverPipeline {
         self.last_ego_estimate = EgoMotionEstimate::none();
     }
 }
-

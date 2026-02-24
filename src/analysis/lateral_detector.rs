@@ -717,7 +717,10 @@ impl LateralShiftDetector {
         // ── NO LANES PATH (neither fresh nor cached) ────────────
         if effective_meas.is_none() {
             let completed_shift = self.handle_no_lanes(ego, timestamp_ms, frame_id);
-            return LateralUpdateResult { completed_shift, confirmed_in_progress: None };
+            return LateralUpdateResult {
+                completed_shift,
+                confirmed_in_progress: None,
+            };
         }
 
         let meas = effective_meas.unwrap();
@@ -749,7 +752,10 @@ impl LateralShiftDetector {
 
                 if self.freeze_remaining > 0 {
                     self.freeze_remaining -= 1;
-                    return LateralUpdateResult { completed_shift: None, confirmed_in_progress: None };
+                    return LateralUpdateResult {
+                        completed_shift: None,
+                        confirmed_in_progress: None,
+                    };
                 }
 
                 if self.baseline_samples >= self.config.baseline_warmup_frames {
@@ -936,7 +942,10 @@ impl LateralShiftDetector {
             None
         };
 
-        LateralUpdateResult { completed_shift, confirmed_in_progress }
+        LateralUpdateResult {
+            completed_shift,
+            confirmed_in_progress,
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -2297,7 +2306,11 @@ mod tests {
                 confidence: 0.4,
             };
             let frame = 68 + i as u64;
-            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
+            if det
+                .update(Some(m), Some(ego), frame as f64 * 33.3, frame)
+                .completed_shift
+                .is_some()
+            {
                 any_shift_emitted = true;
             }
         }
@@ -2387,7 +2400,11 @@ mod tests {
                 confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
             let frame = 65 + i as u64;
-            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
+            if det
+                .update(Some(m), Some(ego), frame as f64 * 33.3, frame)
+                .completed_shift
+                .is_some()
+            {
                 any_shift_emitted = true;
             }
         }
@@ -2402,4 +2419,3 @@ mod tests {
         );
     }
 }
-

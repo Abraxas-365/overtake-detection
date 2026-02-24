@@ -1496,4 +1496,3 @@ mod tests {
         assert!(m.invert().is_none());
     }
 }
-

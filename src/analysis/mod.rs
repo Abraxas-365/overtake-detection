@@ -24,4 +24,3 @@ pub use polynomial_tracker::{
     GeometricLaneChangeSignals, PolynomialBoundaryTracker, PolynomialTrackerConfig,
 };
 pub use vehicle_tracker::{DetectionInput, Track, TrackState, VehicleZone};
-
