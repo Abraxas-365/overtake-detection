@@ -1227,6 +1227,75 @@ impl LaneLegalityDetector {
         })
     }
 
+    /// Like `analyze_frame_fused` but reuses markings from a previous
+    /// `estimate_ego_lane_boundaries` call on the same frame, avoiding a
+    /// redundant YOLO-seg inference.
+    pub fn analyze_frame_fused_from_markings(
+        &mut self,
+        frame_id: u64,
+        vehicle_offset_px: f32,
+        lane_width: Option<f32>,
+        left_lane_x: Option<f32>,
+        right_lane_x: Option<f32>,
+        crossing_side: CrossingSide,
+        frame_width: usize,
+        frame_height: usize,
+    ) -> FusedLegalityResult {
+        let all_markings = self.last_lane_markings.clone();
+
+        let offset_pct = match lane_width {
+            Some(w) if w > 50.0 => (vehicle_offset_px / w).abs(),
+            _ => 0.0,
+        };
+
+        let lane_model_confirms_crossing =
+            crossing_side != CrossingSide::None && offset_pct > 0.25;
+
+        if !lane_model_confirms_crossing {
+            return FusedLegalityResult {
+                verdict: LineLegality::Unknown,
+                crossing_confirmed_by_lane_model: false,
+                line_type_from_seg_model: None,
+                vehicle_offset_pct: offset_pct,
+                all_markings,
+                ego_intersects_marking: false,
+            };
+        }
+
+        let crossing_line = self.find_crossing_line(
+            &all_markings,
+            crossing_side,
+            left_lane_x,
+            right_lane_x,
+            frame_width,
+            frame_height,
+        );
+        let ego_intersects_marking = crossing_line.is_some();
+        let (verdict, intersecting_line) = match crossing_line {
+            Some(marking) => {
+                let confirmed = self.temporal_filter.update(frame_id, marking.legality);
+                if confirmed {
+                    (marking.legality, Some(marking))
+                } else {
+                    (LineLegality::Unknown, Some(marking))
+                }
+            }
+            None => {
+                self.temporal_filter.update(frame_id, LineLegality::Unknown);
+                (LineLegality::Unknown, None)
+            }
+        };
+
+        FusedLegalityResult {
+            verdict,
+            crossing_confirmed_by_lane_model: true,
+            line_type_from_seg_model: intersecting_line,
+            vehicle_offset_pct: offset_pct,
+            all_markings,
+            ego_intersects_marking,
+        }
+    }
+
     fn find_crossing_line(
         &self,
         markings: &[DetectedRoadMarking],

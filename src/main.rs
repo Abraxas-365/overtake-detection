@@ -299,6 +299,11 @@ fn process_video(
     // MAIN FRAME LOOP
     // ═══════════════════════════════════════════════════════════════════
 
+    let timing_interval = config.processing.timing_log_interval;
+    let annotation_interval = config.processing.annotation_interval.max(1);
+    let mut timing_accum = [0u128; 5]; // accumulators for stage timings (µs)
+    let mut timing_count = 0u64;
+
     while let Some(frame) = reader.read_frame()? {
         ps.frame_count += 1;
         let timestamp_ms = frame.timestamp_ms;
@@ -309,37 +314,83 @@ fn process_video(
 
         let arc_frame = Arc::new(frame);
 
-        // ── STAGE 1: Vehicle Detection ──
-        run_vehicle_detection(&mut ps, &arc_frame)?;
+        // ── STAGE 1: Vehicle Detection (skip frames for speed) ──
+        let t1 = std::time::Instant::now();
+        let vd_interval = config.processing.vehicle_detection_interval.max(1);
+        if ps.frame_count % vd_interval == 1 || vd_interval == 1 {
+            run_vehicle_detection(&mut ps, &arc_frame)?;
+        }
+        let d1 = t1.elapsed();
 
         // ── STAGE 2: Lane Detection + Cache + Road Classification ──
+        let t2 = std::time::Instant::now();
+        let ld_interval = config.processing.lane_detection_interval.max(1);
+        let run_lane_inference = ps.frame_count % ld_interval == 1 || ld_interval == 1;
         let (detected_lanes, lane_measurement) =
-            run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms)?;
+            run_lane_detection(&mut ps, &arc_frame, config, timestamp_ms, run_lane_inference)?;
+        let d2 = t2.elapsed();
 
         // ── STAGE 3: Maneuver Detection v2 + Crossing Detection ──
+        let t3 = std::time::Instant::now();
         let v2_output =
             run_maneuver_pipeline_v2(&mut ps, &arc_frame, lane_measurement, timestamp_ms);
+        let d3 = t3.elapsed();
 
         // ── STAGE 4: Save events ──
+        let t4 = std::time::Instant::now();
         for event in &v2_output.maneuver_events {
             save_maneuver_event(event, &mut results_file)?;
         }
+        let d4 = t4.elapsed();
 
-        // ── STAGE 5: Video annotation (v6.0 — full AnnotationInput) ──
+        // ── STAGE 5: Video annotation (skip frames for speed) ──
+        let t5 = std::time::Instant::now();
         if let Some(ref mut w) = writer {
-            let tracked_vehicles = ps.maneuver_pipeline_v2.tracked_vehicles();
+            let run_annotation = ps.frame_count % annotation_interval == 1 || annotation_interval == 1;
+            if run_annotation {
+                let tracked_vehicles = ps.maneuver_pipeline_v2.tracked_vehicles();
 
-            run_video_annotation(
-                w,
-                &ps,
-                &arc_frame,
-                &detected_lanes,
-                &v2_output,
-                &tracked_vehicles,
-                reader.width,
-                reader.height,
-                timestamp_ms,
-            )?;
+                run_video_annotation(
+                    w,
+                    &ps,
+                    &arc_frame,
+                    &detected_lanes,
+                    &v2_output,
+                    &tracked_vehicles,
+                    reader.width,
+                    reader.height,
+                    timestamp_ms,
+                )?;
+            }
+            // Skipped frames simply aren't written — detection still runs.
+            // Set annotation_interval=1 for full annotated video.
+        }
+        let d5 = t5.elapsed();
+
+        // ── Timing log ──
+        if timing_interval > 0 {
+            timing_accum[0] += d1.as_micros();
+            timing_accum[1] += d2.as_micros();
+            timing_accum[2] += d3.as_micros();
+            timing_accum[3] += d4.as_micros();
+            timing_accum[4] += d5.as_micros();
+            timing_count += 1;
+            if timing_count >= timing_interval {
+                let n = timing_count as f64;
+                info!(
+                    "⏱ Avg/frame ({}f): VehicleDet={:.1}ms LaneDet={:.1}ms Maneuver={:.1}ms Events={:.1}ms Annotate={:.1}ms | Total={:.1}ms ({:.0} FPS)",
+                    timing_count,
+                    timing_accum[0] as f64 / n / 1000.0,
+                    timing_accum[1] as f64 / n / 1000.0,
+                    timing_accum[2] as f64 / n / 1000.0,
+                    timing_accum[3] as f64 / n / 1000.0,
+                    timing_accum[4] as f64 / n / 1000.0,
+                    timing_accum.iter().sum::<u128>() as f64 / n / 1000.0,
+                    n / (timing_accum.iter().sum::<u128>() as f64 / 1_000_000.0),
+                );
+                timing_accum = [0u128; 5];
+                timing_count = 0;
+            }
         }
     }
 
@@ -370,30 +421,34 @@ fn run_lane_detection(
     frame: &Arc<Frame>,
     config: &types::Config,
     timestamp_ms: f64,
+    run_inference: bool,
 ) -> Result<(Vec<DetectedLane>, Option<LaneMeasurement>)> {
     let frame_count = ps.frame_count;
     let mut detected_lanes: Vec<DetectedLane> = Vec::new();
     let mut lane_measurement: Option<LaneMeasurement> = None;
     let center_x = frame.width as f32 / 2.0;
 
-    // ── 2a: Run YOLO-seg boundary estimation ──
-    let yolo_result: Option<(f32, f32, f32)> = if let Some(ref mut detector) = ps.legality_detector
-    {
-        match detector.estimate_ego_lane_boundaries_stable(
-            &frame.data,
-            frame.width,
-            frame.height,
-            center_x,
-        ) {
-            Ok(Some((left_x, right_x, conf))) => {
-                ps.yolo_primary_count += 1;
-                Some((left_x, right_x, conf))
+    // ── 2a: Run YOLO-seg boundary estimation (skipped on non-inference frames) ──
+    let yolo_result: Option<(f32, f32, f32)> = if run_inference {
+        if let Some(ref mut detector) = ps.legality_detector {
+            match detector.estimate_ego_lane_boundaries_stable(
+                &frame.data,
+                frame.width,
+                frame.height,
+                center_x,
+            ) {
+                Ok(Some((left_x, right_x, conf))) => {
+                    ps.yolo_primary_count += 1;
+                    Some((left_x, right_x, conf))
+                }
+                Ok(None) => None,
+                Err(_) => None,
             }
-            Ok(None) => None,
-            Err(_) => None,
+        } else {
+            None
         }
     } else {
-        None
+        None // Skipped — cache will provide ego-compensated boundaries
     };
 
     // ── 2b: Get ego lateral velocity for cache ego-compensation ──
@@ -553,7 +608,7 @@ fn buffer_legality_result(
     detector: &mut LaneLegalityDetector,
     buffer: &mut LegalityRingBuffer,
     frame: &Arc<Frame>,
-    config: &types::Config,
+    _config: &types::Config,
     left_x: f32,
     right_x: f32,
     frame_count: u64,
@@ -569,20 +624,19 @@ fn buffer_legality_result(
         lane_legality::CrossingSide::None
     };
 
-    if let Ok(fused) = detector.analyze_frame_fused(
-        &frame.data,
-        frame.width,
-        frame.height,
+    // Reuse markings already computed by estimate_ego_lane_boundaries (same frame).
+    // This avoids a redundant YOLO-seg inference that was the biggest perf bottleneck.
+    let fused = detector.analyze_frame_fused_from_markings(
         frame_count,
-        config.lane_legality.confidence_threshold,
         vehicle_offset,
         lane_width,
         Some(left_x),
         Some(right_x),
         crossing_side,
-    ) {
-        buffer.push(frame_count, timestamp_ms, fused);
-    }
+        frame.width,
+        frame.height,
+    );
+    buffer.push(frame_count, timestamp_ms, fused);
 }
 
 // ============================================================================
