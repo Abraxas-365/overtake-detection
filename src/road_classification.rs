@@ -641,6 +641,10 @@ mod tests {
             center_x: cx,
             confidence: conf,
             detected_color: None,
+            bbox: [0.0, 0.0, 0.0, 0.0],
+            mask: Vec::new(),
+            mask_width: 0,
+            mask_height: 0,
         }
     }
 

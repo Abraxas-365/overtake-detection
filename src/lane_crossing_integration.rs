@@ -479,7 +479,8 @@ pub fn crossing_corroboration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lane_crossing::{CrossingDirection, LineRole, PassingLegality};
+    use crate::lane_crossing::{CrossingDirection, LineRole};
+    use crate::road_classification::PassingLegality;
 
     #[test]
     fn test_crossing_corroboration_agreement() {
