@@ -17,6 +17,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub lane_legality: LaneLegalityConfig,
+    #[serde(default)]
+    pub remote_verification: RemoteVerificationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,45 @@ impl Default for LaneLegalityConfig {
             confidence_threshold: 0.25,
             inference_interval: 3,
             ego_bbox_ratio: [0.30, 0.75, 0.70, 0.98],
+        }
+    }
+}
+
+/// v9.0: Remote server verification configuration.
+///
+/// When enabled, maneuver events are sent with 5 strategic frames to a
+/// remote server running a more capable model for line type verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteVerificationConfig {
+    /// Master switch — set false to disable remote verification entirely.
+    pub enabled: bool,
+    /// Base URL of the verification server (e.g., "http://10.0.1.50:8080").
+    pub server_url: String,
+    /// HTTP timeout in seconds for each verification request.
+    pub timeout_secs: u64,
+    /// If true, fire-and-forget: don't block the pipeline waiting for the
+    /// server response.  The result is logged asynchronously.
+    /// If false, block the pipeline and use the server response to override
+    /// legality before writing the JSONL event.
+    pub async_mode: bool,
+    /// Minimum server confidence (0.0–1.0) required to override local legality.
+    pub min_override_confidence: f32,
+    /// How many frames to keep in the ring buffer (~10 s at 30 fps = 300).
+    pub frame_buffer_capacity: usize,
+    /// JPEG quality for frame encoding (1–100).  Lower = smaller payloads.
+    pub jpeg_quality: u8,
+}
+
+impl Default for RemoteVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: "http://localhost:8080".to_string(),
+            timeout_secs: 30,
+            async_mode: true,
+            min_override_confidence: 0.70,
+            frame_buffer_capacity: 300,
+            jpeg_quality: 80,
         }
     }
 }

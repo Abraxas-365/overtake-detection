@@ -18,6 +18,7 @@ mod lane_detection;
 mod lane_legality;
 mod lane_legality_patches;
 mod pipeline;
+mod remote_verification;
 mod road_classification;
 mod road_overlay;
 mod types;
@@ -92,6 +93,10 @@ struct PipelineState {
     /// Updated every time buffer_legality_result runs (every 3rd frame).
     latest_marking_infos: Vec<road_classification::MarkingInfo>,
 
+    // ── v9.0: Remote verification ──
+    frame_ring_buffer: Option<remote_verification::FrameRingBuffer>,
+    verification_client: Option<remote_verification::RemoteVerificationClient>,
+
     // ── Counters ──
     frame_count: u64,
     yolo_primary_count: u64,
@@ -136,6 +141,38 @@ impl PipelineState {
             frame_height,
         );
 
+        // v9.0: Remote verification setup
+        let (frame_ring_buffer, verification_client) = if config.remote_verification.enabled {
+            let buf = remote_verification::FrameRingBuffer::new(
+                config.remote_verification.frame_buffer_capacity,
+            );
+            let client = match remote_verification::RemoteVerificationClient::new(
+                config.remote_verification.server_url.clone(),
+                config.remote_verification.timeout_secs,
+                config.remote_verification.async_mode,
+                config.remote_verification.min_override_confidence,
+            ) {
+                Ok(c) => {
+                    info!(
+                        "✓ Remote verification enabled: {} (async={})",
+                        config.remote_verification.server_url,
+                        config.remote_verification.async_mode,
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ Remote verification client failed: {}. Continuing without.",
+                        e
+                    );
+                    None
+                }
+            };
+            (Some(buf), client)
+        } else {
+            (None, None)
+        };
+
         info!(
             "✓ Pipeline v6.0 initialized for video: {} ({}×{})",
             video_path.display(),
@@ -154,6 +191,10 @@ impl PipelineState {
             road_classifier: RoadClassifier::new(frame_width),
             crossing_flash: None,
             last_road_classification: RoadClassification::default(),
+
+            // v9.0: Remote verification
+            frame_ring_buffer,
+            verification_client,
 
             latest_vehicle_detections: Vec::new(),
             last_vehicle_state: None,
@@ -312,6 +353,17 @@ fn process_video(
 
         let arc_frame = Arc::new(frame);
 
+        // ── v9.0: Store frame in ring buffer for remote verification ──
+        if let Some(ref mut buf) = ps.frame_ring_buffer {
+            buf.push_frame(
+                ps.frame_count,
+                timestamp_ms,
+                &arc_frame.data,
+                arc_frame.width,
+                arc_frame.height,
+            );
+        }
+
         // ── STAGE 1: Vehicle Detection ──
         run_vehicle_detection(&mut ps, &arc_frame)?;
 
@@ -323,9 +375,14 @@ fn process_video(
         let v2_output =
             run_maneuver_pipeline_v2(&mut ps, &arc_frame, lane_measurement, timestamp_ms);
 
-        // ── STAGE 4: Save events ──
+        // ── STAGE 4: Save events (with optional remote verification) ──
         for event in &v2_output.maneuver_events {
-            save_maneuver_event(event, &mut results_file)?;
+            let verification_result = run_remote_verification(&ps, event);
+            save_maneuver_event_with_verification(
+                event,
+                verification_result.as_ref(),
+                &mut results_file,
+            )?;
         }
 
         // ── STAGE 5: Video annotation (v6.0 — full AnnotationInput) ──
@@ -665,7 +722,7 @@ fn run_maneuver_pipeline_v2(
     };
 
     // ── Process frame through v2 pipeline ──
-    let v2_result = ps.maneuver_pipeline_v2.process_frame(ManeuverFrameInput {
+    let mut v2_result = ps.maneuver_pipeline_v2.process_frame(ManeuverFrameInput {
         vehicle_detections: &vehicle_dets,
         lane_measurement,
         gray_frame: Some(&gray),
@@ -724,8 +781,9 @@ fn run_maneuver_pipeline_v2(
     }
 
     // ── Update counters and last maneuver ──
-    let mut maneuver_events = v2_result.clone().maneuver_events;
-    for event in &mut maneuver_events {
+    // NOTE: We modify events in-place on v2_result so the caller gets
+    // legality-overridden events for saving to JSONL.
+    for event in v2_result.maneuver_events.iter_mut() {
         ps.v2_maneuver_events += 1;
 
         let vehicles_count = if event.passed_vehicle_id.is_some() {
@@ -744,9 +802,7 @@ fn run_maneuver_pipeline_v2(
             analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
                 ps.v2_shadow_overtakes += 1
             }
-            analysis::maneuver_classifier::ManeuverType::LaneChange => {
-                ps.v2_lane_changes += 1
-            }
+            analysis::maneuver_classifier::ManeuverType::LaneChange => ps.v2_lane_changes += 1,
         }
 
         //         // v6.1: Correlate this maneuver with a pending crossing.
@@ -772,28 +828,40 @@ fn run_maneuver_pipeline_v2(
                     match rc.mixed_line_side {
                         Some(MixedLineSide::DashedRight) => {
                             info!(
-                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed dashed_right, \
+                            "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed dashed_right, \
                                  temporal consensus: {:?}, conf={:.2})",
-                                rc.passing_legality, rc.confidence,
-                            );
-                            (99_usize, PassingLegality::MixedAllowed,
-                             "mixed_double_yellow_dashed_right".to_string())
+                            rc.passing_legality, rc.confidence,
+                        );
+                            (
+                                99_usize,
+                                PassingLegality::MixedAllowed,
+                                "mixed_double_yellow_dashed_right".to_string(),
+                            )
                         }
                         Some(MixedLineSide::SolidRight) => {
                             info!(
-                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed solid_right, \
+                            "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed solid_right, \
                                  temporal consensus: {:?}, conf={:.2})",
-                                rc.passing_legality, rc.confidence,
-                            );
-                            (99_usize, PassingLegality::MixedProhibited,
-                             "mixed_double_yellow_solid_right".to_string())
+                            rc.passing_legality, rc.confidence,
+                        );
+                            (
+                                99_usize,
+                                PassingLegality::MixedProhibited,
+                                "mixed_double_yellow_solid_right".to_string(),
+                            )
                         }
-                        _ => (crossing.marking_class_id, crossing.passing_legality,
-                              crossing.marking_class.clone()),
+                        _ => (
+                            crossing.marking_class_id,
+                            crossing.passing_legality,
+                            crossing.marking_class.clone(),
+                        ),
                     }
                 } else {
-                    (crossing.marking_class_id, crossing.passing_legality,
-                     crossing.marking_class.clone())
+                    (
+                        crossing.marking_class_id,
+                        crossing.passing_legality,
+                        crossing.marking_class.clone(),
+                    )
                 };
 
             // Override maneuver legality with the actual crossed line's legality
@@ -892,15 +960,146 @@ fn run_maneuver_pipeline_v2(
 }
 
 // ============================================================================
-// STAGE 4 — Save Events
+// STAGE 4 — Save Events (with optional remote verification)
 // ============================================================================
 
-fn save_maneuver_event(
+/// v9.0: Run remote verification for a maneuver event.
+///
+/// Selects 5 strategic frames from the ring buffer, builds the request,
+/// and sends it to the remote server.  In sync mode, blocks and returns
+/// the response.  In async mode (or when verification is disabled),
+/// returns None.
+fn run_remote_verification(
+    ps: &PipelineState,
     event: &analysis::maneuver_classifier::ManeuverEvent,
+) -> Option<remote_verification::VerificationResponse> {
+    let client = ps.verification_client.as_ref()?;
+    let buf = ps.frame_ring_buffer.as_ref()?;
+
+    // Select 5 strategic frames spanning the maneuver window
+    let frames = buf.select_strategic_frames(event.start_frame, event.end_frame);
+    if frames.is_empty() {
+        warn!(
+            "🌐 No frames available for verification (start={}, end={})",
+            event.start_frame, event.end_frame,
+        );
+        return None;
+    }
+
+    info!(
+        "🌐 Selected {} frames for verification (frames {}-{})",
+        frames.len(),
+        frames.first().map(|f| f.frame_id).unwrap_or(0),
+        frames.last().map(|f| f.frame_id).unwrap_or(0),
+    );
+
+    let request = remote_verification::RemoteVerificationClient::build_request(event, &frames);
+
+    if client.is_async() {
+        // Fire-and-forget: spawn a background task
+        let url = format!("{}/verify", client.server_url().trim_end_matches('/'));
+        let request_json = match serde_json::to_vec(&request) {
+            Ok(j) => j,
+            Err(e) => {
+                error!("🌐 Failed to serialize verification request: {}", e);
+                return None;
+            }
+        };
+        let event_id = request.event_id.clone();
+
+        // Build a one-shot client for the background task
+        let http_client = reqwest::Client::new();
+        tokio::spawn(async move {
+            match http_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(request_json)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        match resp
+                            .json::<remote_verification::VerificationResponse>()
+                            .await
+                        {
+                            Ok(vr) => {
+                                info!(
+                                    "🌐 [async] Verification result for {}: legality={}, conf={:.2}, agrees={}",
+                                    vr.event_id, vr.verified_legality, vr.confidence, vr.agrees_with_local,
+                                );
+                            }
+                            Err(e) => error!("🌐 [async] Failed to parse response: {}", e),
+                        }
+                    } else {
+                        error!("🌐 [async] Server returned {}", resp.status());
+                    }
+                }
+                Err(e) => {
+                    debug!("🌐 [async] Verification request {} failed: {}", event_id, e);
+                }
+            }
+        });
+        None
+    } else {
+        // Synchronous: block the pipeline and wait for the response
+        let handle = tokio::runtime::Handle::current();
+        match handle.block_on(client.verify(&request)) {
+            Some(response) => {
+                if client.should_override(&response) {
+                    info!(
+                        "🌐 Server override: local={:?} → server={} (conf={:.2})",
+                        event.legality, response.verified_legality, response.confidence,
+                    );
+                }
+                Some(response)
+            }
+            None => None,
+        }
+    }
+}
+
+/// Save a maneuver event to JSONL, enriched with optional remote verification.
+fn save_maneuver_event_with_verification(
+    event: &analysis::maneuver_classifier::ManeuverEvent,
+    verification: Option<&remote_verification::VerificationResponse>,
     file: &mut std::fs::File,
 ) -> Result<()> {
     use std::io::Write;
-    let json_line = serde_json::to_string(&event).context("Failed to serialize maneuver event")?;
+
+    let mut event_clone = event.clone();
+
+    let verification_result = verification.map(|vr| {
+        let was_overridden = !vr.agrees_with_local && vr.confidence >= 0.70;
+
+        // Apply server override to the event legality if warranted
+        if was_overridden {
+            let server_legality = remote_verification::RemoteVerificationClient::parse_legality(
+                &vr.verified_legality,
+            );
+            info!(
+                "🌐 Applying server override: {:?} → {:?} (conf={:.2})",
+                event_clone.legality, server_legality, vr.confidence,
+            );
+            event_clone.legality = server_legality;
+            if let Some(ref line_type) = vr.verified_line_type {
+                event_clone.crossed_line_class = Some(line_type.clone());
+            }
+            if let Some(class_id) = vr.verified_class_id {
+                event_clone.crossed_line_class_id = Some(class_id);
+            }
+        }
+
+        remote_verification::VerificationResult::from_response(vr, was_overridden)
+    });
+
+    let enriched = remote_verification::VerifiedManeuverEvent {
+        event: event_clone,
+        remote_verification: verification_result,
+    };
+
+    let json_line =
+        serde_json::to_string(&enriched).context("Failed to serialize maneuver event")?;
     writeln!(file, "{}", json_line)?;
     file.flush()?;
     Ok(())

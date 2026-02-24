@@ -50,3 +50,17 @@ video:
 logging:
   level: "info"
 
+# v9.0: Remote verification — send maneuver frames to a server with a better
+# model (VLM) for line-type verification.  Disabled by default.
+remote_verification:
+  enabled: false
+  server_url: "http://localhost:8080"
+  timeout_secs: 30
+  # true = fire-and-forget (non-blocking), false = wait for server response
+  async_mode: true
+  # Minimum server confidence to override local legality decision
+  min_override_confidence: 0.70
+  # Ring buffer size (~10s at 30fps)
+  frame_buffer_capacity: 300
+  jpeg_quality: 80
+
