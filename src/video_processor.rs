@@ -1239,6 +1239,20 @@ fn render_right_event_panel(
             1,
         )?;
         right_panel_y += line_height;
+
+        // v8.0: Show curve indicator if maneuver was on a curve
+        if maneuver.is_on_curve {
+            draw_text_with_shadow(
+                output,
+                "  [CURVE]",
+                right_panel_x + 8,
+                right_panel_y,
+                0.38,
+                core::Scalar::new(0.0, 200.0, 255.0, 0.0), // Orange/yellow for curve warning
+                1,
+            )?;
+            right_panel_y += line_height;
+        }
     }
 
     // Current-frame events (live alerts)

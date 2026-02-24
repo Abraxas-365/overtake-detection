@@ -26,6 +26,7 @@ mod video_processor;
 
 use analysis::ego_motion::GrayFrame;
 use analysis::lateral_detector::LaneMeasurement;
+use analysis::maneuver_classifier::RoadClassificationSnapshot;
 use analysis::maneuver_pipeline::{
     ManeuverFrameInput, ManeuverFrameOutput, ManeuverPipeline, ManeuverPipelineConfig,
 };
@@ -62,6 +63,8 @@ pub struct LastManeuverInfo {
     pub timestamp_detected: f64,
     pub vehicles_in_this_maneuver: usize,
     pub crossed_line_class: Option<String>,
+    /// v8.0: Whether this maneuver was executed on a curve.
+    pub is_on_curve: bool,
 }
 
 // ============================================================================
@@ -647,6 +650,20 @@ fn run_maneuver_pipeline_v2(
             .map(|m| m.class_name.clone())
     });
 
+    // ── v8.0: Build road classification snapshot for maneuver pipeline ──
+    let road_class_snapshot = if ps.last_road_classification.confidence > 0.3 {
+        let rc = &ps.last_road_classification;
+        let center_line_class = rc.center_line_class_name();
+        Some(RoadClassificationSnapshot {
+            center_line_class: center_line_class.map(|s| s.to_string()),
+            passing_legality: rc.passing_legality.as_str().to_string(),
+            is_passing_legal: rc.passing_legality.is_legal(),
+            confidence: rc.confidence,
+        })
+    } else {
+        None
+    };
+
     // ── Process frame through v2 pipeline ──
     let v2_result = ps.maneuver_pipeline_v2.process_frame(ManeuverFrameInput {
         vehicle_detections: &vehicle_dets,
@@ -655,6 +672,7 @@ fn run_maneuver_pipeline_v2(
         left_marking_name: left_marking.as_deref(),
         right_marking_name: right_marking.as_deref(),
         legality_buffer: Some(&ps.legality_buffer),
+        road_classification: road_class_snapshot,
         timestamp_ms,
         frame_id: frame_count,
     });
@@ -806,6 +824,35 @@ fn run_maneuver_pipeline_v2(
             }
         }
 
+        // v8.0: Fallback — when no crossing event correlated, use the road
+        // classification temporal consensus to set legality. This handles cases
+        // where the crossing detector missed (e.g., dashed line gap, low confidence)
+        // but the RoadClassifier has a stable temporal vote on the center line type.
+        if event.crossed_line_class.is_none() {
+            if let Some(ref rc) = event.road_classification_at_maneuver {
+                if rc.confidence > 0.4 {
+                    let legality = if rc.is_passing_legal {
+                        lane_legality::LineLegality::Legal
+                    } else {
+                        // Check if it's a critical illegal (double yellow) or just illegal
+                        if rc.passing_legality.contains("PROHIBIDO") {
+                            lane_legality::LineLegality::Illegal
+                        } else {
+                            lane_legality::LineLegality::Unknown
+                        }
+                    };
+                    if legality != lane_legality::LineLegality::Unknown {
+                        event.legality = legality;
+                        event.crossed_line_class = rc.center_line_class.clone();
+                        info!(
+                            "📌 v8.0: Maneuver legality from RoadClassifier fallback: {} → {:?} (conf={:.2})",
+                            rc.passing_legality, legality, rc.confidence,
+                        );
+                    }
+                }
+            }
+        }
+
         let confirmed_legality = if event.crossed_line_class.is_some() {
             format!("{:?}", event.legality)
         } else {
@@ -823,18 +870,20 @@ fn run_maneuver_pipeline_v2(
             timestamp_detected: timestamp_ms,
             vehicles_in_this_maneuver: vehicles_count,
             crossed_line_class: event.crossed_line_class.clone(),
+            is_on_curve: event.is_on_curve,
         });
 
         let crossed_line_str = event.crossed_line_class.as_deref().unwrap_or("none");
 
         info!(
-            "🆕 {} {} | conf={:.2} | sources={} | legality={:?} | crossed={} | frame={}",
+            "🆕 {} {} | conf={:.2} | sources={} | legality={:?} | crossed={} | curve={} | frame={}",
             event.maneuver_type.as_str(),
             event.side.as_str(),
             event.confidence,
             event.sources.summary(),
             event.legality,
             crossed_line_str,
+            event.is_on_curve,
             frame_count,
         );
     }

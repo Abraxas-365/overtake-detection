@@ -125,6 +125,14 @@ pub struct RoadClassification {
     pub confidence: f32,
 }
 
+impl RoadClassification {
+    /// v8.0: Get the most representative center line class name.
+    /// Returns the first center marking name if available.
+    pub fn center_line_class_name(&self) -> Option<&str> {
+        self.center_marking_names.first().map(|s| s.as_str())
+    }
+}
+
 impl Default for RoadClassification {
     fn default() -> Self {
         Self {

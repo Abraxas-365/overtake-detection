@@ -204,6 +204,21 @@ pub struct MarkingSnapshot {
     pub frame_id: u64,
 }
 
+/// v8.0: Snapshot of the road classification at maneuver time.
+/// Captures the RoadClassifier's temporal consensus so legality can be
+/// determined even when no crossing event fires (e.g., dashed line gaps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoadClassificationSnapshot {
+    /// The temporal-consensus line type name (e.g. "mixed_double_yellow_dashed_right")
+    pub center_line_class: Option<String>,
+    /// The passing legality from RoadClassifier
+    pub passing_legality: String,
+    /// Whether the road classifier considers passing legal
+    pub is_passing_legal: bool,
+    /// Confidence of the road classification
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ManeuverEvent {
     pub maneuver_type: ManeuverType,
@@ -231,6 +246,15 @@ pub struct ManeuverEvent {
     pub crossed_line_class: Option<String>,
     /// v6.1: The class_id of the crossed line marking (4=solid_white, 5=solid_yellow, etc.)
     pub crossed_line_class_id: Option<usize>,
+
+    /// v8.0: Whether the maneuver was executed on a curve.
+    /// True when curvature or boundary coherence indicates the road is curving
+    /// at the time of the lane change / overtake.
+    pub is_on_curve: bool,
+    /// v8.0: Snapshot of the road classification at the time of the maneuver.
+    /// Captures the RoadClassifier's temporal consensus (line type, passing legality)
+    /// so we know what the center line was when the overtake started.
+    pub road_classification_at_maneuver: Option<RoadClassificationSnapshot>,
 }
 
 // ============================================================================
@@ -282,6 +306,9 @@ pub struct ManeuverClassifier {
     /// v7.0: Tracks (start_frame, direction) of shifts that already had an early
     /// LANE_CHANGE emitted, to prevent duplicate LC when the completed shift arrives.
     early_lc_records: Vec<(u64, ShiftDirection)>,
+    /// v8.0: Current road classification snapshot (from RoadClassifier temporal consensus).
+    /// Updated each frame by the pipeline. Used as fallback legality when no crossing event fires.
+    latest_road_classification: Option<RoadClassificationSnapshot>,
 }
 
 impl ManeuverClassifier {
@@ -299,6 +326,7 @@ impl ManeuverClassifier {
             frames_since_curve_mode: u32::MAX,
             pending_confirmed: Vec::new(),
             early_lc_records: Vec::new(),
+            latest_road_classification: None,
         }
     }
 
@@ -347,6 +375,12 @@ impl ManeuverClassifier {
 
     pub fn update_markings(&mut self, snapshot: MarkingSnapshot) {
         self.latest_markings = snapshot;
+    }
+
+    /// v8.0: Update road classification snapshot from the RoadClassifier.
+    /// Called by the pipeline each frame with the latest temporal consensus.
+    pub fn update_road_classification(&mut self, snapshot: RoadClassificationSnapshot) {
+        self.latest_road_classification = Some(snapshot);
     }
 
     /// v4.13b: Update curve mode state from the lateral detector.
@@ -881,6 +915,8 @@ impl ManeuverClassifier {
                 marking_context: Some(self.latest_markings.clone()),
                 crossed_line_class: None,
                 crossed_line_class_id: None,
+                is_on_curve: confirmed.curve_mode,
+                road_classification_at_maneuver: self.latest_road_classification.clone(),
             };
 
             info!(
@@ -1070,6 +1106,8 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            is_on_curve: self.curve_mode_active,
+            road_classification_at_maneuver: self.latest_road_classification.clone(),
         }
     }
 
@@ -1104,6 +1142,8 @@ impl ManeuverClassifier {
             marking_context: None,
             crossed_line_class: None,
             crossed_line_class_id: None,
+            is_on_curve: self.curve_mode_active,
+            road_classification_at_maneuver: self.latest_road_classification.clone(),
         }
     }
 
@@ -1187,6 +1227,8 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            is_on_curve: self.curve_mode_active,
+            road_classification_at_maneuver: self.latest_road_classification.clone(),
         }
     }
 
@@ -1359,6 +1401,7 @@ impl ManeuverClassifier {
         self.latest_markings = MarkingSnapshot::default();
         self.curve_mode_active = false;
         self.frames_since_curve_mode = u32::MAX;
+        self.latest_road_classification = None;
     }
 }
 

@@ -26,6 +26,7 @@ use super::lateral_detector::{
 };
 use super::maneuver_classifier::{
     ClassifierConfig, ManeuverClassifier, ManeuverEvent, MarkingSnapshot,
+    RoadClassificationSnapshot,
 };
 use super::pass_detector::{PassDetector, PassDetectorConfig};
 use super::polynomial_tracker::{
@@ -49,6 +50,9 @@ pub struct ManeuverFrameInput<'a> {
     /// Reference to the existing legality ring buffer populated by the main pipeline.
     /// Pass None if legality detection is disabled or unavailable.
     pub legality_buffer: Option<&'a LegalityRingBuffer>,
+    /// v8.0: Road classification snapshot from the RoadClassifier temporal consensus.
+    /// Provides the current center line type and passing legality.
+    pub road_classification: Option<RoadClassificationSnapshot>,
     pub timestamp_ms: f64,
     pub frame_id: u64,
 }
@@ -508,6 +512,11 @@ impl ManeuverPipeline {
             right_name: input.right_marking_name.map(|s| s.to_string()),
             frame_id: input.frame_id,
         });
+
+        // v8.0: Feed road classification to classifier for curve + legality awareness
+        if let Some(rc) = input.road_classification {
+            self.classifier.update_road_classification(rc);
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 6. CLASSIFICATION / FUSION
