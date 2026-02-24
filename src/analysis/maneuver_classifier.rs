@@ -33,7 +33,7 @@
 // v4.13 FIX (Bug 2): Curve ego cross-validation gate in lateral_detector.
 
 use super::ego_motion::EgoMotionEstimate;
-use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
+use super::lateral_detector::{LateralShiftEvent, ShiftConfirmedNotification, ShiftDirection};
 use super::pass_detector::{PassDirection, PassEvent, PassSide};
 use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
@@ -252,6 +252,9 @@ struct BufferedPass {
 struct BufferedShift {
     event: LateralShiftEvent,
     correlated: bool,
+    /// v7.0: An early LANE_CHANGE was already emitted for this shift via
+    /// ShiftConfirmedNotification. Don't emit another in the LC phase.
+    early_lc_emitted: bool,
 }
 
 // ============================================================================
@@ -274,6 +277,11 @@ pub struct ManeuverClassifier {
     // VehicleOvertookEgo events require additional validation when active.
     curve_mode_active: bool,
     frames_since_curve_mode: u32,
+    /// v7.0: Pending early shift confirmed notifications to process in classify().
+    pending_confirmed: Vec<ShiftConfirmedNotification>,
+    /// v7.0: Tracks (start_frame, direction) of shifts that already had an early
+    /// LANE_CHANGE emitted, to prevent duplicate LC when the completed shift arrives.
+    early_lc_records: Vec<(u64, ShiftDirection)>,
 }
 
 impl ManeuverClassifier {
@@ -289,6 +297,8 @@ impl ManeuverClassifier {
             latest_markings: MarkingSnapshot::default(),
             curve_mode_active: false,
             frames_since_curve_mode: u32::MAX,
+            pending_confirmed: Vec::new(),
+            early_lc_records: Vec::new(),
         }
     }
 
@@ -301,10 +311,29 @@ impl ManeuverClassifier {
     }
 
     pub fn feed_shift(&mut self, event: LateralShiftEvent) {
+        // v7.0: Check if an early LC was already emitted for this shift.
+        // Match by start_frame and direction — a completed shift with the same
+        // start as a confirmed notification is the same shift.
+        let early_lc = self.early_lc_records.iter().position(|(frame, dir)| {
+            *frame == event.start_frame && *dir == event.direction
+        });
+        let early_lc_emitted = if let Some(idx) = early_lc {
+            self.early_lc_records.swap_remove(idx);
+            true
+        } else {
+            false
+        };
         self.shift_buffer.push_back(BufferedShift {
             event,
             correlated: false,
+            early_lc_emitted,
         });
+    }
+
+    /// v7.0: Accept an early "shift confirmed" notification for immediate
+    /// LANE_CHANGE emission. Processed in the next classify() call.
+    pub fn feed_shift_confirmed(&mut self, notification: ShiftConfirmedNotification) {
+        self.pending_confirmed.push(notification);
     }
 
     pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
@@ -353,6 +382,11 @@ impl ManeuverClassifier {
             .retain(|p| timestamp_ms - p.event.beside_end_ms < window);
         self.shift_buffer
             .retain(|s| timestamp_ms - s.event.end_ms < window);
+        // v7.0: Cap early_lc_records to prevent unbounded growth.
+        // Records older than 60s are no longer relevant.
+        if self.early_lc_records.len() > 50 {
+            self.early_lc_records.drain(..self.early_lc_records.len() - 20);
+        }
 
         debug!(
             "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
@@ -762,6 +796,109 @@ impl ManeuverClassifier {
         }
 
         // ══════════════════════════════════════════════════════════════
+        // v7.0: EARLY LANE CHANGE (from in-progress shift confirmation)
+        //
+        // When a shift is confirmed while still in progress, we emit an
+        // immediate LANE_CHANGE so the entry LC of an overtake fires in
+        // near-real-time instead of waiting for the shift to complete.
+        // ══════════════════════════════════════════════════════════════
+        let pending: Vec<_> = self.pending_confirmed.drain(..).collect();
+        for confirmed in pending {
+            let side = match confirmed.direction {
+                ShiftDirection::Left => ManeuverSide::Left,
+                ShiftDirection::Right => ManeuverSide::Right,
+            };
+
+            // Geometric override check for curve suppression
+            let (geo_override, geo_score) = if let Some(signals) = &confirmed.geometric_signals {
+                if signals.confidence >= self.config.geometric_min_signal_confidence
+                    && signals.suggests_lane_change
+                {
+                    let div_strength = (signals.boundary_velocity_divergence.abs() / 3.0).min(1.0);
+                    let width_strength = (signals.lane_width_rate.abs() / 2.0).min(1.0);
+                    let nf_strength = (signals.near_far_offset_divergence / 0.08).min(1.0);
+                    let score = (div_strength * 0.5 + width_strength * 0.3 + nf_strength * 0.2)
+                        * signals.confidence;
+                    (score >= self.config.geometric_override_min_score, score)
+                } else {
+                    (false, 0.0)
+                }
+            } else {
+                (false, 0.0)
+            };
+
+            // Curve suppression gate
+            if confirmed.curve_mode && !geo_override {
+                debug!(
+                    "  Early LC suppressed: shift {} on curve without geometric override",
+                    confirmed.direction.as_str(),
+                );
+                continue;
+            }
+
+            // Confidence
+            let base_conf = confirmed.confidence * self.config.weight_lateral;
+            let ego_conf = if self.ego_motion_confirms_lateral() {
+                self.config.weight_ego_motion * 0.8
+            } else {
+                0.0
+            };
+            let geo_conf = geo_score * self.config.weight_geometric;
+            let confidence = (base_conf + ego_conf + geo_conf).clamp(0.0, 0.95);
+
+            if confidence < self.config.min_lane_change_confidence {
+                debug!(
+                    "  Early LC below threshold: {} conf={:.2} < {:.2}",
+                    confirmed.direction.as_str(),
+                    confidence,
+                    self.config.min_lane_change_confidence,
+                );
+                continue;
+            }
+
+            let ego_confirms = self.ego_motion_confirms_lateral();
+
+            let maneuver = ManeuverEvent {
+                maneuver_type: ManeuverType::LaneChange,
+                side,
+                legality: LineLegality::Unknown,
+                legality_at_crossing: None,
+                confidence,
+                sources: DetectionSources {
+                    vehicle_tracking: false,
+                    lane_detection: true,
+                    ego_motion: ego_confirms,
+                },
+                start_ms: confirmed.start_ms,
+                end_ms: confirmed.confirmed_ms,
+                start_frame: confirmed.start_frame,
+                end_frame: confirmed.confirmed_frame,
+                duration_ms: confirmed.confirmed_ms - confirmed.start_ms,
+                passed_vehicle_id: None,
+                passed_vehicle_class: None,
+                pass_event: None,
+                lateral_event: None, // No completed shift yet
+                marking_context: Some(self.latest_markings.clone()),
+                crossed_line_class: None,
+                crossed_line_class_id: None,
+            };
+
+            info!(
+                "🔀 EARLY LANE_CHANGE: {} | conf={:.2} | geo_override={} | curve={}",
+                maneuver.side.as_str(),
+                maneuver.confidence,
+                geo_override,
+                confirmed.curve_mode,
+            );
+
+            self.recent_events.push(maneuver);
+            self.total_maneuvers += 1;
+
+            // Record so the completed shift won't produce a duplicate LC
+            self.early_lc_records.push((confirmed.start_frame, confirmed.direction));
+        }
+
+        // ══════════════════════════════════════════════════════════════
         // v7.0: STANDALONE LANE CHANGE DETECTION
         //
         // Lateral shifts not correlated with any pass event are candidates
@@ -775,6 +912,14 @@ impl ManeuverClassifier {
         // ══════════════════════════════════════════════════════════════
         for shift_idx in 0..self.shift_buffer.len() {
             if self.shift_buffer[shift_idx].correlated {
+                continue;
+            }
+
+            // v7.0: Skip shifts that already had an early LC emitted.
+            // These shifts are still available for overtake correlation (above),
+            // but shouldn't produce a duplicate standalone LANE_CHANGE.
+            if self.shift_buffer[shift_idx].early_lc_emitted {
+                self.shift_buffer[shift_idx].correlated = true;
                 continue;
             }
 
