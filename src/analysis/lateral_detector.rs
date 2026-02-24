@@ -362,6 +362,10 @@ pub struct LateralShiftDetector {
     // v4.13b: Whether curve mode was active at ANY point during the current shift.
     // Catches false positives that start/complete during brief curve-mode gaps.
     shift_saw_curve_mode: bool,
+    // v7.1: Count of frames spent in curve mode during this shift.
+    // Used to compute the curve-frame ratio — brief curve activations during
+    // a long shift shouldn't be enough to veto the entire shift.
+    shift_curve_frames: u32,
 
     // v4.13b: Whether the current shift was allowed through via return-window
     // bypass. If true, the resulting LC must NOT set a new return expectation,
@@ -425,6 +429,7 @@ impl LateralShiftDetector {
             in_curve_mode: false,
             frames_since_curve_mode: u32::MAX, // start with no recent curve
             shift_saw_curve_mode: false,
+            shift_curve_frames: 0,
             shift_used_return_bypass: false,
             shift_confirmed_notified: false,
             pending_return_direction: None,
@@ -960,6 +965,9 @@ impl LateralShiftDetector {
                     self.ego_bridge_frames += 1;
                     self.shift_frames += 1;
                     self.shift_saw_curve_mode |= self.in_curve_mode; // v4.13b
+                    if self.in_curve_mode {
+                        self.shift_curve_frames += 1; // v7.1
+                    }
                     if self.shift_source == ShiftSource::LaneBased {
                         self.shift_source = ShiftSource::EgoBridged;
                         // Initialize estimated offset from last known lane position
@@ -1119,6 +1127,10 @@ impl LateralShiftDetector {
         // v4.13b: Latch curve mode — if curve activates at ANY point during
         // the shift, the flag stays true even if curve_mode deactivates later.
         self.shift_saw_curve_mode |= self.in_curve_mode;
+        // v7.1: Count actual curve frames for ratio-based veto gating.
+        if self.in_curve_mode {
+            self.shift_curve_frames += 1;
+        }
 
         if abs_dev > self.shift_peak_offset {
             self.shift_peak_offset = abs_dev;
@@ -1276,9 +1288,18 @@ impl LateralShiftDetector {
         }
 
         // 3. On curves, require ego motion confirmation (same logic as emit_shift_event veto)
-        if self.shift_saw_curve_mode && self.shift_source == ShiftSource::LaneBased {
+        //    v7.1: Use curve-frame ratio and threshold cap, consistent with emit_shift_event.
+        let curve_frame_ratio = if self.shift_frames > 0 {
+            self.shift_curve_frames as f32 / self.shift_frames as f32
+        } else {
+            0.0
+        };
+        if self.shift_saw_curve_mode
+            && curve_frame_ratio >= 0.25
+            && self.shift_source == ShiftSource::LaneBased
+        {
             let duration_s = ((timestamp_ms - self.shift_start_ms) / 1000.0) as f32;
-            let ego_threshold = 10.0_f32.max(duration_s * 15.0);
+            let ego_threshold = 8.0_f32.max(duration_s * 3.0).min(25.0);
 
             let ego_confidence_ratio = if self.shift_frames > 0 {
                 self.ego_shift_confident_frames as f32 / self.shift_frames as f32
@@ -1383,6 +1404,7 @@ impl LateralShiftDetector {
         // v4.13b: Latch curve mode at shift start. Will also be latched
         // if curve_mode activates later during the shift.
         self.shift_saw_curve_mode = self.in_curve_mode;
+        self.shift_curve_frames = if self.in_curve_mode { 1 } else { 0 };
         self.shift_used_return_bypass = false;
     }
 
@@ -1468,34 +1490,57 @@ impl LateralShiftDetector {
         //
         // Threshold: Duration-scaled ego displacement.
         //
-        // A flat 10px threshold is too low for longer shifts — on curves,
-        // optical flow accumulates at ~5-15px/s from road rotation alone.
-        // A real lane change produces ≥15px/s of true lateral displacement
-        // regardless of duration (3.5m lateral / ~3s ≈ 50-150px total).
+        // v7.1: Reduced from max(10, dur×15) to max(8, dur×3) capped at 25.
+        // The previous 15px/s rate was too aggressive — real lane changes on
+        // curvy roads often produce only 5-10px of cumulative ego displacement
+        // because the ego estimator's lateral velocity is dominated by curve-
+        // induced apparent motion. The directional_ego check (confirming vs
+        // opposing) provides the primary discrimination; the threshold now
+        // only filters out very small confirming motion (likely noise).
         //
-        // Formula: max(10.0, duration_s × 15.0)
-        //   0.5s → 10px (floor)     |  LC2 prod: 1.1px / 1.1s → 16.5px min → VETOED
-        //   2.5s → 37.5px           |  LC1 prod: 31.5px / 2.5s → 37.5px min → VETOED
-        //   3.0s → 45px             |  LC3 prod: 116.8px / 3.0s → 45px min → PASSES
+        // Formula: min(25.0, max(8.0, duration_s × 3.0))
+        //   0.5s → 8px (floor)
+        //   2.6s → 8px (floor)  | prod: 9.0px confirming → PASSES
+        //   3.0s → 9px
+        //   8.3s → 25px (cap)
         //
         // v4.13b: Use shift_saw_curve_mode (latched during shift lifetime)
         // instead of only in_curve_mode at emit time. Curve mode chatters
         // on curvy roads — shifts that start/complete during brief off-gaps
         // escaped the gate. Latching catches them.
+        //
+        // v7.1: Additionally require curve_frame_ratio >= 25% before the
+        // veto can fire. Brief curve activations during a long shift (e.g.,
+        // 5 frames of 112) shouldn't taint the entire shift.
         // ══════════════════════════════════════════════════════════
-        const CURVE_EGO_MIN_FLOOR_PX: f32 = 10.0;
-        const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 15.0;
+        const CURVE_EGO_MIN_FLOOR_PX: f32 = 8.0;
+        const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 3.0;
+        // v7.1: Cap the ego threshold to prevent unbounded growth on long shifts.
+        // A real lane change takes ~2-4s; beyond that, higher thresholds just
+        // reject legitimate lane changes with modest ego displacement.
+        const CURVE_EGO_MAX_THRESHOLD_PX: f32 = 25.0;
         // v4.13b: Minimum ratio of confident ego frames to trust the veto.
         // If the ego flow estimator had poor confidence during most of the shift
         // (low-texture terrain like desert), "ego says zero" is unreliable —
         // it means the estimator failed, not that the vehicle didn't move.
         const CURVE_EGO_MIN_CONFIDENCE_RATIO: f32 = 0.30;
+        // v7.1: Minimum fraction of shift frames that must be in curve mode
+        // before the curve veto can fire. Brief curve activations during a long
+        // shift (e.g., 5 frames of 112) shouldn't taint the entire shift.
+        const CURVE_FRAME_RATIO_MIN: f32 = 0.25;
 
         let duration_s = (duration_ms / 1000.0) as f32;
-        let curve_ego_threshold =
-            CURVE_EGO_MIN_FLOOR_PX.max(duration_s * CURVE_EGO_MIN_RATE_PX_PER_S);
+        let curve_ego_threshold = CURVE_EGO_MIN_FLOOR_PX
+            .max(duration_s * CURVE_EGO_MIN_RATE_PX_PER_S)
+            .min(CURVE_EGO_MAX_THRESHOLD_PX);
 
-        let curve_tainted = self.in_curve_mode || self.shift_saw_curve_mode;
+        let curve_frame_ratio = if self.shift_frames > 0 {
+            self.shift_curve_frames as f32 / self.shift_frames as f32
+        } else {
+            0.0
+        };
+        let curve_tainted = (self.in_curve_mode || self.shift_saw_curve_mode)
+            && curve_frame_ratio >= CURVE_FRAME_RATIO_MIN;
 
         let ego_confidence_ratio = if self.shift_frames > 0 {
             self.ego_shift_confident_frames as f32 / self.shift_frames as f32
@@ -1548,8 +1593,8 @@ impl LateralShiftDetector {
         {
             warn!(
                 "❌ Curve ego cross-validation VETO: LaneBased shift {} rejected | \
-                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}) | \
-                 dur={:.1}s | curve_now={} curve_saw={} | ego_conf={}/{} ({:.0}%) → perspective distortion, not lane change",
+                 peak={:.1}% | ego_cum={:.1}px (peak={:.1}px, dir={:.1}px) < {:.0}px min (floor={:.0} + {:.1}s×{:.0}, cap={:.0}) | \
+                 dur={:.1}s | curve_now={} curve_saw={} curve_ratio={:.0}% ({}/{}) | ego_conf={}/{} ({:.0}%) → perspective distortion, not lane change",
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),
@@ -1561,9 +1606,13 @@ impl LateralShiftDetector {
                 CURVE_EGO_MIN_FLOOR_PX,
                 duration_s,
                 CURVE_EGO_MIN_RATE_PX_PER_S,
+                CURVE_EGO_MAX_THRESHOLD_PX,
                 duration_ms / 1000.0,
                 self.in_curve_mode,
                 self.shift_saw_curve_mode,
+                curve_frame_ratio * 100.0,
+                self.shift_curve_frames,
+                self.shift_frames,
                 self.ego_shift_confident_frames,
                 self.shift_frames,
                 ego_confidence_ratio * 100.0,
@@ -1571,6 +1620,30 @@ impl LateralShiftDetector {
             self.state = State::Stable;
             self.reset_shift();
             return None;
+        }
+
+        // v7.1: Diagnostic for when curve veto is bypassed due to low curve-frame ratio.
+        if (self.in_curve_mode || self.shift_saw_curve_mode)
+            && !curve_tainted
+            && self.shift_source == ShiftSource::LaneBased
+            && directional_ego < curve_ego_threshold
+        {
+            warn!(
+                "⚠️ Curve veto BYPASSED (low curve ratio): shift {} | \
+                 peak={:.1}% | ego_cum={:.1}px (dir={:.1}px) < {:.0}px threshold | \
+                 curve_ratio={:.0}% ({}/{}) < {:.0}% min → curve too brief to veto",
+                self.shift_direction
+                    .unwrap_or(ShiftDirection::Left)
+                    .as_str(),
+                self.shift_peak_offset * 100.0,
+                self.ego_cumulative_px,
+                directional_ego,
+                curve_ego_threshold,
+                curve_frame_ratio * 100.0,
+                self.shift_curve_frames,
+                self.shift_frames,
+                CURVE_FRAME_RATIO_MIN * 100.0,
+            );
         }
 
         // v4.13b: Diagnostic logs for when veto WOULD have fired but was bypassed.
@@ -1885,6 +1958,27 @@ impl LateralShiftDetector {
         self.baseline
     }
 
+    /// v7.1: Allow external code (e.g., the maneuver pipeline) to set the
+    /// pending return direction when an overtake is confirmed via tracking.
+    ///
+    /// When an EGO_OVERTOOK event is detected by the pass/maneuver system,
+    /// the ego vehicle has changed lanes. The return lane change is expected
+    /// in the opposite direction. Setting this bypasses the curve ego veto
+    /// for the return, which is safe because the tracking-based overtake
+    /// provides strong evidence that a lane change occurred.
+    pub fn set_pending_return(&mut self, return_direction: ShiftDirection, deadline_ms: f64) {
+        // Only set if no return is already pending (don't overwrite).
+        if self.pending_return_direction.is_none() {
+            self.pending_return_direction = Some(return_direction);
+            self.pending_return_deadline_ms = deadline_ms;
+            info!(
+                "🔄 Return expected (from tracking overtake): {} before {:.1}s",
+                return_direction.as_str(),
+                deadline_ms / 1000.0,
+            );
+        }
+    }
+
     pub fn reset(&mut self) {
         self.state = State::Initializing;
         self.baseline = 0.0;
@@ -2007,6 +2101,7 @@ impl LateralShiftDetector {
         self.ego_estimated_offset = 0.0;
         self.ego_preempt_originated = false;
         self.shift_saw_curve_mode = false;
+        self.shift_curve_frames = 0;
         self.shift_used_return_bypass = false;
         self.shift_confirmed_notified = false;
         self.ego_shift_confident_frames = 0;

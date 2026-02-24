@@ -22,10 +22,11 @@
 
 use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
 use super::lateral_detector::{
-    EgoMotionInput, LaneMeasurement, LateralDetectorConfig, LateralShiftDetector,
+    EgoMotionInput, LaneMeasurement, LateralDetectorConfig, LateralShiftDetector, ShiftDirection,
 };
 use super::maneuver_classifier::{
-    ClassifierConfig, ManeuverClassifier, ManeuverEvent, MarkingSnapshot,
+    ClassifierConfig, ManeuverClassifier, ManeuverEvent, ManeuverSide, ManeuverType,
+    MarkingSnapshot,
 };
 use super::pass_detector::{PassDetector, PassDetectorConfig};
 use super::polynomial_tracker::{
@@ -519,6 +520,29 @@ impl ManeuverPipeline {
         let maneuver_events =
             self.classifier
                 .classify(input.timestamp_ms, input.frame_id, input.legality_buffer);
+
+        // ══════════════════════════════════════════════════════════════════
+        // 6b. OVERTAKE → LATERAL RETURN EXPECTATION (v7.1)
+        // ══════════════════════════════════════════════════════════════════
+        // When an overtake is confirmed via tracking (EGO_OVERTOOK), the ego
+        // vehicle has changed lanes. Set a return expectation on the lateral
+        // detector so the return lane change can bypass the curve ego veto.
+        // Without this, on curvy roads the ego estimator often shows near-zero
+        // displacement during real lane changes, and both the overtake lane
+        // change and the return are vetoed.
+        for evt in &maneuver_events {
+            if evt.maneuver_type == ManeuverType::Overtake && evt.sources.vehicle_tracking {
+                let return_dir = match evt.side {
+                    ManeuverSide::Left => ShiftDirection::Right,
+                    ManeuverSide::Right => ShiftDirection::Left,
+                };
+                const RETURN_WINDOW_MS: f64 = 30_000.0;
+                self.lateral_detector.set_pending_return(
+                    return_dir,
+                    input.timestamp_ms + RETURN_WINDOW_MS,
+                );
+            }
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 7. PERIODIC DIAGNOSTICS (ENHANCED)
