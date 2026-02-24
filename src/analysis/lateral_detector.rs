@@ -1701,12 +1701,25 @@ impl LateralShiftDetector {
         // override alone is not sufficient for short shifts. On severe curves,
         // perspective distortion can produce brief (~1-2s) high-magnitude
         // normalized offsets with small opposing ego and boundary divergence.
-        // Require a minimum duration of 2.5s to distinguish real lane changes
-        // (which take longer) from transient curve artifacts.
-        const GEO_OVERRIDE_OPPOSING_MIN_DURATION_S: f32 = 2.5;
+        // Require a minimum duration to distinguish real lane changes from
+        // transient curve artifacts.
+        //
+        // v7.4: Lowered from 2.5s to 1.5s — real lane changes on winding roads
+        // can complete in 1.5-2.5s, and the 2.5s threshold was filtering out
+        // genuine overtake departures.
+        const GEO_OVERRIDE_OPPOSING_MIN_DURATION_S: f32 = 1.5;
+        // v7.4: When the ego estimator shows near-zero displacement (< 3px),
+        // the signal is inconclusive rather than opposing. On curves, the
+        // rotational flow dominates the ego estimator, making near-zero readings
+        // mean "can't measure" rather than "didn't move". In this case, allow
+        // geometric override without the duration requirement.
+        const CURVE_EGO_INCONCLUSIVE_PX: f32 = 3.0;
         let (geo_override_raw, geo_score) = self.geometric_signals_confirm_lane_change();
+        let ego_is_inconclusive = directional_ego.abs() < CURVE_EGO_INCONCLUSIVE_PX;
         let geo_override = geo_override_raw
-            && (directional_ego >= 0.0 || duration_s >= GEO_OVERRIDE_OPPOSING_MIN_DURATION_S);
+            && (directional_ego >= 0.0
+                || ego_is_inconclusive
+                || duration_s >= GEO_OVERRIDE_OPPOSING_MIN_DURATION_S);
 
         if curve_tainted
             && self.shift_source == ShiftSource::LaneBased
@@ -1744,7 +1757,11 @@ impl LateralShiftDetector {
                 geo_override_raw,
                 geo_score,
                 if geo_override_raw && !geo_override {
-                    " (geo blocked: opposing ego + short duration)"
+                    if ego_is_inconclusive {
+                        " (geo blocked: opposing ego + short duration + not inconclusive)"
+                    } else {
+                        " (geo blocked: opposing ego + short duration)"
+                    }
                 } else {
                     ""
                 },
@@ -1763,9 +1780,14 @@ impl LateralShiftDetector {
             && geo_override
         {
             warn!(
-                "⚠️ Curve veto BYPASSED (geometric override): shift {} | \
+                "⚠️ Curve veto BYPASSED (geometric override{}): shift {} | \
                  peak={:.1}% | ego_cum={:.1}px (dir={:.1}px) < {:.0}px threshold | \
                  geo_score={:.2} → boundary divergence confirms lane change",
+                if ego_is_inconclusive {
+                    " + inconclusive ego"
+                } else {
+                    ""
+                },
                 self.shift_direction
                     .unwrap_or(ShiftDirection::Left)
                     .as_str(),

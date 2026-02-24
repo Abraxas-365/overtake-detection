@@ -397,10 +397,44 @@ pub fn crossing_legality_to_line_legality(
 
 /// v6.1: Expire old pending crossings that are too far from current frame.
 /// Call this periodically to prevent unbounded growth.
+///
+/// v7.4: Before discarding, promote high-confidence crossings on prohibited
+/// markings to confirmed status. A 100% penetration crossing on a solid double
+/// yellow is a meaningful event even without a correlated maneuver — the maneuver
+/// detection pipeline may have suppressed the lane change due to curve-mode veto,
+/// but the physical line crossing still occurred.
 pub fn expire_pending_crossings(state: &mut LaneCrossingState, current_frame: u64, max_age: u64) {
-    state
-        .pending_crossings
-        .retain(|c| current_frame.saturating_sub(c.frame_id) <= max_age);
+    use crate::road_classification::PassingLegality;
+    use tracing::info;
+
+    const STANDALONE_MIN_PENETRATION: f32 = 0.70;
+
+    let mut kept = std::collections::VecDeque::new();
+    while let Some(c) = state.pending_crossings.pop_front() {
+        if current_frame.saturating_sub(c.frame_id) <= max_age {
+            kept.push_back(c);
+        } else {
+            // Expiring — promote if high-confidence prohibited crossing
+            let is_prohibited = matches!(
+                c.passing_legality,
+                PassingLegality::Prohibited | PassingLegality::MixedProhibited
+            );
+            if is_prohibited && c.penetration_ratio >= STANDALONE_MIN_PENETRATION {
+                info!(
+                    "🚧 STANDALONE CROSSING promoted: {} {} → {} (pen={:.0}%, no maneuver correlation) \
+                     at frame {}",
+                    c.line_role.as_str(),
+                    c.marking_class,
+                    c.passing_legality.as_str(),
+                    c.penetration_ratio * 100.0,
+                    c.frame_id,
+                );
+                state.confirmed_crossing_count += 1;
+                state.confirmed_illegal_count += 1;
+            }
+        }
+    }
+    state.pending_crossings = kept;
 }
 
 // ============================================================================
@@ -546,4 +580,3 @@ mod tests {
         );
     }
 }
-
