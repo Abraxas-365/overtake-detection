@@ -94,8 +94,8 @@ struct PipelineState {
     yolo_primary_count: u64,
     v2_maneuver_events: u64,
     v2_overtakes: u64,
+    v2_shadow_overtakes: u64,
     v2_lane_changes: u64,
-    v2_being_overtaken: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -161,8 +161,8 @@ impl PipelineState {
             yolo_primary_count: 0,
             v2_maneuver_events: 0,
             v2_overtakes: 0,
+            v2_shadow_overtakes: 0,
             v2_lane_changes: 0,
-            v2_being_overtaken: 0,
             v2_vehicles_overtaken: 0,
             crossing_events_total: 0,
             crossing_events_illegal: 0,
@@ -179,8 +179,8 @@ struct ProcessingStats {
     yolo_primary_count: u64,
     v2_maneuver_events: u64,
     v2_overtakes: u64,
+    v2_shadow_overtakes: u64,
     v2_lane_changes: u64,
-    v2_being_overtaken: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -197,8 +197,8 @@ impl ProcessingStats {
             yolo_primary_count: ps.yolo_primary_count,
             v2_maneuver_events: ps.v2_maneuver_events,
             v2_overtakes: ps.v2_overtakes,
+            v2_shadow_overtakes: ps.v2_shadow_overtakes,
             v2_lane_changes: ps.v2_lane_changes,
-            v2_being_overtaken: ps.v2_being_overtaken,
             v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
             crossing_events_total: ps.lane_crossing_state.confirmed_crossing_count,
             crossing_events_illegal: ps.lane_crossing_state.confirmed_illegal_count,
@@ -723,9 +723,11 @@ fn run_maneuver_pipeline_v2(
                     ps.v2_vehicles_overtaken += 1;
                 }
             }
-            analysis::maneuver_classifier::ManeuverType::LaneChange => ps.v2_lane_changes += 1,
-            analysis::maneuver_classifier::ManeuverType::BeingOvertaken => {
-                ps.v2_being_overtaken += 1
+            analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
+                ps.v2_shadow_overtakes += 1
+            }
+            analysis::maneuver_classifier::ManeuverType::LaneChange => {
+                ps.v2_lane_changes += 1
             }
         }
 
@@ -737,18 +739,57 @@ fn run_maneuver_pipeline_v2(
         );
 
         if let Some(ref crossing) = correlated_crossing {
+            // v7.1: Use RoadClassifier temporal consensus to correct stale class IDs.
+            //
+            // Problem: During overtakes the camera perspective changes, causing
+            // analyze_double_line_for_mixed() to miss the dashed stripe. The crossing
+            // fires with class 8 (solid_double_yellow → CriticalIllegal) even though
+            // the line is actually mixed with dashed on our side (Legal).
+            //
+            // Fix: The RoadClassifier keeps a 30-frame temporal vote. If it says the
+            // center line is mixed_dashed_right, override class 8 → class 99 legality.
+            let (effective_class_id, effective_passing, effective_class_name) =
+                if crossing.marking_class_id == 8 {
+                    let rc = ps.road_classifier.current();
+                    match rc.mixed_line_side {
+                        Some(MixedLineSide::DashedRight) => {
+                            info!(
+                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed dashed_right, \
+                                 temporal consensus: {:?}, conf={:.2})",
+                                rc.passing_legality, rc.confidence,
+                            );
+                            (99_usize, PassingLegality::MixedAllowed,
+                             "mixed_double_yellow_dashed_right".to_string())
+                        }
+                        Some(MixedLineSide::SolidRight) => {
+                            info!(
+                                "🔄 v7.1: RoadClassifier override: class 8 → 99 (mixed solid_right, \
+                                 temporal consensus: {:?}, conf={:.2})",
+                                rc.passing_legality, rc.confidence,
+                            );
+                            (99_usize, PassingLegality::MixedProhibited,
+                             "mixed_double_yellow_solid_right".to_string())
+                        }
+                        _ => (crossing.marking_class_id, crossing.passing_legality,
+                              crossing.marking_class.clone()),
+                    }
+                } else {
+                    (crossing.marking_class_id, crossing.passing_legality,
+                     crossing.marking_class.clone())
+                };
+
             // Override maneuver legality with the actual crossed line's legality
             let line_legality = lane_crossing_integration::crossing_legality_to_line_legality(
-                &crossing.passing_legality,
-                crossing.marking_class_id,
+                &effective_passing,
+                effective_class_id,
             );
             event.legality = line_legality;
-            event.crossed_line_class = Some(crossing.marking_class.clone());
-            event.crossed_line_class_id = Some(crossing.marking_class_id);
+            event.crossed_line_class = Some(effective_class_name.clone());
+            event.crossed_line_class_id = Some(effective_class_id);
 
             info!(
                 "📌 Maneuver legality set from crossed line: {} ({}) → {:?}",
-                crossing.marking_class, crossing.marking_class_id, line_legality,
+                effective_class_name, effective_class_id, line_legality,
             );
 
             // v6.1: Trigger crossing flash ONLY for confirmed crossings
@@ -868,6 +909,7 @@ fn run_video_annotation(
         ego_lateral_velocity: v2_output.ego_lateral_velocity,
         lateral_state: &v2_output.lateral_state,
         total_overtakes: ps.v2_overtakes,
+        total_shadow_overtakes: ps.v2_shadow_overtakes,
         total_lane_changes: ps.v2_lane_changes,
         total_vehicles_overtaken: ps.v2_vehicles_overtaken,
         last_maneuver: ps.last_maneuver.as_ref(),
@@ -904,10 +946,10 @@ fn print_final_stats(stats: &ProcessingStats) {
     }
 
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║       MANEUVER DETECTION v6.0 (FULL PIPELINE)            ║");
+    info!("║       MANEUVER DETECTION v7.0 (OVERTAKE FOCUSED)         ║");
     info!("╠════════════════════════════════════════════════════════════╣");
     info!(
-        "║ Total v2 maneuver events:   {:>5}                         ║",
+        "║ Total maneuver events:      {:>5}                         ║",
         stats.v2_maneuver_events
     );
     info!(
@@ -915,12 +957,12 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.v2_overtakes, stats.v2_vehicles_overtaken
     );
     info!(
-        "║   🔀 Lane changes:          {:>5}                         ║",
-        stats.v2_lane_changes
+        "║   ⚠️  Shadow overtakes:      {:>5}                         ║",
+        stats.v2_shadow_overtakes
     );
     info!(
-        "║   ⚠️  Being overtaken:       {:>5}                         ║",
-        stats.v2_being_overtaken
+        "║   🔀 Lane changes:          {:>5}                         ║",
+        stats.v2_lane_changes
     );
     info!(
         "║   🚧 Line crossings:        {:>5} ({} illegal)            ║",

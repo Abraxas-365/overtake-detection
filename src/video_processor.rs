@@ -224,6 +224,7 @@ pub struct AnnotationInput<'a> {
     pub ego_lateral_velocity: f32,
     pub lateral_state: &'a str,
     pub total_overtakes: u64,
+    pub total_shadow_overtakes: u64,
     pub total_lane_changes: u64,
     pub total_vehicles_overtaken: u64,
     pub last_maneuver: Option<&'a crate::LastManeuverInfo>,
@@ -252,8 +253,8 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
     let mut output = bgr_mat.try_clone()?;
 
     let has_new_event = !input.maneuver_events.is_empty();
-    let is_being_overtaken = input.maneuver_events.iter().any(|e| {
-        e.maneuver_type == crate::analysis::maneuver_classifier::ManeuverType::BeingOvertaken
+    let is_shadow_overtake = input.maneuver_events.iter().any(|e| {
+        e.maneuver_type == crate::analysis::maneuver_classifier::ManeuverType::ShadowOvertake
     });
 
     // ──────────────────────────────────────────────────────────────────
@@ -337,10 +338,10 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
     )?;
 
     // ──────────────────────────────────────────────────────────────────
-    // LAYER 5: Being-overtaken warning banner
+    // LAYER 5: Shadow overtake warning banner
     // ──────────────────────────────────────────────────────────────────
-    if is_being_overtaken {
-        render_being_overtaken_banner(&mut output, width)?;
+    if is_shadow_overtake {
+        render_shadow_overtake_banner(&mut output, width)?;
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -363,6 +364,7 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
         &mut output,
         input.maneuver_events,
         input.total_overtakes,
+        input.total_shadow_overtakes,
         input.total_lane_changes,
         input.total_vehicles_overtaken,
         input.last_maneuver,
@@ -388,6 +390,7 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
         input.frame_id,
         input.timestamp_ms,
         input.total_overtakes,
+        input.total_shadow_overtakes,
         input.total_lane_changes,
         width,
         height,
@@ -425,6 +428,7 @@ pub fn draw_lanes_v2(
     legality_result: Option<&LegalityResult>,
     vehicle_detections: &[crate::vehicle_detection::Detection],
     total_overtakes: u64,
+    total_shadow_overtakes: u64,
     total_lane_changes: u64,
     total_vehicles_overtaken: u64,
     last_maneuver: Option<&crate::LastManeuverInfo>,
@@ -450,6 +454,7 @@ pub fn draw_lanes_v2(
         ego_lateral_velocity,
         lateral_state,
         total_overtakes,
+        total_shadow_overtakes,
         total_lane_changes,
         total_vehicles_overtaken,
         last_maneuver,
@@ -817,10 +822,10 @@ fn render_ego_indicator(
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Being-overtaken warning banner
+// Shadow overtake warning banner
 // ──────────────────────────────────────────────────────────────────────────
 
-fn render_being_overtaken_banner(output: &mut Mat, width: i32) -> Result<()> {
+fn render_shadow_overtake_banner(output: &mut Mat, width: i32) -> Result<()> {
     let banner_h = 40;
     let mut overlay = output.try_clone()?;
     imgproc::rectangle(
@@ -835,7 +840,7 @@ fn render_being_overtaken_banner(output: &mut Mat, width: i32) -> Result<()> {
     core::add_weighted(&overlay, 0.8, output, 0.2, 0.0, &mut blended, -1)?;
     blended.copy_to(output)?;
 
-    let text = "!! BEING OVERTAKEN !!";
+    let text = "!! SHADOW OVERTAKE !!";
     let mut baseline = 0;
     let text_size =
         imgproc::get_text_size(text, imgproc::FONT_HERSHEY_SIMPLEX, 0.75, 2, &mut baseline)?;
@@ -869,14 +874,14 @@ fn render_maneuver_border_pulse(
 
     let border_color = if events
         .iter()
-        .any(|e| e.maneuver_type == ManeuverType::BeingOvertaken)
+        .any(|e| e.maneuver_type == ManeuverType::ShadowOvertake)
     {
-        core::Scalar::new(0.0, 0.0, 255.0, 0.0) // Red
+        core::Scalar::new(0.0, 0.0, 255.0, 0.0) // Red for shadow overtake
     } else if events
         .iter()
         .any(|e| e.maneuver_type == ManeuverType::Overtake)
     {
-        core::Scalar::new(0.0, 255.0, 0.0, 0.0) // Green
+        core::Scalar::new(0.0, 255.0, 0.0, 0.0) // Green for overtake
     } else {
         core::Scalar::new(0.0, 165.0, 255.0, 0.0) // Orange
     };
@@ -1112,6 +1117,7 @@ fn render_right_event_panel(
     output: &mut Mat,
     maneuver_events: &[crate::analysis::maneuver_classifier::ManeuverEvent],
     total_overtakes: u64,
+    total_shadow_overtakes: u64,
     total_lane_changes: u64,
     total_vehicles_overtaken: u64,
     last_maneuver: Option<&crate::LastManeuverInfo>,
@@ -1141,8 +1147,8 @@ fn render_right_event_panel(
     draw_text_with_shadow(
         output,
         &format!(
-            "OVT: {} ({} veh) | LC: {}",
-            total_overtakes, total_vehicles_overtaken, total_lane_changes,
+            "OVT: {} ({} veh) | LC: {} | SHDW: {}",
+            total_overtakes, total_vehicles_overtaken, total_lane_changes, total_shadow_overtakes,
         ),
         right_panel_x + 8,
         right_panel_y,
@@ -1241,11 +1247,11 @@ fn render_right_event_panel(
             crate::analysis::maneuver_classifier::ManeuverType::Overtake => {
                 core::Scalar::new(0.0, 255.0, 0.0, 0.0)
             }
-            crate::analysis::maneuver_classifier::ManeuverType::LaneChange => {
-                core::Scalar::new(0.0, 165.0, 255.0, 0.0)
-            }
-            crate::analysis::maneuver_classifier::ManeuverType::BeingOvertaken => {
+            crate::analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
                 core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+            }
+            crate::analysis::maneuver_classifier::ManeuverType::LaneChange => {
+                core::Scalar::new(255.0, 200.0, 0.0, 0.0) // Cyan/teal for lane changes
             }
         };
         draw_text_with_shadow(
@@ -1424,6 +1430,7 @@ fn render_bottom_status_bar(
     frame_id: u64,
     timestamp_ms: f64,
     total_overtakes: u64,
+    total_shadow_overtakes: u64,
     total_lane_changes: u64,
     width: i32,
     height: i32,
@@ -1458,7 +1465,7 @@ fn render_bottom_status_bar(
     // Left: branding
     imgproc::put_text(
         output,
-        "LANE ANALYTICS v6.0",
+        "OVERTAKE ANALYTICS v7.0",
         core::Point::new(12, bar_y + 24),
         imgproc::FONT_HERSHEY_SIMPLEX,
         0.45,
@@ -1492,7 +1499,7 @@ fn render_bottom_status_bar(
     )?;
 
     // Right: stats
-    let stats_text = format!("OVT:{} LC:{}", total_overtakes, total_lane_changes);
+    let stats_text = format!("OVT:{} LC:{} SHDW:{}", total_overtakes, total_lane_changes, total_shadow_overtakes);
     let stats_size = imgproc::get_text_size(
         &stats_text,
         imgproc::FONT_HERSHEY_SIMPLEX,

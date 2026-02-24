@@ -281,16 +281,8 @@ pub fn correlate_crossing_with_maneuver(
     let maneuver_start = maneuver.start_frame;
     let maneuver_end = maneuver.end_frame;
 
-    // Determine which side the maneuver crossed (left LC = cross left boundary, etc.)
+    // Determine which side the maneuver crossed (overtake LEFT = cross left boundary, etc.)
     let expected_role = match (maneuver.maneuver_type, maneuver.side) {
-        // Lane change LEFT → crosses left boundary or center line
-        (ManeuverType::LaneChange, ManeuverSide::Left) => {
-            Some((LineRole::LeftBoundary, LineRole::CenterLine))
-        }
-        // Lane change RIGHT → crosses right boundary or center line
-        (ManeuverType::LaneChange, ManeuverSide::Right) => {
-            Some((LineRole::RightBoundary, LineRole::CenterLine))
-        }
         // Overtake LEFT → crosses left boundary or center line
         (ManeuverType::Overtake, ManeuverSide::Left) => {
             Some((LineRole::LeftBoundary, LineRole::CenterLine))
@@ -298,6 +290,14 @@ pub fn correlate_crossing_with_maneuver(
         (ManeuverType::Overtake, ManeuverSide::Right) => {
             Some((LineRole::RightBoundary, LineRole::CenterLine))
         }
+        // v7.0: Lane change — same boundary logic as overtake
+        (ManeuverType::LaneChange, ManeuverSide::Left) => {
+            Some((LineRole::LeftBoundary, LineRole::CenterLine))
+        }
+        (ManeuverType::LaneChange, ManeuverSide::Right) => {
+            Some((LineRole::RightBoundary, LineRole::CenterLine))
+        }
+        // Shadow overtakes don't involve ego crossing a line
         _ => None,
     };
 
@@ -479,7 +479,8 @@ pub fn crossing_corroboration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lane_crossing::{CrossingDirection, LineRole, PassingLegality};
+    use crate::lane_crossing::{CrossingDirection, LineRole};
+    use crate::road_classification::PassingLegality;
 
     #[test]
     fn test_crossing_corroboration_agreement() {

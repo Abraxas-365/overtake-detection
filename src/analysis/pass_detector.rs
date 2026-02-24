@@ -1108,6 +1108,14 @@ mod tests {
         }
     }
 
+    fn det_with_class(x1: f32, y1: f32, x2: f32, y2: f32, class_id: u32) -> DetectionInput {
+        DetectionInput {
+            bbox: [x1, y1, x2, y2],
+            class_id,
+            confidence: 0.8,
+        }
+    }
+
     // ────────────────────────────────────────────────────────────
     // EgoOvertook tests
     // ────────────────────────────────────────────────────────────
@@ -1319,10 +1327,9 @@ mod tests {
         }
 
         // Collect any EgoOvertook events from phase 3 (the old bug)
-        let ego_from_phase3: Vec<_> = events
+        let had_ego_from_phase3 = events
             .iter()
-            .filter(|e| e.direction == PassDirection::EgoOvertook)
-            .collect();
+            .any(|e| e.direction == PassDirection::EgoOvertook);
         // Clear events for clarity — we care about what happens next
         events.clear();
 
@@ -1348,7 +1355,7 @@ mod tests {
         // If the track already completed an EgoOvertook in phase 3,
         // it's in completed_ids and won't generate VehicleOvertookEgo.
         // If not, we should get VehicleOvertookEgo from the reverse pass.
-        if ego_from_phase3.is_empty() {
+        if !had_ego_from_phase3 {
             assert!(
                 !overtook.is_empty(),
                 "BEHIND→BESIDE→AHEAD should produce VehicleOvertookEgo, not EgoOvertook"

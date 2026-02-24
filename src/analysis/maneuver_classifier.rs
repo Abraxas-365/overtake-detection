@@ -33,7 +33,7 @@
 // v4.13 FIX (Bug 2): Curve ego cross-validation gate in lateral_detector.
 
 use super::ego_motion::EgoMotionEstimate;
-use super::lateral_detector::{LateralShiftEvent, ShiftDirection};
+use super::lateral_detector::{LateralShiftEvent, ShiftConfirmedNotification, ShiftDirection};
 use super::pass_detector::{PassDirection, PassEvent, PassSide};
 use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
@@ -69,6 +69,19 @@ pub struct ClassifierConfig {
     /// v4.10: Minimum number of frames at or above the velocity threshold
     /// to consider the ego lateral motion "sustained" (not just noise).
     pub ego_induced_pass_min_sustained_frames: usize,
+    // ── v7.0: Lane change detection ─────────────────────────────
+    /// Minimum confidence to emit a standalone lane change event.
+    pub min_lane_change_confidence: f32,
+    /// Minimum geometric override score to allow lane change through
+    /// curve suppression. When boundaries diverge strongly enough,
+    /// a lane change is real even on a curve.
+    pub geometric_override_min_score: f32,
+    /// Minimum polynomial tracker signal confidence to consider
+    /// geometric override. Prevents stale/predict-only signals
+    /// from causing false overrides.
+    pub geometric_min_signal_confidence: f32,
+    /// Weight for geometric signal contribution to lane change confidence.
+    pub weight_geometric: f32,
 }
 
 impl Default for ClassifierConfig {
@@ -86,6 +99,11 @@ impl Default for ClassifierConfig {
             min_pass_confidence_single_source: 0.55,
             ego_induced_pass_velocity_threshold: 3.0, // v4.10: 3 px/frame
             ego_induced_pass_min_sustained_frames: 8, // v4.10: ~267ms at 30fps
+            // v7.0: Lane change detection
+            min_lane_change_confidence: 0.35,
+            geometric_override_min_score: 0.50,
+            geometric_min_signal_confidence: 0.4,
+            weight_geometric: 0.20,
         }
     }
 }
@@ -106,6 +124,11 @@ impl ClassifierConfig {
             min_pass_confidence_single_source: 0.60,
             ego_induced_pass_velocity_threshold: 2.5, // lower threshold in mining (dusty, noisy flow)
             ego_induced_pass_min_sustained_frames: 6,
+            // v7.0: Lane change detection (slightly higher thresholds for mining)
+            min_lane_change_confidence: 0.40,
+            geometric_override_min_score: 0.55,
+            geometric_min_signal_confidence: 0.45,
+            weight_geometric: 0.20,
         }
     }
 }
@@ -117,16 +140,17 @@ impl ClassifierConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManeuverType {
     Overtake,
+    ShadowOvertake,
+    /// v7.0: Standalone lane change (no vehicle pass involved).
     LaneChange,
-    BeingOvertaken,
 }
 
 impl ManeuverType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Overtake => "OVERTAKE",
+            Self::ShadowOvertake => "SHADOW_OVERTAKE",
             Self::LaneChange => "LANE_CHANGE",
-            Self::BeingOvertaken => "BEING_OVERTAKEN",
         }
     }
 }
@@ -228,6 +252,9 @@ struct BufferedPass {
 struct BufferedShift {
     event: LateralShiftEvent,
     correlated: bool,
+    /// v7.0: An early LANE_CHANGE was already emitted for this shift via
+    /// ShiftConfirmedNotification. Don't emit another in the LC phase.
+    early_lc_emitted: bool,
 }
 
 // ============================================================================
@@ -250,6 +277,11 @@ pub struct ManeuverClassifier {
     // VehicleOvertookEgo events require additional validation when active.
     curve_mode_active: bool,
     frames_since_curve_mode: u32,
+    /// v7.0: Pending early shift confirmed notifications to process in classify().
+    pending_confirmed: Vec<ShiftConfirmedNotification>,
+    /// v7.0: Tracks (start_frame, direction) of shifts that already had an early
+    /// LANE_CHANGE emitted, to prevent duplicate LC when the completed shift arrives.
+    early_lc_records: Vec<(u64, ShiftDirection)>,
 }
 
 impl ManeuverClassifier {
@@ -265,6 +297,8 @@ impl ManeuverClassifier {
             latest_markings: MarkingSnapshot::default(),
             curve_mode_active: false,
             frames_since_curve_mode: u32::MAX,
+            pending_confirmed: Vec::new(),
+            early_lc_records: Vec::new(),
         }
     }
 
@@ -277,10 +311,29 @@ impl ManeuverClassifier {
     }
 
     pub fn feed_shift(&mut self, event: LateralShiftEvent) {
+        // v7.0: Check if an early LC was already emitted for this shift.
+        // Match by start_frame and direction — a completed shift with the same
+        // start as a confirmed notification is the same shift.
+        let early_lc = self.early_lc_records.iter().position(|(frame, dir)| {
+            *frame == event.start_frame && *dir == event.direction
+        });
+        let early_lc_emitted = if let Some(idx) = early_lc {
+            self.early_lc_records.swap_remove(idx);
+            true
+        } else {
+            false
+        };
         self.shift_buffer.push_back(BufferedShift {
             event,
             correlated: false,
+            early_lc_emitted,
         });
+    }
+
+    /// v7.0: Accept an early "shift confirmed" notification for immediate
+    /// LANE_CHANGE emission. Processed in the next classify() call.
+    pub fn feed_shift_confirmed(&mut self, notification: ShiftConfirmedNotification) {
+        self.pending_confirmed.push(notification);
     }
 
     pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
@@ -329,6 +382,11 @@ impl ManeuverClassifier {
             .retain(|p| timestamp_ms - p.event.beside_end_ms < window);
         self.shift_buffer
             .retain(|s| timestamp_ms - s.event.end_ms < window);
+        // v7.0: Cap early_lc_records to prevent unbounded growth.
+        // Records older than 60s are no longer relevant.
+        if self.early_lc_records.len() > 50 {
+            self.early_lc_records.drain(..self.early_lc_records.len() - 20);
+        }
 
         debug!(
             "═══ CLASSIFIER CALLED ═══ ts={:.1}s | {} passes | {} shifts",
@@ -648,43 +706,12 @@ impl ManeuverClassifier {
                     self.total_maneuvers += 1;
 
                     self.pass_buffer[pass_idx].correlated = true;
-                    // NOTE: Intentionally NOT marking shift as correlated.
-                    // An overtake inherently includes a lane change — the
-                    // shift should still emit as a LANE_CHANGE event below.
+                    self.shift_buffer[si].correlated = true;
                 }
             }
         }
 
-        // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
-        // Runs AFTER deferred reinterpretation. Shifts used for overtakes
-        // are intentionally left uncorrelated so they also emit as lane
-        // changes (an overtake always includes a lane change).
-        for shift_idx in 0..self.shift_buffer.len() {
-            if self.shift_buffer[shift_idx].correlated {
-                continue;
-            }
-            if !self.shift_buffer[shift_idx].event.confirmed {
-                continue;
-            }
-
-            let shift_event = self.shift_buffer[shift_idx].event.clone();
-            let maneuver = self.build_lane_change(&shift_event, legality_buffer);
-
-            if maneuver.confidence >= self.config.min_combined_confidence {
-                info!(
-                    "🔀 LANE CHANGE: {} | conf={:.2} | legality={:?}",
-                    maneuver.side.as_str(),
-                    maneuver.confidence,
-                    maneuver.legality,
-                );
-
-                self.recent_events.push(maneuver);
-                self.total_maneuvers += 1;
-                self.shift_buffer[shift_idx].correlated = true;
-            }
-        }
-
-        // ── BEING OVERTAKEN ─────────────────────────────────────
+        // ── SHADOW OVERTAKE (vehicle overtakes ego) ──────────────
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
                 continue;
@@ -693,7 +720,7 @@ impl ManeuverClassifier {
                 // v4.13b: Skip passes deferred by the curve gate — they're
                 // waiting for potential re-interpretation as ego-overtakes.
                 // If no corroborating shift appears, they'll expire from the
-                // buffer naturally (not emitted as false being_overtaken).
+                // buffer naturally (not emitted as false shadow_overtake).
                 if self.pass_buffer[pass_idx].curve_deferred {
                     continue;
                 }
@@ -753,10 +780,10 @@ impl ManeuverClassifier {
                 }
 
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
-                let maneuver = self.build_being_overtaken(&pass_event);
+                let maneuver = self.build_shadow_overtake(&pass_event);
 
                 info!(
-                    "⚠️  BEING OVERTAKEN: track {} on {} | conf={:.2}",
+                    "⚠️  SHADOW OVERTAKE: track {} on {} | conf={:.2}",
                     pass_event.vehicle_track_id,
                     maneuver.side.as_str(),
                     maneuver.confidence,
@@ -766,6 +793,190 @@ impl ManeuverClassifier {
                 self.total_maneuvers += 1;
                 self.pass_buffer[pass_idx].correlated = true;
             }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // v7.0: EARLY LANE CHANGE (from in-progress shift confirmation)
+        //
+        // When a shift is confirmed while still in progress, we emit an
+        // immediate LANE_CHANGE so the entry LC of an overtake fires in
+        // near-real-time instead of waiting for the shift to complete.
+        // ══════════════════════════════════════════════════════════════
+        let pending: Vec<_> = self.pending_confirmed.drain(..).collect();
+        for confirmed in pending {
+            let side = match confirmed.direction {
+                ShiftDirection::Left => ManeuverSide::Left,
+                ShiftDirection::Right => ManeuverSide::Right,
+            };
+
+            // Geometric override check for curve suppression
+            let (geo_override, geo_score) = if let Some(signals) = &confirmed.geometric_signals {
+                if signals.confidence >= self.config.geometric_min_signal_confidence
+                    && signals.suggests_lane_change
+                {
+                    let div_strength = (signals.boundary_velocity_divergence.abs() / 3.0).min(1.0);
+                    let width_strength = (signals.lane_width_rate.abs() / 2.0).min(1.0);
+                    let nf_strength = (signals.near_far_offset_divergence / 0.08).min(1.0);
+                    let score = (div_strength * 0.5 + width_strength * 0.3 + nf_strength * 0.2)
+                        * signals.confidence;
+                    (score >= self.config.geometric_override_min_score, score)
+                } else {
+                    (false, 0.0)
+                }
+            } else {
+                (false, 0.0)
+            };
+
+            // Curve suppression gate
+            if confirmed.curve_mode && !geo_override {
+                debug!(
+                    "  Early LC suppressed: shift {} on curve without geometric override",
+                    confirmed.direction.as_str(),
+                );
+                continue;
+            }
+
+            // Confidence
+            let base_conf = confirmed.confidence * self.config.weight_lateral;
+            let ego_conf = if self.ego_motion_confirms_lateral() {
+                self.config.weight_ego_motion * 0.8
+            } else {
+                0.0
+            };
+            let geo_conf = geo_score * self.config.weight_geometric;
+            let confidence = (base_conf + ego_conf + geo_conf).clamp(0.0, 0.95);
+
+            if confidence < self.config.min_lane_change_confidence {
+                debug!(
+                    "  Early LC below threshold: {} conf={:.2} < {:.2}",
+                    confirmed.direction.as_str(),
+                    confidence,
+                    self.config.min_lane_change_confidence,
+                );
+                continue;
+            }
+
+            let ego_confirms = self.ego_motion_confirms_lateral();
+
+            let maneuver = ManeuverEvent {
+                maneuver_type: ManeuverType::LaneChange,
+                side,
+                legality: LineLegality::Unknown,
+                legality_at_crossing: None,
+                confidence,
+                sources: DetectionSources {
+                    vehicle_tracking: false,
+                    lane_detection: true,
+                    ego_motion: ego_confirms,
+                },
+                start_ms: confirmed.start_ms,
+                end_ms: confirmed.confirmed_ms,
+                start_frame: confirmed.start_frame,
+                end_frame: confirmed.confirmed_frame,
+                duration_ms: confirmed.confirmed_ms - confirmed.start_ms,
+                passed_vehicle_id: None,
+                passed_vehicle_class: None,
+                pass_event: None,
+                lateral_event: None, // No completed shift yet
+                marking_context: Some(self.latest_markings.clone()),
+                crossed_line_class: None,
+                crossed_line_class_id: None,
+            };
+
+            info!(
+                "🔀 EARLY LANE_CHANGE: {} | conf={:.2} | geo_override={} | curve={}",
+                maneuver.side.as_str(),
+                maneuver.confidence,
+                geo_override,
+                confirmed.curve_mode,
+            );
+
+            self.recent_events.push(maneuver);
+            self.total_maneuvers += 1;
+
+            // Record so the completed shift won't produce a duplicate LC
+            self.early_lc_records.push((confirmed.start_frame, confirmed.direction));
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // v7.0: STANDALONE LANE CHANGE DETECTION
+        //
+        // Lateral shifts not correlated with any pass event are candidates
+        // for standalone lane change events. On Peru's narrow curvy mountain
+        // roads, the key challenge is distinguishing real lane changes from
+        // curve-induced perspective artifacts.
+        //
+        // The polynomial tracker's geometric signals discriminate:
+        //   - Curve: boundaries move TOGETHER (coherent) → suppress
+        //   - Lane change: boundaries DIVERGE → allow (even on curves)
+        // ══════════════════════════════════════════════════════════════
+        for shift_idx in 0..self.shift_buffer.len() {
+            if self.shift_buffer[shift_idx].correlated {
+                continue;
+            }
+
+            // v7.0: Skip shifts that already had an early LC emitted.
+            // These shifts are still available for overtake correlation (above),
+            // but shouldn't produce a duplicate standalone LANE_CHANGE.
+            if self.shift_buffer[shift_idx].early_lc_emitted {
+                self.shift_buffer[shift_idx].correlated = true;
+                continue;
+            }
+
+            let shift = &self.shift_buffer[shift_idx].event;
+
+            // Step 1: Evaluate geometric override
+            let (geo_override, geo_score) = self.evaluate_geometric_override(shift);
+
+            // Step 2: Curve suppression gate
+            // On curves without geometric override → suppress (perspective artifact)
+            if shift.curve_mode && !geo_override {
+                debug!(
+                    "  LC suppressed: shift {} on curve without geometric override | peak={:.1}%",
+                    shift.direction.as_str(),
+                    shift.peak_offset * 100.0,
+                );
+                self.shift_buffer[shift_idx].correlated = true;
+                continue;
+            }
+
+            // Step 3: Compute confidence
+            let base_conf = shift.confidence * self.config.weight_lateral;
+            let ego_conf = if self.ego_motion_confirms_lateral() {
+                self.config.weight_ego_motion * 0.8
+            } else {
+                0.0
+            };
+            let geo_conf = geo_score * self.config.weight_geometric;
+
+            let confidence = (base_conf + ego_conf + geo_conf).clamp(0.0, 0.95);
+
+            if confidence < self.config.min_lane_change_confidence {
+                debug!(
+                    "  LC below threshold: {} conf={:.2} < {:.2}",
+                    shift.direction.as_str(),
+                    confidence,
+                    self.config.min_lane_change_confidence,
+                );
+                continue; // Leave in buffer; may correlate later with a pass
+            }
+
+            // Step 4: Build and emit
+            let ego_confirms = self.ego_motion_confirms_lateral();
+            let maneuver = self.build_lane_change(shift, confidence, ego_confirms);
+
+            info!(
+                "🔀 LANE_CHANGE: {} | conf={:.2} | geo_override={} | geo_score={:.2} | curve_mode={}",
+                maneuver.side.as_str(),
+                maneuver.confidence,
+                geo_override,
+                geo_score,
+                shift.curve_mode,
+            );
+
+            self.recent_events.push(maneuver);
+            self.total_maneuvers += 1;
+            self.shift_buffer[shift_idx].correlated = true;
         }
 
         // v4.13 FIX (Bug 1): Drain consumed entries immediately.
@@ -862,71 +1073,14 @@ impl ManeuverClassifier {
         }
     }
 
-    fn build_lane_change(
-        &self,
-        shift: &LateralShiftEvent,
-        legality_buffer: Option<&LegalityRingBuffer>,
-    ) -> ManeuverEvent {
-        let side = match shift.direction {
-            ShiftDirection::Left => ManeuverSide::Left,
-            ShiftDirection::Right => ManeuverSide::Right,
-        };
-
-        let legality_at_crossing =
-            legality_buffer.and_then(|buf| buf.worst_in_range(shift.start_frame, shift.end_frame));
-        let legality = legality_at_crossing
-            .as_ref()
-            .map(|r| r.verdict)
-            .unwrap_or(LineLegality::Unknown);
-
-        let ego_confirms = self.ego_motion_confirms_lateral();
-
-        let shift_conf = shift.confidence * (self.config.weight_pass + self.config.weight_lateral);
-        let ego_conf = if ego_confirms {
-            self.config.weight_ego_motion * 0.8
-        } else {
-            0.0
-        };
-
-        let sources = DetectionSources {
-            vehicle_tracking: false,
-            lane_detection: true,
-            ego_motion: ego_confirms,
-        };
-
-        let confidence =
-            (shift_conf + ego_conf + if sources.count() >= 2 { 0.05 } else { 0.0 }).min(0.95);
-
-        ManeuverEvent {
-            maneuver_type: ManeuverType::LaneChange,
-            side,
-            legality,
-            legality_at_crossing,
-            confidence,
-            sources,
-            start_ms: shift.start_ms,
-            end_ms: shift.end_ms,
-            start_frame: shift.start_frame,
-            end_frame: shift.end_frame,
-            duration_ms: shift.duration_ms,
-            passed_vehicle_id: None,
-            passed_vehicle_class: None,
-            pass_event: None,
-            lateral_event: Some(shift.clone()),
-            marking_context: Some(self.latest_markings.clone()),
-            crossed_line_class: None,
-            crossed_line_class_id: None,
-        }
-    }
-
-    fn build_being_overtaken(&self, pass: &PassEvent) -> ManeuverEvent {
+    fn build_shadow_overtake(&self, pass: &PassEvent) -> ManeuverEvent {
         let side = match pass.side {
             PassSide::Left => ManeuverSide::Left,
             PassSide::Right => ManeuverSide::Right,
         };
 
         ManeuverEvent {
-            maneuver_type: ManeuverType::BeingOvertaken,
+            maneuver_type: ManeuverType::ShadowOvertake,
             side,
             legality: LineLegality::Unknown,
             legality_at_crossing: None,
@@ -952,6 +1106,90 @@ impl ManeuverClassifier {
             crossed_line_class_id: None,
         }
     }
+
+    // ── v7.0: LANE CHANGE HELPERS ────────────────────────────────
+
+    /// Evaluate whether geometric signals from the polynomial tracker
+    /// indicate a real lane change, overriding curve suppression.
+    ///
+    /// Returns (should_override, confidence_score).
+    ///
+    /// On curves, both boundaries move together → divergence ≈ 0.
+    /// On lane changes (even on curves), boundaries diverge.
+    /// When divergence is strong enough, we allow the lane change through.
+    fn evaluate_geometric_override(
+        &self,
+        shift: &LateralShiftEvent,
+    ) -> (bool, f32) {
+        let signals = match &shift.geometric_signals {
+            Some(s) => s,
+            None => return (false, 0.0),
+        };
+
+        // Need minimum signal confidence (both boundaries actively tracked)
+        if signals.confidence < self.config.geometric_min_signal_confidence {
+            return (false, 0.0);
+        }
+
+        // The polynomial tracker already computes suggests_lane_change using
+        // a 2-of-3 vote on boundary_velocity_divergence, lane_width_rate,
+        // and near_far_offset_divergence.
+        if !signals.suggests_lane_change {
+            return (false, 0.0);
+        }
+
+        // Compute graded confidence based on signal strengths.
+        // Thresholds from polynomial_tracker: div>3.0, width_rate>2.0, nf_div>0.08
+        let div_strength = (signals.boundary_velocity_divergence.abs() / 3.0).min(1.0);
+        let width_strength = (signals.lane_width_rate.abs() / 2.0).min(1.0);
+        let nf_strength = (signals.near_far_offset_divergence / 0.08).min(1.0);
+
+        let geo_score = div_strength * 0.5 + width_strength * 0.3 + nf_strength * 0.2;
+        let boosted_score = geo_score * signals.confidence;
+
+        let should_override = boosted_score >= self.config.geometric_override_min_score;
+
+        (should_override, boosted_score)
+    }
+
+    /// Build a ManeuverEvent for a standalone lane change.
+    fn build_lane_change(
+        &self,
+        shift: &LateralShiftEvent,
+        confidence: f32,
+        ego_confirms: bool,
+    ) -> ManeuverEvent {
+        let side = match shift.direction {
+            ShiftDirection::Left => ManeuverSide::Left,
+            ShiftDirection::Right => ManeuverSide::Right,
+        };
+
+        ManeuverEvent {
+            maneuver_type: ManeuverType::LaneChange,
+            side,
+            legality: LineLegality::Unknown, // Set later by crossing correlation
+            legality_at_crossing: None,
+            confidence,
+            sources: DetectionSources {
+                vehicle_tracking: false,
+                lane_detection: true,
+                ego_motion: ego_confirms,
+            },
+            start_ms: shift.start_ms,
+            end_ms: shift.end_ms,
+            start_frame: shift.start_frame,
+            end_frame: shift.end_frame,
+            duration_ms: shift.duration_ms,
+            passed_vehicle_id: None,
+            passed_vehicle_class: None,
+            pass_event: None,
+            lateral_event: Some(shift.clone()),
+            marking_context: Some(self.latest_markings.clone()),
+            crossed_line_class: None,
+            crossed_line_class_id: None,
+        }
+    }
+
     // ── HELPERS ──────────────────────────────────────────────────
 
     fn compute_frame_range(

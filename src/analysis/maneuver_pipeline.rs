@@ -476,14 +476,28 @@ impl ManeuverPipeline {
             None
         };
 
-        let shift_event = self.lateral_detector.update(
+        let lateral_result = self.lateral_detector.update(
             enhanced_measurement,
             ego_input,
             input.timestamp_ms,
             input.frame_id,
         );
-        if let Some(ref shift) = shift_event {
-            self.classifier.feed_shift(shift.clone());
+        // v7.0: Attach geometric signals from polynomial tracker to the
+        // shift event. These signals help the classifier distinguish real
+        // lane changes from curve-induced perspective artifacts.
+        if let Some(mut shift) = lateral_result.completed_shift {
+            if self.poly_tracker.both_active() {
+                shift.geometric_signals = Some(*self.poly_tracker.signals());
+            }
+            self.classifier.feed_shift(shift);
+        }
+        // v7.0: Feed early "shift confirmed" notification to classifier for
+        // immediate LANE_CHANGE emission (entry LC fires before shift completes).
+        if let Some(mut confirmed) = lateral_result.confirmed_in_progress {
+            if self.poly_tracker.both_active() {
+                confirmed.geometric_signals = Some(*self.poly_tracker.signals());
+            }
+            self.classifier.feed_shift_confirmed(confirmed);
         }
 
         // ══════════════════════════════════════════════════════════════════

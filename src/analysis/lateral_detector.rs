@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 use super::curvature_estimator::CurvatureEstimate;
+use super::polynomial_tracker::GeometricLaneChangeSignals;
 
 // ============================================================================
 // CONFIGURATION
@@ -208,6 +209,40 @@ pub struct LateralShiftEvent {
     pub ego_cumulative_peak_px: f32,
     /// v4.13: Shift detection source (LaneBased / EgoBridged / EgoStarted).
     pub source_label: &'static str,
+    /// v7.0: Snapshot of geometric lane change signals at time of shift emission.
+    /// Populated by the pipeline from the polynomial tracker; None when created.
+    pub geometric_signals: Option<GeometricLaneChangeSignals>,
+}
+
+/// v7.0: Early notification when a shift is confirmed in-progress.
+/// Fires once per shift when peak exceeds confirm threshold, min frames met,
+/// and (on curves) ego motion confirms lateral displacement.
+/// Used to emit an early LANE_CHANGE before the shift completes.
+#[derive(Debug, Clone)]
+pub struct ShiftConfirmedNotification {
+    pub direction: ShiftDirection,
+    pub start_ms: f64,
+    pub start_frame: u64,
+    /// Peak offset at confirmation time
+    pub peak_offset: f32,
+    /// Confidence estimate at confirmation time
+    pub confidence: f32,
+    /// Was curve mode active?
+    pub curve_mode: bool,
+    /// Frame when confirmation occurred
+    pub confirmed_frame: u64,
+    pub confirmed_ms: f64,
+    /// Geometric signals snapshot (populated by pipeline)
+    pub geometric_signals: Option<GeometricLaneChangeSignals>,
+}
+
+/// Result from a single frame update of the lateral shift detector.
+pub struct LateralUpdateResult {
+    /// A shift that completed this frame (returned to baseline / settled / timed out).
+    pub completed_shift: Option<LateralShiftEvent>,
+    /// A shift that was just confirmed in-progress (fires once per shift).
+    /// Used to emit an early LANE_CHANGE before the shift completes.
+    pub confirmed_in_progress: Option<ShiftConfirmedNotification>,
 }
 
 /// Input from ego-motion estimator (optical flow based)
@@ -332,6 +367,8 @@ pub struct LateralShiftDetector {
     // bypass. If true, the resulting LC must NOT set a new return expectation,
     // preventing cascading false positives (RIGHT→LEFT→RIGHT→...).
     shift_used_return_bypass: bool,
+    /// v7.0: Whether early "shift confirmed" notification has fired for this shift.
+    shift_confirmed_notified: bool,
 
     // v4.13b: Post-lane-change return expectation.
     //
@@ -389,6 +426,7 @@ impl LateralShiftDetector {
             frames_since_curve_mode: u32::MAX, // start with no recent curve
             shift_saw_curve_mode: false,
             shift_used_return_bypass: false,
+            shift_confirmed_notified: false,
             pending_return_direction: None,
             pending_return_deadline_ms: 0.0,
         }
@@ -583,7 +621,7 @@ impl LateralShiftDetector {
         ego_motion: Option<EgoMotionInput>,
         timestamp_ms: f64,
         frame_id: u64,
-    ) -> Option<LateralShiftEvent> {
+    ) -> LateralUpdateResult {
         let ego = ego_motion.unwrap_or_default();
         self.ego_last_velocity = ego.lateral_velocity;
 
@@ -678,7 +716,8 @@ impl LateralShiftDetector {
 
         // ── NO LANES PATH (neither fresh nor cached) ────────────
         if effective_meas.is_none() {
-            return self.handle_no_lanes(ego, timestamp_ms, frame_id);
+            let completed_shift = self.handle_no_lanes(ego, timestamp_ms, frame_id);
+            return LateralUpdateResult { completed_shift, confirmed_in_progress: None };
         }
 
         let meas = effective_meas.unwrap();
@@ -692,7 +731,7 @@ impl LateralShiftDetector {
         }
 
         // ── STATE MACHINE ───────────────────────────────────────
-        match self.state {
+        let completed_shift = match self.state {
             State::Occluded => {
                 info!(
                     "🔄 Lateral detector: recovering from occlusion at offset={:.1}%",
@@ -710,7 +749,7 @@ impl LateralShiftDetector {
 
                 if self.freeze_remaining > 0 {
                     self.freeze_remaining -= 1;
-                    return None;
+                    return LateralUpdateResult { completed_shift: None, confirmed_in_progress: None };
                 }
 
                 if self.baseline_samples >= self.config.baseline_warmup_frames {
@@ -882,7 +921,22 @@ impl LateralShiftDetector {
                     frame_id,
                 )
             }
-        }
+        };
+
+        // v7.0: Check for early shift confirmation notification.
+        // Only fires when: still in Shifting state (shift didn't complete this frame),
+        // not already notified for this shift, peak meets confirm threshold,
+        // min frames met, and (not on curve OR ego confirms lateral displacement).
+        let confirmed_in_progress = if completed_shift.is_none()
+            && self.state == State::Shifting
+            && !self.shift_confirmed_notified
+        {
+            self.check_shift_confirmed(timestamp_ms, frame_id)
+        } else {
+            None
+        };
+
+        LateralUpdateResult { completed_shift, confirmed_in_progress }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -1192,6 +1246,111 @@ impl LateralShiftDetector {
     // ════════════════════════════════════════════════════════════════════
     // SHIFT LIFECYCLE HELPERS
     // ════════════════════════════════════════════════════════════════════
+
+    /// v7.0: Check if the in-progress shift should fire an early "confirmed" notification.
+    ///
+    /// Fires ONCE per shift when:
+    ///   1. Peak offset >= effective confirm threshold
+    ///   2. Shift frames >= min_shift_frames
+    ///   3. Either NOT curve-tainted, OR ego cumulative exceeds dynamic threshold
+    ///
+    /// This allows the classifier to emit an early LANE_CHANGE before the shift
+    /// completes (returns to baseline), so the entry LC of an overtake fires in
+    /// near-real-time instead of being delayed until the shift ends.
+    fn check_shift_confirmed(
+        &mut self,
+        timestamp_ms: f64,
+        frame_id: u64,
+    ) -> Option<ShiftConfirmedNotification> {
+        let eff_confirm = self.effective_shift_confirm_threshold();
+
+        // 1. Peak must meet confirm threshold
+        if self.shift_peak_offset < eff_confirm {
+            return None;
+        }
+
+        // 2. Minimum frames must be met
+        if self.shift_frames < self.config.min_shift_frames {
+            return None;
+        }
+
+        // 3. On curves, require ego motion confirmation (same logic as emit_shift_event veto)
+        if self.shift_saw_curve_mode && self.shift_source == ShiftSource::LaneBased {
+            let duration_s = ((timestamp_ms - self.shift_start_ms) / 1000.0) as f32;
+            let ego_threshold = 10.0_f32.max(duration_s * 15.0);
+
+            let ego_confidence_ratio = if self.shift_frames > 0 {
+                self.ego_shift_confident_frames as f32 / self.shift_frames as f32
+            } else {
+                0.0
+            };
+            let ego_trustworthy = ego_confidence_ratio >= 0.30;
+
+            // Directional ego: must confirm the shift direction
+            let shift_sign = match self.shift_direction {
+                Some(ShiftDirection::Right) => 1.0f32,
+                Some(ShiftDirection::Left) => -1.0f32,
+                None => 1.0f32,
+            };
+            let directional_ego = self.ego_cumulative_peak_px * shift_sign;
+
+            // Gate A: Ego trustworthy + insufficient confirming motion → suppress
+            if ego_trustworthy && directional_ego < ego_threshold {
+                return None; // Curve artifact — ego doesn't confirm
+            }
+
+            // Gate B: Direction disagreement — even with low ego confidence,
+            // if ego has accumulated meaningful displacement OPPOSING the shift
+            // direction, the lane-based direction is likely a perspective artifact.
+            // This mirrors the direction-correction veto in emit_shift_event().
+            // Threshold: 5px is well above noise, but catches clear opposing motion.
+            let ego_opposing = self.ego_cumulative_px * shift_sign;
+            if ego_opposing < -5.0 {
+                debug!(
+                    "🔔❌ Early LC suppressed: ego opposes shift on curve | ego_cum={:.1}px vs shift={} | ego_conf={:.0}%",
+                    self.ego_cumulative_px,
+                    self.shift_direction.unwrap_or(ShiftDirection::Left).as_str(),
+                    ego_confidence_ratio * 100.0,
+                );
+                return None;
+            }
+        }
+
+        // All gates passed — fire the notification
+        self.shift_confirmed_notified = true;
+
+        let direction = self.shift_direction.unwrap_or(ShiftDirection::Left);
+        let avg_confidence = if self.shift_frames > 0 {
+            self.shift_confidence_sum / self.shift_frames as f32
+        } else {
+            0.3
+        };
+        let confidence = self.compute_confidence(avg_confidence);
+
+        info!(
+            "🔔 Shift confirmed in-progress: {} | peak={:.1}% | frames={} | conf={:.2} | \
+             curve={} | ego_cum={:.1}px | frame={}",
+            direction.as_str(),
+            self.shift_peak_offset * 100.0,
+            self.shift_frames,
+            confidence,
+            self.shift_saw_curve_mode,
+            self.ego_cumulative_px,
+            frame_id,
+        );
+
+        Some(ShiftConfirmedNotification {
+            direction,
+            start_ms: self.shift_start_ms,
+            start_frame: self.shift_start_frame,
+            peak_offset: self.shift_peak_offset,
+            confidence,
+            curve_mode: self.shift_saw_curve_mode,
+            confirmed_frame: frame_id,
+            confirmed_ms: timestamp_ms,
+            geometric_signals: None, // Populated by pipeline
+        })
+    }
 
     fn start_shift(
         &mut self,
@@ -1539,6 +1698,7 @@ impl LateralShiftDetector {
             curve_mode: self.in_curve_mode || self.shift_saw_curve_mode,
             ego_cumulative_peak_px: self.ego_cumulative_peak_px,
             source_label,
+            geometric_signals: None, // v7.0: Populated by pipeline
         };
 
         info!(
@@ -1847,6 +2007,7 @@ impl LateralShiftDetector {
         self.ego_preempt_originated = false;
         self.shift_saw_curve_mode = false;
         self.shift_used_return_bypass = false;
+        self.shift_confirmed_notified = false;
         self.ego_shift_confident_frames = 0;
     }
 
@@ -1953,7 +2114,7 @@ mod tests {
             let result = det.update(Some(m), None, frame as f64 * 33.3, frame);
             // Should NOT produce a shift event
             assert!(
-                result.is_none(),
+                result.completed_shift.is_none(),
                 "Frame {}: unexpected shift event during curve! offset={:.1}%",
                 frame,
                 (offset_px / lane_w) * 100.0,
@@ -2039,7 +2200,7 @@ mod tests {
             let frame = 30 + i as u64;
             let result = det.update(Some(m), None, frame as f64 * 33.3, frame);
             assert!(
-                result.is_none(),
+                result.completed_shift.is_none(),
                 "Frame {}: smooth drift should not produce shift event",
                 frame
             );
@@ -2117,7 +2278,7 @@ mod tests {
             // Shift should NOT be emitted yet (still ramping or still active)
             // But it might start the shift state
             assert!(
-                result.is_none(),
+                result.completed_shift.is_none(),
                 "Frame {}: unexpected shift emission during ramp",
                 frame
             );
@@ -2136,7 +2297,7 @@ mod tests {
                 confidence: 0.4,
             };
             let frame = 68 + i as u64;
-            if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
+            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
                 any_shift_emitted = true;
             }
         }
@@ -2226,7 +2387,7 @@ mod tests {
                 confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
             let frame = 65 + i as u64;
-            if let Some(_evt) = det.update(Some(m), Some(ego), frame as f64 * 33.3, frame) {
+            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
                 any_shift_emitted = true;
             }
         }
