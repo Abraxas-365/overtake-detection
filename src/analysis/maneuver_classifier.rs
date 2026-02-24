@@ -231,6 +231,10 @@ pub struct ManeuverEvent {
     pub crossed_line_class: Option<String>,
     /// v6.1: The class_id of the crossed line marking (4=solid_white, 5=solid_yellow, etc.)
     pub crossed_line_class_id: Option<usize>,
+
+    /// v7.2: When true, this OVERTAKE supersedes a previously emitted early LANE_CHANGE
+    /// for the same lateral shift. The pipeline should decrement its lane change counter.
+    pub supersedes_early_lc: bool,
 }
 
 // ============================================================================
@@ -469,9 +473,32 @@ impl ManeuverClassifier {
             if let Some(si) = best_shift_idx {
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let shift_event = self.shift_buffer[si].event.clone();
+                let had_early_lc = self.shift_buffer[si].early_lc_emitted;
 
-                let maneuver =
+                let mut maneuver =
                     self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+                let overtake_confidence = maneuver.confidence;
+
+                // v7.2: Handle departure lane change for overtakes.
+                //
+                // An overtake consists of two lane changes (departure + return).
+                // Previously only the return was counted as a standalone LC because
+                // the departure shift was correlated with the overtake.
+                //
+                // Two cases:
+                // A) Early LC was already emitted → it may be a false positive
+                //    (curve artifact). Mark overtake as superseding it so the
+                //    pipeline decrements the LC counter. Then emit a proper
+                //    companion departure LC → net change: -1 +1 = 0 (replaces
+                //    the potentially false early LC with a confirmed one).
+                // B) No early LC → emit a companion departure LC. Net: +1.
+                if had_early_lc {
+                    maneuver.supersedes_early_lc = true;
+                    info!(
+                        "🔄 OVERTAKE supersedes prior early LANE_CHANGE (shift start_frame={})",
+                        shift_event.start_frame,
+                    );
+                }
 
                 info!(
                     "🚗 OVERTAKE: {} | conf={:.2} | sources={} | legality={:?}",
@@ -482,6 +509,21 @@ impl ManeuverClassifier {
                 );
 
                 self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+
+                // Always emit a companion departure LANE_CHANGE for the overtake.
+                // This ensures the departure side is counted in the LC total.
+                // When superseding an early LC, this replaces the false early one
+                // with a confirmed departure LC (supersede -1, companion +1 = net 0).
+                let ego_confirms = self.ego_motion_confirms_lateral();
+                let companion_lc =
+                    self.build_lane_change(&shift_event, overtake_confidence.min(0.90), ego_confirms);
+                info!(
+                    "🔀 COMPANION LANE_CHANGE (overtake departure): {} | conf={:.2}",
+                    companion_lc.side.as_str(),
+                    companion_lc.confidence,
+                );
+                self.recent_events.push(companion_lc);
                 self.total_maneuvers += 1;
 
                 self.pass_buffer[pass_idx].correlated = true;
@@ -688,9 +730,15 @@ impl ManeuverClassifier {
             if let Some(si) = best_shift_idx {
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let shift_event = self.shift_buffer[si].event.clone();
+                let had_early_lc = self.shift_buffer[si].early_lc_emitted;
 
-                let maneuver =
+                let mut maneuver =
                     self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+                let overtake_confidence = maneuver.confidence;
+
+                if had_early_lc {
+                    maneuver.supersedes_early_lc = true;
+                }
 
                 if maneuver.confidence >= self.config.min_combined_confidence {
                     info!(
@@ -703,6 +751,18 @@ impl ManeuverClassifier {
                     );
 
                     self.recent_events.push(maneuver);
+                    self.total_maneuvers += 1;
+
+                    // v7.2: Emit companion departure LANE_CHANGE
+                    let ego_confirms = self.ego_motion_confirms_lateral();
+                    let companion_lc =
+                        self.build_lane_change(&shift_event, overtake_confidence.min(0.90), ego_confirms);
+                    info!(
+                        "🔀 COMPANION LANE_CHANGE (reinterpreted overtake departure): {} | conf={:.2}",
+                        companion_lc.side.as_str(),
+                        companion_lc.confidence,
+                    );
+                    self.recent_events.push(companion_lc);
                     self.total_maneuvers += 1;
 
                     self.pass_buffer[pass_idx].correlated = true;
@@ -881,6 +941,7 @@ impl ManeuverClassifier {
                 marking_context: Some(self.latest_markings.clone()),
                 crossed_line_class: None,
                 crossed_line_class_id: None,
+                supersedes_early_lc: false,
             };
 
             info!(
@@ -1070,6 +1131,7 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 
@@ -1104,6 +1166,7 @@ impl ManeuverClassifier {
             marking_context: None,
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 
@@ -1187,6 +1250,7 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 

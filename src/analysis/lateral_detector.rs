@@ -488,8 +488,16 @@ impl LateralShiftDetector {
 
         if frame_is_curve {
             self.curve_sustained_frames += 1;
+        } else if self.in_curve_mode {
+            // v7.2: While curve mode is active, decay slowly (1 per frame max).
+            // This prevents rapid toggling when curve signals are intermittent.
+            // The hysteresis deactivation threshold (below) ensures curve mode
+            // stays on until evidence clearly says "not curve".
+            if self.curve_sustained_frames > 0 {
+                self.curve_sustained_frames -= 1;
+            }
         } else if coherence_says_curve == Some(false) && !curvature_says_curve {
-            // Both signals say not-curve — faster decay
+            // Both signals say not-curve — faster decay (only when not in curve mode)
             self.curve_sustained_frames = self.curve_sustained_frames.saturating_sub(2);
         } else {
             // Ambiguous (no data) — slow decay
@@ -500,11 +508,24 @@ impl LateralShiftDetector {
 
         let was_curve = self.in_curve_mode;
 
-        // v4.14: Both poly curvature and coherence use the sustained-frame
-        // gate. Instant activation caused chattering on straight roads where
-        // a single noisy frame would activate curve mode, then deactivate
-        // the next frame, keeping the curve VETO tainted.
-        self.in_curve_mode = self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
+        // v7.2: Hysteresis for curve mode to prevent rapid toggling.
+        //
+        // Activation requires >= curve_min_sustained_frames (e.g., 5).
+        // Deactivation requires the counter to drop below 2 (not back to < 5).
+        // This creates a hysteresis band that stabilizes curve mode on roads
+        // where curve signals are intermittent (e.g., when one boundary is
+        // briefly lost during a curve).
+        //
+        // Additionally, when curve mode is active, the counter decays at
+        // 1 per frame (not 2), making it harder to accidentally exit.
+        const CURVE_DEACTIVATION_THRESHOLD: u32 = 2;
+        if self.in_curve_mode {
+            // Deactivate only when counter drops well below activation threshold
+            self.in_curve_mode = self.curve_sustained_frames >= CURVE_DEACTIVATION_THRESHOLD;
+        } else {
+            // Activate at the normal threshold
+            self.in_curve_mode = self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
+        }
 
         // v4.12: Track how recently curve mode was active
         if self.in_curve_mode {
@@ -1299,7 +1320,8 @@ impl LateralShiftDetector {
             && self.shift_source == ShiftSource::LaneBased
         {
             let duration_s = ((timestamp_ms - self.shift_start_ms) / 1000.0) as f32;
-            let ego_threshold = 8.0_f32.max(duration_s * 3.0).min(25.0);
+            // v7.2: Use same relaxed thresholds as emit_shift_event
+            let ego_threshold = 4.0_f32.max(duration_s * 1.5).min(15.0);
 
             let ego_confidence_ratio = if self.shift_frames > 0 {
                 self.ego_shift_confident_frames as f32 / self.shift_frames as f32
@@ -1513,12 +1535,21 @@ impl LateralShiftDetector {
         // veto can fire. Brief curve activations during a long shift (e.g.,
         // 5 frames of 112) shouldn't taint the entire shift.
         // ══════════════════════════════════════════════════════════
-        const CURVE_EGO_MIN_FLOOR_PX: f32 = 8.0;
-        const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 3.0;
-        // v7.1: Cap the ego threshold to prevent unbounded growth on long shifts.
-        // A real lane change takes ~2-4s; beyond that, higher thresholds just
-        // reject legitimate lane changes with modest ego displacement.
-        const CURVE_EGO_MAX_THRESHOLD_PX: f32 = 25.0;
+        //
+        // v7.2: Relaxed thresholds. The previous floor of 8px + 3px/s was too
+        // aggressive for smooth lane changes on curved roads where the ego
+        // estimator shows near-zero lateral displacement (dominated by curve
+        // rotation). Real lane changes with ego_cum of 2-5px were being vetoed.
+        //
+        // The directional check (confirming vs opposing) is the primary
+        // discriminator; the threshold now only filters noise-level motion.
+        //
+        // When ego OPPOSES the shift (directional_ego <= 0), always veto.
+        // When ego CONFIRMS but is below threshold, only veto if very small.
+        const CURVE_EGO_MIN_FLOOR_PX: f32 = 4.0;
+        const CURVE_EGO_MIN_RATE_PX_PER_S: f32 = 1.5;
+        // v7.2: Lowered cap — real lane changes rarely need >15px to confirm.
+        const CURVE_EGO_MAX_THRESHOLD_PX: f32 = 15.0;
         // v4.13b: Minimum ratio of confident ego frames to trust the veto.
         // If the ego flow estimator had poor confidence during most of the shift
         // (low-texture terrain like desert), "ego says zero" is unreliable —
@@ -2437,13 +2468,18 @@ mod tests {
         }
         assert!(det.in_curve_mode, "Curve mode should activate");
 
-        // Deactivate curve mode (low coherence)
-        for i in 0..4 {
+        // Try to deactivate curve mode (low coherence).
+        // v7.2: With hysteresis, curve mode stays active longer — it requires
+        // sustained_frames to drop below CURVE_DEACTIVATION_THRESHOLD (2).
+        // After 6 frames of activation (sustained=6) and slow decay (1/frame
+        // while active), 4 frames only brings it to 2 — still in curve mode.
+        // Use more frames to truly deactivate.
+        for i in 0..8 {
             let m = make_measurement(0.0, lane_w, 0.1);
             let frame = 36 + i as u64;
             det.update(Some(m), None, frame as f64 * 33.3, frame);
         }
-        assert!(!det.in_curve_mode, "Curve mode should have deactivated");
+        assert!(!det.in_curve_mode, "Curve mode should have deactivated after hysteresis cooldown");
 
         // Phase 2: Shift starts while curve_mode=false (the gap).
         // Offset ramps to 60% — above base 35% threshold but below raised 70%.
@@ -2457,7 +2493,7 @@ mod tests {
                 lateral_velocity: -0.15, // tiny, curve-induced
                 confidence: 0.4,
             };
-            let frame = 40 + i as u64;
+            let frame = 44 + i as u64;
             det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
         }
 
@@ -2469,7 +2505,7 @@ mod tests {
                 lateral_velocity: -0.10,
                 confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
-            let frame = 60 + i as u64;
+            let frame = 64 + i as u64;
             det.update(Some(m), Some(ego), frame as f64 * 33.3, frame);
         }
         // shift_saw_curve_mode should now be latched true
@@ -2486,7 +2522,7 @@ mod tests {
                 lateral_velocity: 0.05,
                 confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
-            let frame = 65 + i as u64;
+            let frame = 69 + i as u64;
             if det
                 .update(Some(m), Some(ego), frame as f64 * 33.3, frame)
                 .completed_shift

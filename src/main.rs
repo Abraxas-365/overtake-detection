@@ -722,6 +722,15 @@ fn run_maneuver_pipeline_v2(
                 if event.passed_vehicle_id.is_some() {
                     ps.v2_vehicles_overtaken += 1;
                 }
+                // v7.2: If this overtake supersedes a previously emitted early
+                // LANE_CHANGE, decrement the lane change counter to undo it.
+                if event.supersedes_early_lc && ps.v2_lane_changes > 0 {
+                    ps.v2_lane_changes -= 1;
+                    info!(
+                        "🔄 Decremented lane_changes (superseded by overtake): now {}",
+                        ps.v2_lane_changes,
+                    );
+                }
             }
             analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
                 ps.v2_shadow_overtakes += 1
