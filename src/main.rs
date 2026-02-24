@@ -94,8 +94,7 @@ struct PipelineState {
     yolo_primary_count: u64,
     v2_maneuver_events: u64,
     v2_overtakes: u64,
-    v2_lane_changes: u64,
-    v2_being_overtaken: u64,
+    v2_shadow_overtakes: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -161,8 +160,7 @@ impl PipelineState {
             yolo_primary_count: 0,
             v2_maneuver_events: 0,
             v2_overtakes: 0,
-            v2_lane_changes: 0,
-            v2_being_overtaken: 0,
+            v2_shadow_overtakes: 0,
             v2_vehicles_overtaken: 0,
             crossing_events_total: 0,
             crossing_events_illegal: 0,
@@ -179,8 +177,7 @@ struct ProcessingStats {
     yolo_primary_count: u64,
     v2_maneuver_events: u64,
     v2_overtakes: u64,
-    v2_lane_changes: u64,
-    v2_being_overtaken: u64,
+    v2_shadow_overtakes: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -197,8 +194,7 @@ impl ProcessingStats {
             yolo_primary_count: ps.yolo_primary_count,
             v2_maneuver_events: ps.v2_maneuver_events,
             v2_overtakes: ps.v2_overtakes,
-            v2_lane_changes: ps.v2_lane_changes,
-            v2_being_overtaken: ps.v2_being_overtaken,
+            v2_shadow_overtakes: ps.v2_shadow_overtakes,
             v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
             crossing_events_total: ps.lane_crossing_state.confirmed_crossing_count,
             crossing_events_illegal: ps.lane_crossing_state.confirmed_illegal_count,
@@ -723,9 +719,8 @@ fn run_maneuver_pipeline_v2(
                     ps.v2_vehicles_overtaken += 1;
                 }
             }
-            analysis::maneuver_classifier::ManeuverType::LaneChange => ps.v2_lane_changes += 1,
-            analysis::maneuver_classifier::ManeuverType::BeingOvertaken => {
-                ps.v2_being_overtaken += 1
+            analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
+                ps.v2_shadow_overtakes += 1
             }
         }
 
@@ -868,7 +863,7 @@ fn run_video_annotation(
         ego_lateral_velocity: v2_output.ego_lateral_velocity,
         lateral_state: &v2_output.lateral_state,
         total_overtakes: ps.v2_overtakes,
-        total_lane_changes: ps.v2_lane_changes,
+        total_shadow_overtakes: ps.v2_shadow_overtakes,
         total_vehicles_overtaken: ps.v2_vehicles_overtaken,
         last_maneuver: ps.last_maneuver.as_ref(),
 
@@ -904,10 +899,10 @@ fn print_final_stats(stats: &ProcessingStats) {
     }
 
     info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║       MANEUVER DETECTION v6.0 (FULL PIPELINE)            ║");
+    info!("║       MANEUVER DETECTION v7.0 (OVERTAKE FOCUSED)         ║");
     info!("╠════════════════════════════════════════════════════════════╣");
     info!(
-        "║ Total v2 maneuver events:   {:>5}                         ║",
+        "║ Total maneuver events:      {:>5}                         ║",
         stats.v2_maneuver_events
     );
     info!(
@@ -915,12 +910,8 @@ fn print_final_stats(stats: &ProcessingStats) {
         stats.v2_overtakes, stats.v2_vehicles_overtaken
     );
     info!(
-        "║   🔀 Lane changes:          {:>5}                         ║",
-        stats.v2_lane_changes
-    );
-    info!(
-        "║   ⚠️  Being overtaken:       {:>5}                         ║",
-        stats.v2_being_overtaken
+        "║   ⚠️  Shadow overtakes:      {:>5}                         ║",
+        stats.v2_shadow_overtakes
     );
     info!(
         "║   🚧 Line crossings:        {:>5} ({} illegal)            ║",

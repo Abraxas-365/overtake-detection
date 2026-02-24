@@ -117,16 +117,14 @@ impl ClassifierConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManeuverType {
     Overtake,
-    LaneChange,
-    BeingOvertaken,
+    ShadowOvertake,
 }
 
 impl ManeuverType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Overtake => "OVERTAKE",
-            Self::LaneChange => "LANE_CHANGE",
-            Self::BeingOvertaken => "BEING_OVERTAKEN",
+            Self::ShadowOvertake => "SHADOW_OVERTAKE",
         }
     }
 }
@@ -655,36 +653,7 @@ impl ManeuverClassifier {
             }
         }
 
-        // ── UNCORRELATED SHIFTS → LANE CHANGE ───────────────────
-        // Runs AFTER deferred reinterpretation. Shifts used for overtakes
-        // are intentionally left uncorrelated so they also emit as lane
-        // changes (an overtake always includes a lane change).
-        for shift_idx in 0..self.shift_buffer.len() {
-            if self.shift_buffer[shift_idx].correlated {
-                continue;
-            }
-            if !self.shift_buffer[shift_idx].event.confirmed {
-                continue;
-            }
-
-            let shift_event = self.shift_buffer[shift_idx].event.clone();
-            let maneuver = self.build_lane_change(&shift_event, legality_buffer);
-
-            if maneuver.confidence >= self.config.min_combined_confidence {
-                info!(
-                    "🔀 LANE CHANGE: {} | conf={:.2} | legality={:?}",
-                    maneuver.side.as_str(),
-                    maneuver.confidence,
-                    maneuver.legality,
-                );
-
-                self.recent_events.push(maneuver);
-                self.total_maneuvers += 1;
-                self.shift_buffer[shift_idx].correlated = true;
-            }
-        }
-
-        // ── BEING OVERTAKEN ─────────────────────────────────────
+        // ── SHADOW OVERTAKE (vehicle overtakes ego) ──────────────
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
                 continue;
@@ -693,7 +662,7 @@ impl ManeuverClassifier {
                 // v4.13b: Skip passes deferred by the curve gate — they're
                 // waiting for potential re-interpretation as ego-overtakes.
                 // If no corroborating shift appears, they'll expire from the
-                // buffer naturally (not emitted as false being_overtaken).
+                // buffer naturally (not emitted as false shadow_overtake).
                 if self.pass_buffer[pass_idx].curve_deferred {
                     continue;
                 }
@@ -753,10 +722,10 @@ impl ManeuverClassifier {
                 }
 
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
-                let maneuver = self.build_being_overtaken(&pass_event);
+                let maneuver = self.build_shadow_overtake(&pass_event);
 
                 info!(
-                    "⚠️  BEING OVERTAKEN: track {} on {} | conf={:.2}",
+                    "⚠️  SHADOW OVERTAKE: track {} on {} | conf={:.2}",
                     pass_event.vehicle_track_id,
                     maneuver.side.as_str(),
                     maneuver.confidence,
@@ -862,71 +831,14 @@ impl ManeuverClassifier {
         }
     }
 
-    fn build_lane_change(
-        &self,
-        shift: &LateralShiftEvent,
-        legality_buffer: Option<&LegalityRingBuffer>,
-    ) -> ManeuverEvent {
-        let side = match shift.direction {
-            ShiftDirection::Left => ManeuverSide::Left,
-            ShiftDirection::Right => ManeuverSide::Right,
-        };
-
-        let legality_at_crossing =
-            legality_buffer.and_then(|buf| buf.worst_in_range(shift.start_frame, shift.end_frame));
-        let legality = legality_at_crossing
-            .as_ref()
-            .map(|r| r.verdict)
-            .unwrap_or(LineLegality::Unknown);
-
-        let ego_confirms = self.ego_motion_confirms_lateral();
-
-        let shift_conf = shift.confidence * (self.config.weight_pass + self.config.weight_lateral);
-        let ego_conf = if ego_confirms {
-            self.config.weight_ego_motion * 0.8
-        } else {
-            0.0
-        };
-
-        let sources = DetectionSources {
-            vehicle_tracking: false,
-            lane_detection: true,
-            ego_motion: ego_confirms,
-        };
-
-        let confidence =
-            (shift_conf + ego_conf + if sources.count() >= 2 { 0.05 } else { 0.0 }).min(0.95);
-
-        ManeuverEvent {
-            maneuver_type: ManeuverType::LaneChange,
-            side,
-            legality,
-            legality_at_crossing,
-            confidence,
-            sources,
-            start_ms: shift.start_ms,
-            end_ms: shift.end_ms,
-            start_frame: shift.start_frame,
-            end_frame: shift.end_frame,
-            duration_ms: shift.duration_ms,
-            passed_vehicle_id: None,
-            passed_vehicle_class: None,
-            pass_event: None,
-            lateral_event: Some(shift.clone()),
-            marking_context: Some(self.latest_markings.clone()),
-            crossed_line_class: None,
-            crossed_line_class_id: None,
-        }
-    }
-
-    fn build_being_overtaken(&self, pass: &PassEvent) -> ManeuverEvent {
+    fn build_shadow_overtake(&self, pass: &PassEvent) -> ManeuverEvent {
         let side = match pass.side {
             PassSide::Left => ManeuverSide::Left,
             PassSide::Right => ManeuverSide::Right,
         };
 
         ManeuverEvent {
-            maneuver_type: ManeuverType::BeingOvertaken,
+            maneuver_type: ManeuverType::ShadowOvertake,
             side,
             legality: LineLegality::Unknown,
             legality_at_crossing: None,
