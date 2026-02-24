@@ -290,6 +290,13 @@ pub fn correlate_crossing_with_maneuver(
         (ManeuverType::Overtake, ManeuverSide::Right) => {
             Some((LineRole::RightBoundary, LineRole::CenterLine))
         }
+        // v7.0: Lane change — same boundary logic as overtake
+        (ManeuverType::LaneChange, ManeuverSide::Left) => {
+            Some((LineRole::LeftBoundary, LineRole::CenterLine))
+        }
+        (ManeuverType::LaneChange, ManeuverSide::Right) => {
+            Some((LineRole::RightBoundary, LineRole::CenterLine))
+        }
         // Shadow overtakes don't involve ego crossing a line
         _ => None,
     };

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use tracing::{debug, info, warn};
 
 use super::curvature_estimator::CurvatureEstimate;
+use super::polynomial_tracker::GeometricLaneChangeSignals;
 
 // ============================================================================
 // CONFIGURATION
@@ -208,6 +209,9 @@ pub struct LateralShiftEvent {
     pub ego_cumulative_peak_px: f32,
     /// v4.13: Shift detection source (LaneBased / EgoBridged / EgoStarted).
     pub source_label: &'static str,
+    /// v7.0: Snapshot of geometric lane change signals at time of shift emission.
+    /// Populated by the pipeline from the polynomial tracker; None when created.
+    pub geometric_signals: Option<GeometricLaneChangeSignals>,
 }
 
 /// Input from ego-motion estimator (optical flow based)
@@ -1539,6 +1543,7 @@ impl LateralShiftDetector {
             curve_mode: self.in_curve_mode || self.shift_saw_curve_mode,
             ego_cumulative_peak_px: self.ego_cumulative_peak_px,
             source_label,
+            geometric_signals: None, // v7.0: Populated by pipeline
         };
 
         info!(

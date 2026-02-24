@@ -95,6 +95,7 @@ struct PipelineState {
     v2_maneuver_events: u64,
     v2_overtakes: u64,
     v2_shadow_overtakes: u64,
+    v2_lane_changes: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -161,6 +162,7 @@ impl PipelineState {
             v2_maneuver_events: 0,
             v2_overtakes: 0,
             v2_shadow_overtakes: 0,
+            v2_lane_changes: 0,
             v2_vehicles_overtaken: 0,
             crossing_events_total: 0,
             crossing_events_illegal: 0,
@@ -178,6 +180,7 @@ struct ProcessingStats {
     v2_maneuver_events: u64,
     v2_overtakes: u64,
     v2_shadow_overtakes: u64,
+    v2_lane_changes: u64,
     v2_vehicles_overtaken: u64,
     crossing_events_total: u64,
     crossing_events_illegal: u64,
@@ -195,6 +198,7 @@ impl ProcessingStats {
             v2_maneuver_events: ps.v2_maneuver_events,
             v2_overtakes: ps.v2_overtakes,
             v2_shadow_overtakes: ps.v2_shadow_overtakes,
+            v2_lane_changes: ps.v2_lane_changes,
             v2_vehicles_overtaken: ps.v2_vehicles_overtaken,
             crossing_events_total: ps.lane_crossing_state.confirmed_crossing_count,
             crossing_events_illegal: ps.lane_crossing_state.confirmed_illegal_count,
@@ -722,6 +726,9 @@ fn run_maneuver_pipeline_v2(
             analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
                 ps.v2_shadow_overtakes += 1
             }
+            analysis::maneuver_classifier::ManeuverType::LaneChange => {
+                ps.v2_lane_changes += 1
+            }
         }
 
         //         // v6.1: Correlate this maneuver with a pending crossing.
@@ -864,6 +871,7 @@ fn run_video_annotation(
         lateral_state: &v2_output.lateral_state,
         total_overtakes: ps.v2_overtakes,
         total_shadow_overtakes: ps.v2_shadow_overtakes,
+        total_lane_changes: ps.v2_lane_changes,
         total_vehicles_overtaken: ps.v2_vehicles_overtaken,
         last_maneuver: ps.last_maneuver.as_ref(),
 
@@ -912,6 +920,10 @@ fn print_final_stats(stats: &ProcessingStats) {
     info!(
         "║   ⚠️  Shadow overtakes:      {:>5}                         ║",
         stats.v2_shadow_overtakes
+    );
+    info!(
+        "║   🔀 Lane changes:          {:>5}                         ║",
+        stats.v2_lane_changes
     );
     info!(
         "║   🚧 Line crossings:        {:>5} ({} illegal)            ║",

@@ -225,6 +225,7 @@ pub struct AnnotationInput<'a> {
     pub lateral_state: &'a str,
     pub total_overtakes: u64,
     pub total_shadow_overtakes: u64,
+    pub total_lane_changes: u64,
     pub total_vehicles_overtaken: u64,
     pub last_maneuver: Option<&'a crate::LastManeuverInfo>,
 
@@ -364,6 +365,7 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
         input.maneuver_events,
         input.total_overtakes,
         input.total_shadow_overtakes,
+        input.total_lane_changes,
         input.total_vehicles_overtaken,
         input.last_maneuver,
         input.timestamp_ms,
@@ -389,6 +391,7 @@ pub fn draw_annotated_frame(input: &AnnotationInput) -> Result<Mat> {
         input.timestamp_ms,
         input.total_overtakes,
         input.total_shadow_overtakes,
+        input.total_lane_changes,
         width,
         height,
     )?;
@@ -426,6 +429,7 @@ pub fn draw_lanes_v2(
     vehicle_detections: &[crate::vehicle_detection::Detection],
     total_overtakes: u64,
     total_shadow_overtakes: u64,
+    total_lane_changes: u64,
     total_vehicles_overtaken: u64,
     last_maneuver: Option<&crate::LastManeuverInfo>,
 ) -> Result<Mat> {
@@ -451,6 +455,7 @@ pub fn draw_lanes_v2(
         lateral_state,
         total_overtakes,
         total_shadow_overtakes,
+        total_lane_changes,
         total_vehicles_overtaken,
         last_maneuver,
         tracked_vehicles,
@@ -1113,6 +1118,7 @@ fn render_right_event_panel(
     maneuver_events: &[crate::analysis::maneuver_classifier::ManeuverEvent],
     total_overtakes: u64,
     total_shadow_overtakes: u64,
+    total_lane_changes: u64,
     total_vehicles_overtaken: u64,
     last_maneuver: Option<&crate::LastManeuverInfo>,
     timestamp_ms: f64,
@@ -1141,8 +1147,8 @@ fn render_right_event_panel(
     draw_text_with_shadow(
         output,
         &format!(
-            "OVT: {} ({} veh) | SHDW: {}",
-            total_overtakes, total_vehicles_overtaken, total_shadow_overtakes,
+            "OVT: {} ({} veh) | LC: {} | SHDW: {}",
+            total_overtakes, total_vehicles_overtaken, total_lane_changes, total_shadow_overtakes,
         ),
         right_panel_x + 8,
         right_panel_y,
@@ -1243,6 +1249,9 @@ fn render_right_event_panel(
             }
             crate::analysis::maneuver_classifier::ManeuverType::ShadowOvertake => {
                 core::Scalar::new(0.0, 0.0, 255.0, 0.0)
+            }
+            crate::analysis::maneuver_classifier::ManeuverType::LaneChange => {
+                core::Scalar::new(255.0, 200.0, 0.0, 0.0) // Cyan/teal for lane changes
             }
         };
         draw_text_with_shadow(
@@ -1422,6 +1431,7 @@ fn render_bottom_status_bar(
     timestamp_ms: f64,
     total_overtakes: u64,
     total_shadow_overtakes: u64,
+    total_lane_changes: u64,
     width: i32,
     height: i32,
 ) -> Result<()> {
@@ -1489,7 +1499,7 @@ fn render_bottom_status_bar(
     )?;
 
     // Right: stats
-    let stats_text = format!("OVT:{} SHDW:{}", total_overtakes, total_shadow_overtakes);
+    let stats_text = format!("OVT:{} LC:{} SHDW:{}", total_overtakes, total_lane_changes, total_shadow_overtakes);
     let stats_size = imgproc::get_text_size(
         &stats_text,
         imgproc::FONT_HERSHEY_SIMPLEX,
