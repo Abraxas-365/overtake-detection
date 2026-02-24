@@ -495,19 +495,11 @@ impl LateralShiftDetector {
 
         let was_curve = self.in_curve_mode;
 
-        // v4.13: If polynomial curvature confidently says curve, activate
-        // immediately without waiting for sustained frames. This eliminates
-        // the multi-frame lag that let early-curve false positives through.
-        if curvature_says_curve && curvature.unwrap().confidence > 0.5 {
-            self.in_curve_mode = true;
-            self.curve_sustained_frames = self
-                .curve_sustained_frames
-                .max(self.config.curve_min_sustained_frames);
-        } else {
-            // Standard sustained-frame gate for coherence-only path
-            self.in_curve_mode =
-                self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
-        }
+        // v4.14: Both poly curvature and coherence use the sustained-frame
+        // gate. Instant activation caused chattering on straight roads where
+        // a single noisy frame would activate curve mode, then deactivate
+        // the next frame, keeping the curve VETO tainted.
+        self.in_curve_mode = self.curve_sustained_frames >= self.config.curve_min_sustained_frames;
 
         // v4.12: Track how recently curve mode was active
         if self.in_curve_mode {
@@ -717,7 +709,10 @@ impl LateralShiftDetector {
         // ── NO LANES PATH (neither fresh nor cached) ────────────
         if effective_meas.is_none() {
             let completed_shift = self.handle_no_lanes(ego, timestamp_ms, frame_id);
-            return LateralUpdateResult { completed_shift, confirmed_in_progress: None };
+            return LateralUpdateResult {
+                completed_shift,
+                confirmed_in_progress: None,
+            };
         }
 
         let meas = effective_meas.unwrap();
@@ -749,7 +744,10 @@ impl LateralShiftDetector {
 
                 if self.freeze_remaining > 0 {
                     self.freeze_remaining -= 1;
-                    return LateralUpdateResult { completed_shift: None, confirmed_in_progress: None };
+                    return LateralUpdateResult {
+                        completed_shift: None,
+                        confirmed_in_progress: None,
+                    };
                 }
 
                 if self.baseline_samples >= self.config.baseline_warmup_frames {
@@ -936,7 +934,10 @@ impl LateralShiftDetector {
             None
         };
 
-        LateralUpdateResult { completed_shift, confirmed_in_progress }
+        LateralUpdateResult {
+            completed_shift,
+            confirmed_in_progress,
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -2297,7 +2298,11 @@ mod tests {
                 confidence: 0.4,
             };
             let frame = 68 + i as u64;
-            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
+            if det
+                .update(Some(m), Some(ego), frame as f64 * 33.3, frame)
+                .completed_shift
+                .is_some()
+            {
                 any_shift_emitted = true;
             }
         }
@@ -2387,7 +2392,11 @@ mod tests {
                 confidence: 0.5, // ego working but measuring near-zero → curve artifact
             };
             let frame = 65 + i as u64;
-            if det.update(Some(m), Some(ego), frame as f64 * 33.3, frame).completed_shift.is_some() {
+            if det
+                .update(Some(m), Some(ego), frame as f64 * 33.3, frame)
+                .completed_shift
+                .is_some()
+            {
                 any_shift_emitted = true;
             }
         }
@@ -2402,4 +2411,3 @@ mod tests {
         );
     }
 }
-

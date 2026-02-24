@@ -79,6 +79,10 @@ pub struct PassDetectorConfig {
     /// This gate prevents those initial misclassifications from seeding
     /// a false VehicleOvertookEgo sequence.
     pub min_track_age_for_beside_overtook: u32,
+    /// v4.14: Maximum area growth rate (peak_area / initial_area per second)
+    /// for EgoOvertook events. Oncoming traffic grows at 3+/s due to high
+    /// closing speed; same-direction targets grow at <1.5/s.
+    pub max_area_growth_rate_per_sec: f32,
 }
 
 impl Default for PassDetectorConfig {
@@ -98,6 +102,7 @@ impl Default for PassDetectorConfig {
             min_beside_height_ratio_overtook_ego: 0.15, // v4.10: 15% of frame height
             min_behind_frames_for_reverse: 5,           // v4.9b: ~167ms at 30fps
             min_track_age_for_beside_overtook: 5,       // v4.10: ~167ms warmup
+            max_area_growth_rate_per_sec: 2.5,          // v4.14: oncoming traffic filter
         }
     }
 }
@@ -120,6 +125,7 @@ impl PassDetectorConfig {
             min_beside_height_ratio_overtook_ego: 0.18, // v4.10: 18% for mining (larger vehicles)
             min_behind_frames_for_reverse: 8,
             min_track_age_for_beside_overtook: 8, // v4.10: ~267ms warmup for mining
+            max_area_growth_rate_per_sec: 3.0, // v4.14: more lenient for mining (larger vehicles)
         }
     }
 }
@@ -240,6 +246,14 @@ struct PendingPass {
     /// Zone on the previous update frame. Used to detect transitions
     /// (e.g., BEHIND → BESIDE vs BESIDE → BESIDE continuation).
     last_zone: Option<VehicleZone>,
+
+    // ── v4.14: Oncoming traffic rejection (EgoOvertook) ──
+    /// Track's initial area at first observation.
+    initial_track_area: f32,
+    /// Track's peak area across all observations.
+    peak_track_area: f32,
+    /// Timestamp of first observation (ms).
+    first_seen_ms: f64,
 }
 
 impl PendingPass {
@@ -274,6 +288,9 @@ impl PendingPass {
             current_beside_phase_start_frame: None,
             current_beside_zone: None,
             last_zone: None,
+            initial_track_area: 0.0,
+            peak_track_area: 0.0,
+            first_seen_ms: 0.0,
         }
     }
 
@@ -338,10 +355,18 @@ impl PassDetector {
                 continue;
             }
 
-            let pending = self
-                .pending
-                .entry(track.id)
-                .or_insert_with(|| PendingPass::new(track.id));
+            let pending = self.pending.entry(track.id).or_insert_with(|| {
+                let mut p = PendingPass::new(track.id);
+                // v4.14: Capture initial area and timestamp for oncoming traffic detection
+                p.initial_track_area = track.initial_area;
+                p.first_seen_ms = timestamp_ms;
+                p
+            });
+
+            // v4.14: Update peak area every frame
+            if track.peak_area > pending.peak_track_area {
+                pending.peak_track_area = track.peak_area;
+            }
 
             match track.zone {
                 // ═══════════════════════════════════════════════════
@@ -722,6 +747,14 @@ impl PassDetector {
                     continue;
                 }
 
+                // Gate 5: Oncoming traffic rejection (v4.14)
+                if self.is_likely_oncoming(pending, timestamp_ms) {
+                    if first_rejection {
+                        self.rejected_disappeared_logged.insert(track_id);
+                    }
+                    continue;
+                }
+
                 let event = PassEvent {
                     vehicle_track_id: track_id,
                     direction: PassDirection::EgoOvertook,
@@ -799,6 +832,10 @@ impl PassDetector {
                         pending.ahead_frames_before_beside,
                         self.config.min_ahead_frames
                     );
+                    return None;
+                }
+                // v4.14: Oncoming traffic rejection
+                if self.is_likely_oncoming(pending, timestamp_ms) {
                     return None;
                 }
             }
@@ -961,6 +998,36 @@ impl PassDetector {
             confidence,
             vehicle_class_id: track.class_id,
         })
+    }
+
+    /// v4.14: Check if a track's area growth rate suggests oncoming traffic.
+    /// Oncoming vehicles grow explosively (closing speed ~100-200 km/h)
+    /// while same-direction overtake targets grow slowly (~10-30 km/h relative).
+    fn is_likely_oncoming(&self, pending: &PendingPass, timestamp_ms: f64) -> bool {
+        if pending.initial_track_area < 1.0 || pending.first_seen_ms <= 0.0 {
+            return false;
+        }
+        let elapsed_sec = (timestamp_ms - pending.first_seen_ms) / 1000.0;
+        if elapsed_sec < 0.5 {
+            return false; // Too short to judge
+        }
+        let growth = pending.peak_track_area / pending.initial_track_area;
+        let growth_rate = growth / elapsed_sec;
+
+        if growth_rate > self.config.max_area_growth_rate_per_sec {
+            warn!(
+                "🚫 Track {} likely oncoming: area {:.0}→{:.0} ({:.1}× in {:.1}s = {:.2}/s, max={:.2}/s)",
+                pending.track_id,
+                pending.initial_track_area,
+                pending.peak_track_area,
+                growth,
+                elapsed_sec,
+                growth_rate,
+                self.config.max_area_growth_rate_per_sec
+            );
+            return true;
+        }
+        false
     }
 
     // ── Side mapping helpers ──
@@ -1558,4 +1625,3 @@ mod tests {
         );
     }
 }
-
