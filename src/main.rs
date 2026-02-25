@@ -743,6 +743,11 @@ fn run_maneuver_pipeline_v2(
             event.penetration_ratio,
             frame_count,
         );
+
+        // v7.5: Feed crossing to the maneuver pipeline classifier.
+        // This allows deferred VehicleOvertookEgo passes (curve-suppressed)
+        // to be promoted when the crossing corroborates the overtake.
+        ps.maneuver_pipeline_v2.feed_crossing(event.clone());
     }
 
     // v6.1: Expire stale pending crossings (older than 5s = 125 frames at 25fps)

@@ -654,6 +654,11 @@ impl ManeuverPipeline {
         self.poly_tracker.signals()
     }
 
+    /// v7.5: Feed a line crossing event to the classifier for deferred pass promotion.
+    pub fn feed_crossing(&mut self, event: crate::lane_crossing::LineCrossingEvent) {
+        self.classifier.feed_crossing(event);
+    }
+
     pub fn reset(&mut self) {
         self.tracker.reset();
         self.pass_detector.reset();

@@ -35,6 +35,7 @@
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftConfirmedNotification, ShiftDirection};
 use super::pass_detector::{PassDirection, PassEvent, PassSide};
+use crate::lane_crossing::{CrossingDirection, LineCrossingEvent, LineRole};
 use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use serde::{Deserialize, Serialize};
@@ -286,6 +287,11 @@ pub struct ManeuverClassifier {
     /// v7.0: Tracks (start_frame, direction) of shifts that already had an early
     /// LANE_CHANGE emitted, to prevent duplicate LC when the completed shift arrives.
     early_lc_records: Vec<(u64, ShiftDirection)>,
+    /// v7.5: Line crossing events for deferred pass promotion.
+    /// A line crossing (e.g., ego crossed center line) provides physical evidence
+    /// of a lane change that can corroborate a deferred VehicleOvertookEgo pass
+    /// even when the lateral detector fails (e.g., on curves).
+    crossing_buffer: VecDeque<LineCrossingEvent>,
 }
 
 impl ManeuverClassifier {
@@ -303,6 +309,7 @@ impl ManeuverClassifier {
             frames_since_curve_mode: u32::MAX,
             pending_confirmed: Vec::new(),
             early_lc_records: Vec::new(),
+            crossing_buffer: VecDeque::with_capacity(10),
         }
     }
 
@@ -338,6 +345,14 @@ impl ManeuverClassifier {
     /// LANE_CHANGE emission. Processed in the next classify() call.
     pub fn feed_shift_confirmed(&mut self, notification: ShiftConfirmedNotification) {
         self.pending_confirmed.push(notification);
+    }
+
+    /// v7.5: Accept a line crossing event for deferred pass promotion.
+    /// A crossing provides physical evidence of lane departure that can
+    /// corroborate a deferred VehicleOvertookEgo even when the lateral
+    /// detector fails (e.g., curve-mode thresholds too high).
+    pub fn feed_crossing(&mut self, event: LineCrossingEvent) {
+        self.crossing_buffer.push_back(event);
     }
 
     pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
@@ -771,6 +786,103 @@ impl ManeuverClassifier {
             }
         }
 
+        // ══════════════════════════════════════════════════════════════════
+        // v7.5: CROSSING-BASED PROMOTION for deferred VehicleOvertookEgo.
+        //
+        // When the lateral detector fails on curves (curve-mode thresholds
+        // too high, ego estimator unreliable), a line crossing event provides
+        // direct physical evidence that the ego crossed a lane boundary.
+        //
+        // Matching logic:
+        //   Vehicle on RIGHT + crossing RightBoundary/CenterLine Leftward
+        //     = ego moved LEFT to overtake
+        //   Vehicle on LEFT + crossing LeftBoundary/CenterLine Rightward
+        //     = ego moved RIGHT to overtake
+        // ══════════════════════════════════════════════════════════════════
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
+            }
+            if !self.pass_buffer[pass_idx].curve_deferred {
+                continue;
+            }
+
+            let pass = &self.pass_buffer[pass_idx].event;
+
+            let mut best_crossing_idx: Option<usize> = None;
+            let mut best_crossing_gap = f64::MAX;
+
+            for (ci, crossing) in self.crossing_buffer.iter().enumerate() {
+                // Direction match: ego crossed boundary in the direction
+                // consistent with overtaking the vehicle on the given side.
+                let crossing_confirms = matches!(
+                    (pass.side, crossing.line_role, crossing.crossing_direction),
+                    // Vehicle on RIGHT → ego moved LEFT to pass
+                    (PassSide::Right, LineRole::RightBoundary | LineRole::CenterLine, CrossingDirection::Leftward)
+                    // Vehicle on LEFT → ego moved RIGHT to pass
+                    | (PassSide::Left, LineRole::LeftBoundary | LineRole::CenterLine, CrossingDirection::Rightward)
+                );
+
+                if !crossing_confirms {
+                    continue;
+                }
+
+                // Time window: crossing must occur within the correlation window
+                // from the pass's beside phase start through a generous post-ahead window.
+                let pass_window_end =
+                    pass.beside_end_ms.max(pass.ahead_start_ms) + self.config.correlation_window_ms;
+
+                let time_gap = temporal_gap(
+                    pass.beside_start_ms,
+                    pass_window_end,
+                    crossing.timestamp_ms,
+                    crossing.timestamp_ms,
+                );
+
+                if time_gap < gap && time_gap < best_crossing_gap {
+                    best_crossing_idx = Some(ci);
+                    best_crossing_gap = time_gap;
+                }
+            }
+
+            if let Some(ci) = best_crossing_idx {
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let crossing = self.crossing_buffer[ci].clone();
+
+                let mut maneuver =
+                    self.build_overtake(&pass_event, None, legality_buffer);
+
+                // Apply crossing-based legality and marking info
+                maneuver.crossed_line_class = Some(crossing.marking_class.clone());
+                maneuver.crossed_line_class_id = Some(crossing.marking_class_id);
+                maneuver.legality =
+                    crate::lane_crossing_integration::crossing_legality_to_line_legality(
+                        &crossing.passing_legality,
+                        crossing.marking_class_id,
+                    );
+
+                if maneuver.confidence >= self.config.min_combined_confidence {
+                    info!(
+                        "🚗 OVERTAKE (ego passed vehicle, crossing-confirmed): Track {} \
+                         re-interpreted VehicleOvertookEgo + {} crossing {} | \
+                         conf={:.2} | legality={:?} | marking={}",
+                        pass_event.vehicle_track_id,
+                        crossing.line_role.as_str(),
+                        crossing.crossing_direction.as_str(),
+                        maneuver.confidence,
+                        maneuver.legality,
+                        crossing.marking_class,
+                    );
+
+                    self.recent_events.push(maneuver);
+                    self.total_maneuvers += 1;
+                    self.pass_buffer[pass_idx].correlated = true;
+                    // Don't remove the crossing — it stays available for
+                    // the lane_crossing_integration standalone promotion flow.
+                }
+            }
+        }
+
         // ── SHADOW OVERTAKE (vehicle overtakes ego) ──────────────
         for pass_idx in 0..self.pass_buffer.len() {
             if self.pass_buffer[pass_idx].correlated {
@@ -1045,6 +1157,10 @@ impl ManeuverClassifier {
         // for the full correlation_window_ms, producing log spam every frame.
         self.pass_buffer.retain(|p| !p.correlated);
         self.shift_buffer.retain(|s| !s.correlated);
+
+        // v7.5: Expire old crossings from the buffer.
+        self.crossing_buffer
+            .retain(|c| timestamp_ms - c.timestamp_ms < self.config.correlation_window_ms);
 
         self.recent_events.clone()
     }
