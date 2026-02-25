@@ -656,8 +656,55 @@ impl ManeuverClassifier {
                         self.ego_motion_confirms_lateral(),
                     );
 
+                    let overtake_conf = maneuver.confidence;
                     self.recent_events.push(maneuver);
                     self.total_maneuvers += 1;
+
+                    // v7.5f: Emit a companion departure LANE_CHANGE for tracking-only
+                    // overtakes, matching the behavior of the correlated pass+shift path.
+                    // The lateral detector may fail to detect the departure shift on
+                    // curves (ego estimator unreliable, curve veto), but the vehicle
+                    // tracking confirms the ego physically changed lanes to overtake.
+                    // Use the same side as the overtake (PassSide maps 1:1 to ManeuverSide),
+                    // consistent with how build_lane_change + build_overtake both use
+                    // direct (non-inverted) mappings in the correlated path.
+                    let departure_side = match pass_event.side {
+                        PassSide::Left => ManeuverSide::Left,
+                        PassSide::Right => ManeuverSide::Right,
+                    };
+                    let departure_lc = ManeuverEvent {
+                        maneuver_type: ManeuverType::LaneChange,
+                        side: departure_side,
+                        legality: LineLegality::Unknown,
+                        legality_at_crossing: None,
+                        confidence: overtake_conf.min(0.90),
+                        sources: DetectionSources {
+                            vehicle_tracking: true,
+                            lane_detection: false,
+                            ego_motion: false,
+                        },
+                        start_ms: pass_event.beside_start_ms,
+                        end_ms: pass_event.beside_start_ms,
+                        start_frame: pass_event.frame_id,
+                        end_frame: pass_event.frame_id,
+                        duration_ms: 0.0,
+                        passed_vehicle_id: Some(pass_event.vehicle_track_id),
+                        passed_vehicle_class: None,
+                        pass_event: None,
+                        lateral_event: None,
+                        marking_context: Some(self.latest_markings.clone()),
+                        crossed_line_class: None,
+                        crossed_line_class_id: None,
+                        supersedes_early_lc: false,
+                    };
+                    info!(
+                        "🔀 COMPANION LANE_CHANGE (tracking-only departure): {} | conf={:.2}",
+                        departure_side.as_str(),
+                        departure_lc.confidence,
+                    );
+                    self.recent_events.push(departure_lc);
+                    self.total_maneuvers += 1;
+
                     self.pass_buffer[pass_idx].correlated = true;
                 } else {
                     info!(
