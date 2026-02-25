@@ -1404,12 +1404,13 @@ impl LateralShiftDetector {
             // The completed shift will still go through emit_shift_event where
             // the direction-correction veto provides a safety net.
             //
-            // v7.5: Tightened from >= 0.0 to >= 0.5 — consistent with the
-            // completion path. On curves, near-zero ego (-0.0) with high
-            // geo_score is perspective distortion. Require at least 0.5px
-            // of positive confirming ego motion.
+            // v7.5b: Duration-scaled threshold, matching the completion path.
+            // Ego noise on curves accumulates at ~1-2 px/s; a flat 0.5 px
+            // floor lets long shifts pass on noise alone. Scale with duration
+            // so longer shifts need proportionally stronger ego evidence.
             let (geo_override_raw, _geo_score) = self.geometric_signals_confirm_lane_change();
-            let geo_override = geo_override_raw && directional_ego >= 0.5;
+            let curve_geo_min = 0.5_f32.max(duration_s * 2.0).min(8.0);
+            let geo_override = geo_override_raw && directional_ego >= curve_geo_min;
 
             // Gate A: Ego trustworthy + insufficient confirming motion → suppress
             //         UNLESS geometric signals confirm AND ego is not opposing.
@@ -1727,14 +1728,19 @@ impl LateralShiftDetector {
         // shifts. Zero or opposing ego + high geo_score on a curve is
         // perspective distortion, not a lane change. Expected returns are
         // handled separately via is_expected_return.
-        const CURVE_GEO_MIN_CONFIRM_PX: f32 = 0.5;
         let (geo_override_raw, geo_score) = self.geometric_signals_confirm_lane_change();
         let ego_is_inconclusive = directional_ego.abs() < CURVE_EGO_INCONCLUSIVE_PX;
         let geo_override = if curve_tainted {
-            // On curves: boundary divergence can't independently confirm a
-            // lane change because perspective geometry creates the same signal.
-            // Require at least 0.5px of confirming directional ego.
-            geo_override_raw && directional_ego >= CURVE_GEO_MIN_CONFIRM_PX
+            // v7.5b: Duration-scaled threshold. Ego noise on curves accumulates
+            // at ~1-2 px/s from rotation-induced drift. A flat 0.5 px floor
+            // lets long shifts (>1 s) pass on noise alone. Scale the minimum
+            // confirming ego with duration so that longer shifts need
+            // proportionally stronger ego evidence.
+            //   floor = 0.5 px  (short bursts still need *some* ego)
+            //   rate  = 2.0 px/s (above typical 1-2 px/s curve noise)
+            //   cap   = 8.0 px  (don't require unreasonable displacement)
+            let curve_geo_min = 0.5_f32.max(duration_s * 2.0).min(8.0);
+            geo_override_raw && directional_ego >= curve_geo_min
         } else {
             // Off curves: geometric signals are reliable independent confirmation.
             geo_override_raw
@@ -1780,7 +1786,7 @@ impl LateralShiftDetector {
                 geo_score,
                 if geo_override_raw && !geo_override {
                     if curve_tainted {
-                        " (geo blocked: curve requires confirming ego >= 0.5px)"
+                        " (geo blocked: curve requires confirming ego >= duration-scaled threshold)"
                     } else if ego_is_inconclusive {
                         " (geo blocked: opposing ego + short duration + not inconclusive)"
                     } else {
