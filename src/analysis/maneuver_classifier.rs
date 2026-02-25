@@ -862,6 +862,61 @@ impl ManeuverClassifier {
                     );
 
                 if maneuver.confidence >= self.config.min_combined_confidence {
+                    // v7.5c: Emit a LANE_CHANGE for the departure BEFORE the overtake.
+                    // The crossing is physical evidence that the ego crossed a lane
+                    // boundary. The lateral detector missed the departure because
+                    // the baseline was established after the ego had already shifted
+                    // (video started mid-maneuver). The crossing direction tells us
+                    // which way the ego moved.
+                    let departure_side = match crossing.crossing_direction {
+                        CrossingDirection::Leftward => ManeuverSide::Left,
+                        CrossingDirection::Rightward => ManeuverSide::Right,
+                        _ => maneuver.side, // fallback
+                    };
+                    let departure_legality =
+                        crate::lane_crossing_integration::crossing_legality_to_line_legality(
+                            &crossing.passing_legality,
+                            crossing.marking_class_id,
+                        );
+                    let departure_lc = ManeuverEvent {
+                        maneuver_type: ManeuverType::LaneChange,
+                        side: departure_side,
+                        legality: departure_legality,
+                        legality_at_crossing: None,
+                        confidence: crossing.confidence * crossing.penetration_ratio,
+                        sources: DetectionSources {
+                            vehicle_tracking: false,
+                            lane_detection: false,
+                            ego_motion: false,
+                        },
+                        start_ms: crossing.timestamp_ms,
+                        end_ms: crossing.timestamp_ms,
+                        start_frame: crossing.frame_id,
+                        end_frame: crossing.frame_id,
+                        duration_ms: 0.0,
+                        passed_vehicle_id: None,
+                        passed_vehicle_class: None,
+                        pass_event: None,
+                        lateral_event: None,
+                        marking_context: Some(self.latest_markings.clone()),
+                        crossed_line_class: Some(crossing.marking_class.clone()),
+                        crossed_line_class_id: Some(crossing.marking_class_id),
+                        supersedes_early_lc: false,
+                    };
+
+                    info!(
+                        "🔀 LANE_CHANGE (crossing-based departure): {} | conf={:.2} | \
+                         legality={:?} | marking={} | frame={}",
+                        departure_side.as_str(),
+                        departure_lc.confidence,
+                        departure_lc.legality,
+                        crossing.marking_class,
+                        crossing.frame_id,
+                    );
+
+                    self.recent_events.push(departure_lc);
+                    self.total_maneuvers += 1;
+
                     info!(
                         "🚗 OVERTAKE (ego passed vehicle, crossing-confirmed): Track {} \
                          re-interpreted VehicleOvertookEgo + {} crossing {} | \

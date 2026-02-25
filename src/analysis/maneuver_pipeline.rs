@@ -542,9 +542,14 @@ impl ManeuverPipeline {
         // change and the return are vetoed.
         for evt in &maneuver_events {
             if evt.maneuver_type == ManeuverType::Overtake && evt.sources.vehicle_tracking {
+                // v7.5c: Return direction = same as ManeuverSide.
+                // ManeuverSide::Right means the vehicle was on the RIGHT,
+                // so the ego departed LEFT (into oncoming lane). The RETURN
+                // is RIGHT (back to own lane). Previously this was inverted
+                // (computed the departure direction instead of the return).
                 let return_dir = match evt.side {
-                    ManeuverSide::Left => ShiftDirection::Right,
-                    ManeuverSide::Right => ShiftDirection::Left,
+                    ManeuverSide::Left => ShiftDirection::Left,
+                    ManeuverSide::Right => ShiftDirection::Right,
                 };
                 const RETURN_WINDOW_MS: f64 = 30_000.0;
                 self.lateral_detector.set_pending_return(
