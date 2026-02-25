@@ -12,11 +12,13 @@
 
 mod analysis;
 mod color_analysis;
+mod frame_buffer;
 mod lane_crossing;
 mod lane_crossing_integration;
 mod lane_detection;
 mod lane_legality;
 mod lane_legality_patches;
+mod llm_client;
 mod pipeline;
 mod road_classification;
 mod road_overlay;
@@ -32,9 +34,11 @@ use analysis::maneuver_pipeline::{
 use analysis::vehicle_tracker::DetectionInput;
 
 use anyhow::{Context, Result};
+use frame_buffer::StrategicFrameBuffer;
 use lane_crossing::CacheState;
 use lane_crossing_integration::LaneCrossingState;
 use lane_legality::{FusedLegalityResult, LaneLegalityDetector, LegalityResult};
+use llm_client::LlmClient;
 use pipeline::legality_buffer::LegalityRingBuffer;
 use road_classification::{MixedLineSide, PassingLegality, RoadClassification, RoadClassifier};
 use road_overlay::CrossingFlashState;
@@ -80,6 +84,12 @@ struct PipelineState {
     road_classifier: RoadClassifier,
     crossing_flash: Option<CrossingFlashState>,
     last_road_classification: RoadClassification,
+
+    // ── v8.0: LLM Vision integration ──
+    frame_buffer: StrategicFrameBuffer,
+    llm_client: Option<LlmClient>,
+    /// Last curvature estimate (for LLM context)
+    last_curvature: Option<analysis::curvature_estimator::CurvatureEstimate>,
 
     // ── Transient state ──
     latest_vehicle_detections: Vec<vehicle_detection::Detection>,
@@ -140,6 +150,17 @@ impl PipelineState {
             frame_height,
         );
 
+        // ── v8.0: LLM Vision integration ──
+        let llm_server_url = std::env::var("LLM_SERVER_URL").ok();
+        let llm_client = llm_server_url.map(|url| {
+            let video_name = video_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            info!("🌐 LLM server configured: {} (source: {})", url, video_name);
+            LlmClient::new(&url, video_name, 25.0, frame_width as i32, frame_height as i32)
+        });
+
         Ok(Self {
             yolo_detector,
             legality_detector,
@@ -151,6 +172,11 @@ impl PipelineState {
             road_classifier: RoadClassifier::new(frame_width),
             crossing_flash: None,
             last_road_classification: RoadClassification::default(),
+
+            // v8.0: LLM Vision
+            frame_buffer: StrategicFrameBuffer::new(),
+            llm_client,
+            last_curvature: None,
 
             latest_vehicle_detections: Vec::new(),
             last_vehicle_state: None,
@@ -335,6 +361,102 @@ fn process_video(
         let v2_output =
             run_maneuver_pipeline_v2(&mut ps, &arc_frame, lane_measurement, timestamp_ms);
         let d3 = t3.elapsed();
+
+        // ── STAGE 3b: Strategic Frame Capture for LLM ──
+        // Feed every frame into the rolling lookback buffer.
+        // Strategic captures happen on signals (shift start, crossing, etc.)
+        {
+            let left_marking = ps.latest_marking_infos.iter()
+                .filter(|m| m.center_x < arc_frame.width as f32 / 2.0)
+                .max_by(|a, b| a.center_x.partial_cmp(&b.center_x).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|m| m.class_name.as_str());
+            let right_marking = ps.latest_marking_infos.iter()
+                .filter(|m| m.center_x >= arc_frame.width as f32 / 2.0)
+                .min_by(|a, b| a.center_x.partial_cmp(&b.center_x).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|m| m.class_name.as_str());
+
+            let lane_conf = ps.last_vehicle_state.as_ref().map(|vs| vs.detection_confidence);
+            let offset_pct = ps.last_vehicle_state.as_ref().and_then(|vs| vs.normalized_offset());
+            let curve_detected = ps.last_road_classification.road_type != road_classification::RoadType::Unknown;
+            let vehicles_visible = ps.latest_vehicle_detections.len() as u32;
+
+            ps.frame_buffer.feed_frame(
+                &arc_frame.data,
+                arc_frame.width as usize,
+                arc_frame.height as usize,
+                ps.frame_count,
+                timestamp_ms,
+                lane_conf,
+                offset_pct,
+                left_marking,
+                right_marking,
+                curve_detected,
+                0.0,
+                vehicles_visible,
+            );
+
+            // Capture curvature for LLM context
+            if let Some(ref detector) = ps.legality_detector {
+                if let Some(curv) = detector.curvature_estimate() {
+                    ps.last_curvature = Some(*curv);
+                }
+            }
+
+            // Signal crossing events to frame buffer
+            if v2_output.shift_in_progress && !ps.frame_buffer.has_frames() {
+                let going_left = v2_output.ego_lateral_velocity < -1.0;
+                ps.frame_buffer.notify_shift_start(going_left);
+            }
+            ps.frame_buffer.maybe_capture_periodic();
+
+            // When a maneuver completes, trigger LLM analysis
+            for event in &v2_output.maneuver_events {
+                ps.frame_buffer.notify_maneuver_complete();
+
+                if ps.llm_client.is_some() && ps.frame_buffer.has_frames() {
+                    let frames = ps.frame_buffer.collect_best_frames(7);
+                    let event_clone = event.clone();
+                    let curvature = ps.last_curvature;
+                    let road_class = ps.last_road_classification.clone();
+                    let vehicle_state = ps.last_vehicle_state;
+                    let shadow_count = ps.v2_shadow_overtakes;
+                    let vehicles_overtaken = ps.v2_vehicles_overtaken;
+
+                    // We take a reference to the client — it lives in PipelineState.
+                    // Send the request asynchronously so we don't block the pipeline.
+                    if let Some(ref client) = ps.llm_client {
+                        let client_url = format!("{}/api/analyze", "");
+                        // Build request synchronously, send async
+                        info!(
+                            "🌐 Queuing LLM analysis: {} {} | {} frames",
+                            event_clone.maneuver_type.as_str(),
+                            event_clone.side.as_str(),
+                            frames.len(),
+                        );
+
+                        // Fire-and-forget async task
+                        let llm_request = client.analyze_maneuver(
+                            &event_clone,
+                            &frames,
+                            curvature.as_ref(),
+                            Some(&road_class),
+                            vehicle_state.as_ref(),
+                            None,
+                            shadow_count,
+                            vehicles_overtaken,
+                        );
+                        tokio::spawn(async move {
+                            match llm_request.await {
+                                Ok(resp) => info!("🌐 LLM result: {} — {}", resp.status, resp.message),
+                                Err(e) => warn!("🌐 LLM error: {}", e),
+                            }
+                        });
+                    }
+
+                    ps.frame_buffer.reset();
+                }
+            }
+        }
 
         // ── STAGE 4: Save events ──
         let t4 = std::time::Instant::now();
