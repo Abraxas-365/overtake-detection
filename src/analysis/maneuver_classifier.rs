@@ -1150,10 +1150,11 @@ impl ManeuverClassifier {
             }
 
             // v7.0: Skip shifts that already had an early LC emitted.
-            // These shifts are still available for overtake correlation (above),
-            // but shouldn't produce a duplicate standalone LANE_CHANGE.
+            // These shifts shouldn't produce a duplicate standalone LANE_CHANGE.
+            // v7.5f: Don't mark as correlated — keep in buffer so that a
+            // later-arriving pass can still correlate with this shift for
+            // OVERTAKE detection (pass+shift path runs before this section).
             if self.shift_buffer[shift_idx].early_lc_emitted {
-                self.shift_buffer[shift_idx].correlated = true;
                 continue;
             }
 
@@ -1174,14 +1175,19 @@ impl ManeuverClassifier {
             };
 
             // Step 2: Curve suppression gate
-            // On curves without geometric override → suppress (perspective artifact)
+            // On curves without geometric override → suppress as standalone LC
+            // (perspective artifact). BUT do NOT mark as correlated — the shift
+            // may still be needed for pass+shift → OVERTAKE correlation. A valid
+            // overtake departure on a curve can fail the geo_override (weak ego
+            // on curves) while still being corroborated by a subsequent pass event.
+            // v7.5f: Changed from `correlated = true` to just skip, keeping the
+            // shift available for the pass+shift correlation path above.
             if shift.curve_mode && !geo_override {
                 debug!(
                     "  LC suppressed: shift {} on curve without geometric override | peak={:.1}%",
                     shift.direction.as_str(),
                     shift.peak_offset * 100.0,
                 );
-                self.shift_buffer[shift_idx].correlated = true;
                 continue;
             }
 
