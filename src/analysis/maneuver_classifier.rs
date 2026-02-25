@@ -1037,7 +1037,13 @@ impl ManeuverClassifier {
             };
 
             // Geometric override check for curve suppression
-            let (geo_override, geo_score) = if let Some(signals) = &confirmed.geometric_signals {
+            // v7.5d: On curves, geometric signals are contaminated by perspective
+            // distortion — disable geo_override entirely. The lateral detector
+            // (v7.5c) already suppresses early notifications on curves, but this
+            // provides defense in depth.
+            let (geo_override, geo_score) = if confirmed.curve_mode {
+                (false, 0.0)
+            } else if let Some(signals) = &confirmed.geometric_signals {
                 if signals.confidence >= self.config.geometric_min_signal_confidence
                     && signals.suggests_lane_change
                 {
@@ -1154,7 +1160,18 @@ impl ManeuverClassifier {
             let shift = &self.shift_buffer[shift_idx].event;
 
             // Step 1: Evaluate geometric override
-            let (geo_override, geo_score) = self.evaluate_geometric_override(shift);
+            let (raw_geo_override, geo_score) = self.evaluate_geometric_override(shift);
+            // v7.5d: On curves, geometric signals (boundary divergence,
+            // lane width rate) are contaminated by perspective distortion.
+            // Require confirming ego displacement scaled by duration to avoid
+            // false positives from perspective artifacts on curves.
+            let geo_override = if shift.curve_mode && raw_geo_override {
+                let dur_s = (shift.duration_ms / 1000.0) as f32;
+                let curve_geo_min = 0.5_f32.max(dur_s * 2.0).min(8.0);
+                shift.ego_cumulative_peak_px >= curve_geo_min
+            } else {
+                raw_geo_override
+            };
 
             // Step 2: Curve suppression gate
             // On curves without geometric override → suppress (perspective artifact)
