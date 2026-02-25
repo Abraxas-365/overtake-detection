@@ -1390,27 +1390,16 @@ impl LateralShiftDetector {
             };
             let directional_ego = self.ego_cumulative_peak_px * shift_sign;
 
-            // v7.3: Check geometric override before suppressing.
-            // Boundary divergence can confirm a lane change even when ego
-            // estimator fails on curves (rotational flow cancels lateral motion).
-            //
-            // v7.3b: Only allow geometric override for EARLY notifications when
-            // ego is NOT opposing the shift direction (directional_ego >= 0).
-            // On severe curves, the polynomial tracker can report high boundary
-            // divergence even for pure perspective artifacts. Without direction
-            // validation (which only runs in emit_shift_event), the early LC
-            // path must be conservative. When ego opposes, we can't distinguish
-            // "ego canceled by curve rotation" from "no real lateral motion."
-            // The completed shift will still go through emit_shift_event where
-            // the direction-correction veto provides a safety net.
-            //
-            // v7.5b: Duration-scaled threshold, matching the completion path.
-            // Ego noise on curves accumulates at ~1-2 px/s; a flat 0.5 px
-            // floor lets long shifts pass on noise alone. Scale with duration
-            // so longer shifts need proportionally stronger ego evidence.
-            let (geo_override_raw, _geo_score) = self.geometric_signals_confirm_lane_change();
-            let curve_geo_min = 0.5_f32.max(duration_s * 2.0).min(8.0);
-            let geo_override = geo_override_raw && directional_ego >= curve_geo_min;
+            // v7.5c: Disable geometric override entirely for EARLY notifications
+            // on curves. On curves, polynomial boundary signals (divergence,
+            // width rate) are contaminated by perspective distortion and cannot
+            // independently confirm lane changes. The early path also lacks
+            // the direction-correction veto that the completion path has —
+            // making it doubly vulnerable to false positives from transient
+            // ego noise (e.g. 2.9px at 0.6s that decays to ~0 by 2.2s).
+            // If the ego itself isn't above threshold, wait for completion
+            // where the full veto pipeline runs.
+            let geo_override = false;
 
             // Gate A: Ego trustworthy + insufficient confirming motion → suppress
             //         UNLESS geometric signals confirm AND ego is not opposing.
