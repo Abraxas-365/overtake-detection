@@ -14,9 +14,8 @@
 
 use crate::analysis::curvature_estimator::CurvatureEstimate;
 use crate::analysis::maneuver_classifier::{ManeuverEvent, ManeuverSide, ManeuverType};
-use crate::frame_buffer::{CapturedFrame, StrategicFrameBuffer};
+use crate::frame_buffer::CapturedFrame;
 use crate::lane_legality::LineLegality;
-use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use crate::road_classification::RoadClassification;
 use crate::types::VehicleState;
 
@@ -217,81 +216,43 @@ impl LlmClient {
         }
     }
 
-    /// Build and send a full analysis request to the LLM server.
-    ///
-    /// This takes all available data from the Rust pipeline and packages it
-    /// into the richest possible request for the LLM vision model.
-    pub async fn analyze_maneuver(
+    /// Build the request synchronously from references, then call
+    /// `send_request` in a spawned task with the owned request.
+    pub fn build_and_get_sender(
         &self,
         event: &ManeuverEvent,
         captured_frames: &[CapturedFrame],
         curvature: Option<&CurvatureEstimate>,
         road_classification: Option<&RoadClassification>,
         vehicle_state: Option<&VehicleState>,
-        legality_buffer: Option<&LegalityRingBuffer>,
         shadow_overtake_count: u64,
         total_vehicles_overtaken: u64,
-    ) -> Result<LaneChangeLegalityResponse, String> {
+    ) -> LlmSendTask {
         let request = self.build_request(
             event,
             captured_frames,
             curvature,
             road_classification,
             vehicle_state,
-            legality_buffer,
             shadow_overtake_count,
             total_vehicles_overtaken,
         );
 
-        let url = format!("{}/api/analyze", self.server_url);
-
-        info!(
-            "🌐 Sending LLM request: {} | {} frames | dir={} | event={}",
-            event.maneuver_type.as_str(),
-            captured_frames.len(),
-            event.side.as_str(),
-            request.event_id,
-        );
-
-        match self.http_client.post(&url).json(&request).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    match resp.json::<LaneChangeLegalityResponse>().await {
-                        Ok(result) => {
-                            info!(
-                                "🌐 LLM response: {} — {}",
-                                result.status, result.message
-                            );
-                            Ok(result)
-                        }
-                        Err(e) => {
-                            warn!("🌐 Failed to parse LLM response: {}", e);
-                            Err(format!("Parse error: {}", e))
-                        }
-                    }
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    warn!("🌐 LLM server error {}: {}", status, body);
-                    Err(format!("HTTP {}: {}", status, body))
-                }
-            }
-            Err(e) => {
-                error!("🌐 Failed to reach LLM server: {}", e);
-                Err(format!("Connection error: {}", e))
-            }
+        LlmSendTask {
+            http_client: self.http_client.clone(),
+            url: format!("{}/api/analyze", self.server_url),
+            request,
         }
     }
 
     /// Build the full request with all pipeline metadata
-    fn build_request(
+    pub fn build_request(
         &self,
         event: &ManeuverEvent,
         captured_frames: &[CapturedFrame],
         curvature: Option<&CurvatureEstimate>,
         road_classification: Option<&RoadClassification>,
         vehicle_state: Option<&VehicleState>,
-        legality_buffer: Option<&LegalityRingBuffer>,
         shadow_overtake_count: u64,
         total_vehicles_overtaken: u64,
     ) -> LaneChangeLegalityRequest {
@@ -527,6 +488,55 @@ impl LlmClient {
             detection_metadata,
             enable_image_enhancement: true,
             enhancement_mode: "auto".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// SEND TASK — owns all data, safe to move into tokio::spawn
+// ============================================================================
+
+/// Owned task that can be moved into `tokio::spawn`.
+/// Built synchronously by `LlmClient::build_and_get_sender`,
+/// then sent asynchronously via `send()`.
+pub struct LlmSendTask {
+    http_client: reqwest::Client,
+    url: String,
+    pub request: LaneChangeLegalityRequest,
+}
+
+impl LlmSendTask {
+    /// Send the request to the Go LLM server. This is `'static`-safe.
+    pub async fn send(self) -> Result<LaneChangeLegalityResponse, String> {
+        let event_id = self.request.event_id.clone();
+
+        match self.http_client.post(&self.url).json(&self.request).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<LaneChangeLegalityResponse>().await {
+                        Ok(result) => {
+                            info!(
+                                "🌐 LLM response [{}]: {} — {}",
+                                event_id, result.status, result.message
+                            );
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            warn!("🌐 Failed to parse LLM response [{}]: {}", event_id, e);
+                            Err(format!("Parse error: {}", e))
+                        }
+                    }
+                } else {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!("🌐 LLM server error [{}] {}: {}", event_id, status, body);
+                    Err(format!("HTTP {}: {}", status, body))
+                }
+            }
+            Err(e) => {
+                error!("🌐 Failed to reach LLM server [{}]: {}", event_id, e);
+                Err(format!("Connection error: {}", e))
+            }
         }
     }
 }

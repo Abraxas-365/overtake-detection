@@ -413,47 +413,38 @@ fn process_video(
             for event in &v2_output.maneuver_events {
                 ps.frame_buffer.notify_maneuver_complete();
 
-                if ps.llm_client.is_some() && ps.frame_buffer.has_frames() {
-                    let frames = ps.frame_buffer.collect_best_frames(7);
-                    let event_clone = event.clone();
-                    let curvature = ps.last_curvature;
-                    let road_class = ps.last_road_classification.clone();
-                    let vehicle_state = ps.last_vehicle_state;
-                    let shadow_count = ps.v2_shadow_overtakes;
-                    let vehicles_overtaken = ps.v2_vehicles_overtaken;
+                if let Some(ref client) = ps.llm_client {
+                    if ps.frame_buffer.has_frames() {
+                        let frames = ps.frame_buffer.collect_best_frames(7);
 
-                    // We take a reference to the client — it lives in PipelineState.
-                    // Send the request asynchronously so we don't block the pipeline.
-                    if let Some(ref client) = ps.llm_client {
-                        let client_url = format!("{}/api/analyze", "");
-                        // Build request synchronously, send async
                         info!(
                             "🌐 Queuing LLM analysis: {} {} | {} frames",
-                            event_clone.maneuver_type.as_str(),
-                            event_clone.side.as_str(),
+                            event.maneuver_type.as_str(),
+                            event.side.as_str(),
                             frames.len(),
                         );
 
-                        // Fire-and-forget async task
-                        let llm_request = client.analyze_maneuver(
-                            &event_clone,
+                        // Build request synchronously (takes refs — no lifetime issues)
+                        let send_task = client.build_and_get_sender(
+                            event,
                             &frames,
-                            curvature.as_ref(),
-                            Some(&road_class),
-                            vehicle_state.as_ref(),
-                            None,
-                            shadow_count,
-                            vehicles_overtaken,
+                            ps.last_curvature.as_ref(),
+                            Some(&ps.last_road_classification),
+                            ps.last_vehicle_state.as_ref(),
+                            ps.v2_shadow_overtakes,
+                            ps.v2_vehicles_overtaken,
                         );
+
+                        // Spawn owned send task — no borrows cross the spawn boundary
                         tokio::spawn(async move {
-                            match llm_request.await {
+                            match send_task.send().await {
                                 Ok(resp) => info!("🌐 LLM result: {} — {}", resp.status, resp.message),
                                 Err(e) => warn!("🌐 LLM error: {}", e),
                             }
                         });
-                    }
 
-                    ps.frame_buffer.reset();
+                        ps.frame_buffer.reset();
+                    }
                 }
             }
         }
