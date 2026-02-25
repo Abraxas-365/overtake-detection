@@ -22,10 +22,11 @@
 
 use super::ego_motion::{EgoMotionConfig, EgoMotionEstimate, EgoMotionEstimator, GrayFrame};
 use super::lateral_detector::{
-    EgoMotionInput, LaneMeasurement, LateralDetectorConfig, LateralShiftDetector,
+    EgoMotionInput, LaneMeasurement, LateralDetectorConfig, LateralShiftDetector, ShiftDirection,
 };
 use super::maneuver_classifier::{
-    ClassifierConfig, ManeuverClassifier, ManeuverEvent, MarkingSnapshot,
+    ClassifierConfig, ManeuverClassifier, ManeuverEvent, ManeuverSide, ManeuverType,
+    MarkingSnapshot,
 };
 use super::pass_detector::{PassDetector, PassDetectorConfig};
 use super::polynomial_tracker::{
@@ -466,7 +467,17 @@ impl ManeuverPipeline {
         // 4. LATERAL SHIFT DETECTION + FEED TO CLASSIFIER
         //    v4.4: Now receives ego-motion input for fusion/bridging.
         //    v5.0: Receives enhanced measurement from polynomial tracker.
+        //    v7.3: Receives geometric signals for curve veto bypass.
         // ══════════════════════════════════════════════════════════════════
+        // v7.3: Feed geometric signals BEFORE lateral update so the curve
+        // veto can consult boundary divergence as independent lane-change evidence.
+        if self.poly_tracker.both_active() {
+            self.lateral_detector
+                .set_geometric_signals(Some(*self.poly_tracker.signals()));
+        } else {
+            self.lateral_detector.set_geometric_signals(None);
+        }
+
         let ego_input = if self.enable_ego_motion {
             Some(EgoMotionInput {
                 lateral_velocity: self.last_ego_estimate.lateral_velocity_px,
@@ -519,6 +530,34 @@ impl ManeuverPipeline {
         let maneuver_events =
             self.classifier
                 .classify(input.timestamp_ms, input.frame_id, input.legality_buffer);
+
+        // ══════════════════════════════════════════════════════════════════
+        // 6b. OVERTAKE → LATERAL RETURN EXPECTATION (v7.1)
+        // ══════════════════════════════════════════════════════════════════
+        // When an overtake is confirmed via tracking (EGO_OVERTOOK), the ego
+        // vehicle has changed lanes. Set a return expectation on the lateral
+        // detector so the return lane change can bypass the curve ego veto.
+        // Without this, on curvy roads the ego estimator often shows near-zero
+        // displacement during real lane changes, and both the overtake lane
+        // change and the return are vetoed.
+        for evt in &maneuver_events {
+            if evt.maneuver_type == ManeuverType::Overtake && evt.sources.vehicle_tracking {
+                // v7.5c: Return direction = same as ManeuverSide.
+                // ManeuverSide::Right means the vehicle was on the RIGHT,
+                // so the ego departed LEFT (into oncoming lane). The RETURN
+                // is RIGHT (back to own lane). Previously this was inverted
+                // (computed the departure direction instead of the return).
+                let return_dir = match evt.side {
+                    ManeuverSide::Left => ShiftDirection::Left,
+                    ManeuverSide::Right => ShiftDirection::Right,
+                };
+                const RETURN_WINDOW_MS: f64 = 30_000.0;
+                self.lateral_detector.set_pending_return(
+                    return_dir,
+                    input.timestamp_ms + RETURN_WINDOW_MS,
+                );
+            }
+        }
 
         // ══════════════════════════════════════════════════════════════════
         // 7. PERIODIC DIAGNOSTICS (ENHANCED)
@@ -618,6 +657,11 @@ impl ManeuverPipeline {
     /// v5.0: Get the latest geometric lane change signals.
     pub fn geometric_signals(&self) -> &GeometricLaneChangeSignals {
         self.poly_tracker.signals()
+    }
+
+    /// v7.5: Feed a line crossing event to the classifier for deferred pass promotion.
+    pub fn feed_crossing(&mut self, event: crate::lane_crossing::LineCrossingEvent) {
+        self.classifier.feed_crossing(event);
     }
 
     pub fn reset(&mut self) {

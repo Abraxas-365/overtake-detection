@@ -1012,7 +1012,7 @@ impl PassDetector {
             return false; // Too short to judge
         }
         let growth = pending.peak_track_area / pending.initial_track_area;
-        let growth_rate = growth / elapsed_sec;
+        let growth_rate = growth / elapsed_sec as f32;
 
         if growth_rate > self.config.max_area_growth_rate_per_sec {
             warn!(

@@ -35,6 +35,7 @@
 use super::ego_motion::EgoMotionEstimate;
 use super::lateral_detector::{LateralShiftEvent, ShiftConfirmedNotification, ShiftDirection};
 use super::pass_detector::{PassDirection, PassEvent, PassSide};
+use crate::lane_crossing::{CrossingDirection, LineCrossingEvent, LineRole};
 use crate::lane_legality::{FusedLegalityResult, LineLegality};
 use crate::pipeline::legality_buffer::LegalityRingBuffer;
 use serde::{Deserialize, Serialize};
@@ -231,6 +232,10 @@ pub struct ManeuverEvent {
     pub crossed_line_class: Option<String>,
     /// v6.1: The class_id of the crossed line marking (4=solid_white, 5=solid_yellow, etc.)
     pub crossed_line_class_id: Option<usize>,
+
+    /// v7.2: When true, this OVERTAKE supersedes a previously emitted early LANE_CHANGE
+    /// for the same lateral shift. The pipeline should decrement its lane change counter.
+    pub supersedes_early_lc: bool,
 }
 
 // ============================================================================
@@ -282,6 +287,11 @@ pub struct ManeuverClassifier {
     /// v7.0: Tracks (start_frame, direction) of shifts that already had an early
     /// LANE_CHANGE emitted, to prevent duplicate LC when the completed shift arrives.
     early_lc_records: Vec<(u64, ShiftDirection)>,
+    /// v7.5: Line crossing events for deferred pass promotion.
+    /// A line crossing (e.g., ego crossed center line) provides physical evidence
+    /// of a lane change that can corroborate a deferred VehicleOvertookEgo pass
+    /// even when the lateral detector fails (e.g., on curves).
+    crossing_buffer: VecDeque<LineCrossingEvent>,
 }
 
 impl ManeuverClassifier {
@@ -299,6 +309,7 @@ impl ManeuverClassifier {
             frames_since_curve_mode: u32::MAX,
             pending_confirmed: Vec::new(),
             early_lc_records: Vec::new(),
+            crossing_buffer: VecDeque::with_capacity(10),
         }
     }
 
@@ -334,6 +345,14 @@ impl ManeuverClassifier {
     /// LANE_CHANGE emission. Processed in the next classify() call.
     pub fn feed_shift_confirmed(&mut self, notification: ShiftConfirmedNotification) {
         self.pending_confirmed.push(notification);
+    }
+
+    /// v7.5: Accept a line crossing event for deferred pass promotion.
+    /// A crossing provides physical evidence of lane departure that can
+    /// corroborate a deferred VehicleOvertookEgo even when the lateral
+    /// detector fails (e.g., curve-mode thresholds too high).
+    pub fn feed_crossing(&mut self, event: LineCrossingEvent) {
+        self.crossing_buffer.push_back(event);
     }
 
     pub fn feed_ego_motion(&mut self, estimate: EgoMotionEstimate, timestamp_ms: f64) {
@@ -469,9 +488,32 @@ impl ManeuverClassifier {
             if let Some(si) = best_shift_idx {
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let shift_event = self.shift_buffer[si].event.clone();
+                let had_early_lc = self.shift_buffer[si].early_lc_emitted;
 
-                let maneuver =
+                let mut maneuver =
                     self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+                let overtake_confidence = maneuver.confidence;
+
+                // v7.2: Handle departure lane change for overtakes.
+                //
+                // An overtake consists of two lane changes (departure + return).
+                // Previously only the return was counted as a standalone LC because
+                // the departure shift was correlated with the overtake.
+                //
+                // Two cases:
+                // A) Early LC was already emitted → it may be a false positive
+                //    (curve artifact). Mark overtake as superseding it so the
+                //    pipeline decrements the LC counter. Then emit a proper
+                //    companion departure LC → net change: -1 +1 = 0 (replaces
+                //    the potentially false early LC with a confirmed one).
+                // B) No early LC → emit a companion departure LC. Net: +1.
+                if had_early_lc {
+                    maneuver.supersedes_early_lc = true;
+                    info!(
+                        "🔄 OVERTAKE supersedes prior early LANE_CHANGE (shift start_frame={})",
+                        shift_event.start_frame,
+                    );
+                }
 
                 info!(
                     "🚗 OVERTAKE: {} | conf={:.2} | sources={} | legality={:?}",
@@ -482,6 +524,21 @@ impl ManeuverClassifier {
                 );
 
                 self.recent_events.push(maneuver);
+                self.total_maneuvers += 1;
+
+                // Always emit a companion departure LANE_CHANGE for the overtake.
+                // This ensures the departure side is counted in the LC total.
+                // When superseding an early LC, this replaces the false early one
+                // with a confirmed departure LC (supersede -1, companion +1 = net 0).
+                let ego_confirms = self.ego_motion_confirms_lateral();
+                let companion_lc =
+                    self.build_lane_change(&shift_event, overtake_confidence.min(0.90), ego_confirms);
+                info!(
+                    "🔀 COMPANION LANE_CHANGE (overtake departure): {} | conf={:.2}",
+                    companion_lc.side.as_str(),
+                    companion_lc.confidence,
+                );
+                self.recent_events.push(companion_lc);
                 self.total_maneuvers += 1;
 
                 self.pass_buffer[pass_idx].correlated = true;
@@ -599,8 +656,55 @@ impl ManeuverClassifier {
                         self.ego_motion_confirms_lateral(),
                     );
 
+                    let overtake_conf = maneuver.confidence;
                     self.recent_events.push(maneuver);
                     self.total_maneuvers += 1;
+
+                    // v7.5f: Emit a companion departure LANE_CHANGE for tracking-only
+                    // overtakes, matching the behavior of the correlated pass+shift path.
+                    // The lateral detector may fail to detect the departure shift on
+                    // curves (ego estimator unreliable, curve veto), but the vehicle
+                    // tracking confirms the ego physically changed lanes to overtake.
+                    // Use the same side as the overtake (PassSide maps 1:1 to ManeuverSide),
+                    // consistent with how build_lane_change + build_overtake both use
+                    // direct (non-inverted) mappings in the correlated path.
+                    let departure_side = match pass_event.side {
+                        PassSide::Left => ManeuverSide::Left,
+                        PassSide::Right => ManeuverSide::Right,
+                    };
+                    let departure_lc = ManeuverEvent {
+                        maneuver_type: ManeuverType::LaneChange,
+                        side: departure_side,
+                        legality: LineLegality::Unknown,
+                        legality_at_crossing: None,
+                        confidence: overtake_conf.min(0.90),
+                        sources: DetectionSources {
+                            vehicle_tracking: true,
+                            lane_detection: false,
+                            ego_motion: false,
+                        },
+                        start_ms: pass_event.beside_start_ms,
+                        end_ms: pass_event.beside_start_ms,
+                        start_frame: pass_event.frame_id,
+                        end_frame: pass_event.frame_id,
+                        duration_ms: 0.0,
+                        passed_vehicle_id: Some(pass_event.vehicle_track_id),
+                        passed_vehicle_class: None,
+                        pass_event: None,
+                        lateral_event: None,
+                        marking_context: Some(self.latest_markings.clone()),
+                        crossed_line_class: None,
+                        crossed_line_class_id: None,
+                        supersedes_early_lc: false,
+                    };
+                    info!(
+                        "🔀 COMPANION LANE_CHANGE (tracking-only departure): {} | conf={:.2}",
+                        departure_side.as_str(),
+                        departure_lc.confidence,
+                    );
+                    self.recent_events.push(departure_lc);
+                    self.total_maneuvers += 1;
+
                     self.pass_buffer[pass_idx].correlated = true;
                 } else {
                     info!(
@@ -688,9 +792,15 @@ impl ManeuverClassifier {
             if let Some(si) = best_shift_idx {
                 let pass_event = self.pass_buffer[pass_idx].event.clone();
                 let shift_event = self.shift_buffer[si].event.clone();
+                let had_early_lc = self.shift_buffer[si].early_lc_emitted;
 
-                let maneuver =
+                let mut maneuver =
                     self.build_overtake(&pass_event, Some(&shift_event), legality_buffer);
+                let overtake_confidence = maneuver.confidence;
+
+                if had_early_lc {
+                    maneuver.supersedes_early_lc = true;
+                }
 
                 if maneuver.confidence >= self.config.min_combined_confidence {
                     info!(
@@ -705,8 +815,172 @@ impl ManeuverClassifier {
                     self.recent_events.push(maneuver);
                     self.total_maneuvers += 1;
 
+                    // v7.2: Emit companion departure LANE_CHANGE
+                    let ego_confirms = self.ego_motion_confirms_lateral();
+                    let companion_lc =
+                        self.build_lane_change(&shift_event, overtake_confidence.min(0.90), ego_confirms);
+                    info!(
+                        "🔀 COMPANION LANE_CHANGE (reinterpreted overtake departure): {} | conf={:.2}",
+                        companion_lc.side.as_str(),
+                        companion_lc.confidence,
+                    );
+                    self.recent_events.push(companion_lc);
+                    self.total_maneuvers += 1;
+
                     self.pass_buffer[pass_idx].correlated = true;
                     self.shift_buffer[si].correlated = true;
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // v7.5: CROSSING-BASED PROMOTION for deferred VehicleOvertookEgo.
+        //
+        // When the lateral detector fails on curves (curve-mode thresholds
+        // too high, ego estimator unreliable), a line crossing event provides
+        // direct physical evidence that the ego crossed a lane boundary.
+        //
+        // Matching logic:
+        //   Vehicle on RIGHT + crossing RightBoundary/CenterLine Leftward
+        //     = ego moved LEFT to overtake
+        //   Vehicle on LEFT + crossing LeftBoundary/CenterLine Rightward
+        //     = ego moved RIGHT to overtake
+        // ══════════════════════════════════════════════════════════════════
+        for pass_idx in 0..self.pass_buffer.len() {
+            if self.pass_buffer[pass_idx].correlated {
+                continue;
+            }
+            if !self.pass_buffer[pass_idx].curve_deferred {
+                continue;
+            }
+
+            let pass = &self.pass_buffer[pass_idx].event;
+
+            let mut best_crossing_idx: Option<usize> = None;
+            let mut best_crossing_gap = f64::MAX;
+
+            for (ci, crossing) in self.crossing_buffer.iter().enumerate() {
+                // Direction match: ego crossed boundary in the direction
+                // consistent with overtaking the vehicle on the given side.
+                let crossing_confirms = matches!(
+                    (pass.side, crossing.line_role, crossing.crossing_direction),
+                    // Vehicle on RIGHT → ego moved LEFT to pass
+                    (PassSide::Right, LineRole::RightBoundary | LineRole::CenterLine, CrossingDirection::Leftward)
+                    // Vehicle on LEFT → ego moved RIGHT to pass
+                    | (PassSide::Left, LineRole::LeftBoundary | LineRole::CenterLine, CrossingDirection::Rightward)
+                );
+
+                if !crossing_confirms {
+                    continue;
+                }
+
+                // Time window: crossing must occur within the correlation window
+                // from the pass's beside phase start through a generous post-ahead window.
+                let pass_window_end =
+                    pass.beside_end_ms.max(pass.ahead_start_ms) + self.config.correlation_window_ms;
+
+                let time_gap = temporal_gap(
+                    pass.beside_start_ms,
+                    pass_window_end,
+                    crossing.timestamp_ms,
+                    crossing.timestamp_ms,
+                );
+
+                if time_gap < gap && time_gap < best_crossing_gap {
+                    best_crossing_idx = Some(ci);
+                    best_crossing_gap = time_gap;
+                }
+            }
+
+            if let Some(ci) = best_crossing_idx {
+                let pass_event = self.pass_buffer[pass_idx].event.clone();
+                let crossing = self.crossing_buffer[ci].clone();
+
+                let mut maneuver =
+                    self.build_overtake(&pass_event, None, legality_buffer);
+
+                // Apply crossing-based legality and marking info
+                maneuver.crossed_line_class = Some(crossing.marking_class.clone());
+                maneuver.crossed_line_class_id = Some(crossing.marking_class_id);
+                maneuver.legality =
+                    crate::lane_crossing_integration::crossing_legality_to_line_legality(
+                        &crossing.passing_legality,
+                        crossing.marking_class_id,
+                    );
+
+                if maneuver.confidence >= self.config.min_combined_confidence {
+                    // v7.5c: Emit a LANE_CHANGE for the departure BEFORE the overtake.
+                    // The crossing is physical evidence that the ego crossed a lane
+                    // boundary. The lateral detector missed the departure because
+                    // the baseline was established after the ego had already shifted
+                    // (video started mid-maneuver). The crossing direction tells us
+                    // which way the ego moved.
+                    let departure_side = match crossing.crossing_direction {
+                        CrossingDirection::Leftward => ManeuverSide::Left,
+                        CrossingDirection::Rightward => ManeuverSide::Right,
+                        _ => maneuver.side, // fallback
+                    };
+                    let departure_legality =
+                        crate::lane_crossing_integration::crossing_legality_to_line_legality(
+                            &crossing.passing_legality,
+                            crossing.marking_class_id,
+                        );
+                    let departure_lc = ManeuverEvent {
+                        maneuver_type: ManeuverType::LaneChange,
+                        side: departure_side,
+                        legality: departure_legality,
+                        legality_at_crossing: None,
+                        confidence: crossing.confidence * crossing.penetration_ratio,
+                        sources: DetectionSources {
+                            vehicle_tracking: false,
+                            lane_detection: false,
+                            ego_motion: false,
+                        },
+                        start_ms: crossing.timestamp_ms,
+                        end_ms: crossing.timestamp_ms,
+                        start_frame: crossing.frame_id,
+                        end_frame: crossing.frame_id,
+                        duration_ms: 0.0,
+                        passed_vehicle_id: None,
+                        passed_vehicle_class: None,
+                        pass_event: None,
+                        lateral_event: None,
+                        marking_context: Some(self.latest_markings.clone()),
+                        crossed_line_class: Some(crossing.marking_class.clone()),
+                        crossed_line_class_id: Some(crossing.marking_class_id),
+                        supersedes_early_lc: false,
+                    };
+
+                    info!(
+                        "🔀 LANE_CHANGE (crossing-based departure): {} | conf={:.2} | \
+                         legality={:?} | marking={} | frame={}",
+                        departure_side.as_str(),
+                        departure_lc.confidence,
+                        departure_lc.legality,
+                        crossing.marking_class,
+                        crossing.frame_id,
+                    );
+
+                    self.recent_events.push(departure_lc);
+                    self.total_maneuvers += 1;
+
+                    info!(
+                        "🚗 OVERTAKE (ego passed vehicle, crossing-confirmed): Track {} \
+                         re-interpreted VehicleOvertookEgo + {} crossing {} | \
+                         conf={:.2} | legality={:?} | marking={}",
+                        pass_event.vehicle_track_id,
+                        crossing.line_role.as_str(),
+                        crossing.crossing_direction.as_str(),
+                        maneuver.confidence,
+                        maneuver.legality,
+                        crossing.marking_class,
+                    );
+
+                    self.recent_events.push(maneuver);
+                    self.total_maneuvers += 1;
+                    self.pass_buffer[pass_idx].correlated = true;
+                    // Don't remove the crossing — it stays available for
+                    // the lane_crossing_integration standalone promotion flow.
                 }
             }
         }
@@ -810,7 +1084,13 @@ impl ManeuverClassifier {
             };
 
             // Geometric override check for curve suppression
-            let (geo_override, geo_score) = if let Some(signals) = &confirmed.geometric_signals {
+            // v7.5d: On curves, geometric signals are contaminated by perspective
+            // distortion — disable geo_override entirely. The lateral detector
+            // (v7.5c) already suppresses early notifications on curves, but this
+            // provides defense in depth.
+            let (geo_override, geo_score) = if confirmed.curve_mode {
+                (false, 0.0)
+            } else if let Some(signals) = &confirmed.geometric_signals {
                 if signals.confidence >= self.config.geometric_min_signal_confidence
                     && signals.suggests_lane_change
                 {
@@ -881,6 +1161,7 @@ impl ManeuverClassifier {
                 marking_context: Some(self.latest_markings.clone()),
                 crossed_line_class: None,
                 crossed_line_class_id: None,
+                supersedes_early_lc: false,
             };
 
             info!(
@@ -916,27 +1197,44 @@ impl ManeuverClassifier {
             }
 
             // v7.0: Skip shifts that already had an early LC emitted.
-            // These shifts are still available for overtake correlation (above),
-            // but shouldn't produce a duplicate standalone LANE_CHANGE.
+            // These shifts shouldn't produce a duplicate standalone LANE_CHANGE.
+            // v7.5f: Don't mark as correlated — keep in buffer so that a
+            // later-arriving pass can still correlate with this shift for
+            // OVERTAKE detection (pass+shift path runs before this section).
             if self.shift_buffer[shift_idx].early_lc_emitted {
-                self.shift_buffer[shift_idx].correlated = true;
                 continue;
             }
 
             let shift = &self.shift_buffer[shift_idx].event;
 
             // Step 1: Evaluate geometric override
-            let (geo_override, geo_score) = self.evaluate_geometric_override(shift);
+            let (raw_geo_override, geo_score) = self.evaluate_geometric_override(shift);
+            // v7.5d: On curves, geometric signals (boundary divergence,
+            // lane width rate) are contaminated by perspective distortion.
+            // Require confirming ego displacement scaled by duration to avoid
+            // false positives from perspective artifacts on curves.
+            let geo_override = if shift.curve_mode && raw_geo_override {
+                let dur_s = (shift.duration_ms / 1000.0) as f32;
+                let curve_geo_min = 0.5_f32.max(dur_s * 2.0).min(8.0);
+                shift.ego_cumulative_peak_px >= curve_geo_min
+            } else {
+                raw_geo_override
+            };
 
             // Step 2: Curve suppression gate
-            // On curves without geometric override → suppress (perspective artifact)
+            // On curves without geometric override → suppress as standalone LC
+            // (perspective artifact). BUT do NOT mark as correlated — the shift
+            // may still be needed for pass+shift → OVERTAKE correlation. A valid
+            // overtake departure on a curve can fail the geo_override (weak ego
+            // on curves) while still being corroborated by a subsequent pass event.
+            // v7.5f: Changed from `correlated = true` to just skip, keeping the
+            // shift available for the pass+shift correlation path above.
             if shift.curve_mode && !geo_override {
                 debug!(
                     "  LC suppressed: shift {} on curve without geometric override | peak={:.1}%",
                     shift.direction.as_str(),
                     shift.peak_offset * 100.0,
                 );
-                self.shift_buffer[shift_idx].correlated = true;
                 continue;
             }
 
@@ -984,6 +1282,10 @@ impl ManeuverClassifier {
         // for the full correlation_window_ms, producing log spam every frame.
         self.pass_buffer.retain(|p| !p.correlated);
         self.shift_buffer.retain(|s| !s.correlated);
+
+        // v7.5: Expire old crossings from the buffer.
+        self.crossing_buffer
+            .retain(|c| timestamp_ms - c.timestamp_ms < self.config.correlation_window_ms);
 
         self.recent_events.clone()
     }
@@ -1070,6 +1372,7 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 
@@ -1104,6 +1407,7 @@ impl ManeuverClassifier {
             marking_context: None,
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 
@@ -1187,6 +1491,7 @@ impl ManeuverClassifier {
             marking_context: Some(self.latest_markings.clone()),
             crossed_line_class: None,
             crossed_line_class_id: None,
+            supersedes_early_lc: false,
         }
     }
 
